@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-import sys
 import os
 import re
 import subprocess
+import sys
+
 
 def run_cmd(cmd, check=True):
     try:
@@ -16,16 +17,16 @@ def get_current_version():
     if not os.path.exists("pyproject.toml"):
         print("Error: pyproject.toml not found in the current directory.")
         sys.exit(1)
-        
+
     with open("pyproject.toml", "r") as f:
         content = f.read()
-    
+
     # Simple regex to find version in [project] block
     match = re.search(r'\[project\]\n(?:.*\n)*?version\s*=\s*"([^"]+)"', content)
     if not match:
         # Fallback to first version line
         match = re.search(r'version\s*=\s*"([^"]+)"', content)
-    
+
     if match:
         return match.group(1)
     return None
@@ -33,14 +34,21 @@ def get_current_version():
 def set_version(new_version):
     with open("pyproject.toml", "r") as f:
         content = f.read()
-    
+
     # Replace version in [project] block
     project_match = re.search(r'(\[project\]\n(?:.*\n)*?version\s*=\s*")([^"]+)(")', content)
     if project_match:
-        new_content = content.replace(project_match.group(0), project_match.group(1) + new_version + project_match.group(3), 1)
+        old_val = project_match.group(0)
+        new_val = project_match.group(1) + new_version + project_match.group(3)
+        new_content = content.replace(old_val, new_val, 1)
     else:
-        new_content = re.sub(r'(version\s*=\s*")[^"]+(")', rf'\g<1>{new_version}\g<2>', content, count=1)
-        
+        new_content = re.sub(
+            r'(version\s*=\s*")[^"]+(")',
+            rf'\g<1>{new_version}\g<2>',
+            content,
+            count=1,
+        )
+
     with open("pyproject.toml", "w") as f:
         f.write(new_content)
 
@@ -89,7 +97,7 @@ def main():
     if not current_version:
         print("Error: Could not find version in pyproject.toml")
         sys.exit(1)
-    
+
     print(f"Current version: {current_version}")
 
     # Determine new version
@@ -146,7 +154,7 @@ def main():
     print(f"Updated pyproject.toml to version {new_version}")
 
     # 4. Git commit and tag
-    run_cmd(f"git add pyproject.toml")
+    run_cmd("git add pyproject.toml")
     run_cmd(f'git commit -m "chore: bump version to v{new_version}"')
     run_cmd(f'git tag v{new_version}')
     print(f"Committed and tagged with v{new_version}")

@@ -1,30 +1,92 @@
-# Repository Guidelines
+# Repository Guidelines & Developer Architecture
+
+This document provides developer-facing guidelines, architectural overviews, and styling rules for `mcp-yield-shell`.
+
+---
+
+## Architectural Design & Components
+
+The server uses an asynchronous model designed to manage subprocess lifecycles, redirect output streams, and avoid blocking the MCP communication channel.
+
+```mermaid
+graph TD
+    PM["ProcessManager<br>(Singleton registry)"] -->|creates / tracks / manages| MP["ManagedProcess<br>(State container for one task)"]
+    MP --> RB_OUT["RingBuffer<br>(stdout)"]
+    MP --> RB_ERR["RingBuffer<br>(stderr)"]
+    MP --> AT["asyncio.Task<br>(Drains, completion, timeouts)"]
+```
+
+### Key Components
+
+*   **`ProcessManager`** (`src/mcp_yield_shell/process/manager.py`):
+    *   Acts as the central registry tracking active and completed processes in a dictionary mapped by unique IDs (`proc_<hex>`).
+    *   Implements the core MCP tool logic (`exec_command`, `read_output`, `write_input`, `wait_process`, `stop_process`).
+*   **`ManagedProcess`** (`src/mcp_yield_shell/process/manager.py`):
+    *   Groups the underlying `asyncio.subprocess.Process` handle with its stdout/stderr buffers, status, and active control tasks.
+*   **`RingBuffer`** (`src/mcp_yield_shell/process/ring_buffer.py`):
+    *   Maintains a fixed-size, byte-capped buffer for stdout and stderr to avoid unbounded memory growth.
+    *   Tracks sequence numbers for chunks of bytes. Readers query the buffer with `since_seq` to retrieve incremental logs.
+
+---
+
+## Asynchronous Lifecycles & Task Scheduling
+
+Whenever a command is executed, `ProcessManager` schedules several async tasks:
+
+1.  **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks and write directly to the corresponding `RingBuffer`. They must complete draining before a process is marked as fully completed.
+2.  **Completion Tracker** (`completion-<id>`): Waits for the process to exit using `await proc.wait()`, waits for outstanding drain tasks to finish, and sets the final exit code, signal info, and state transitions.
+3.  **Timeout Handler** (`timeout-<id>`): Scheduled if `timeout_ms` is set. After sleeping, if the process is still running, it escalates from `SIGTERM` (graceful) to `SIGKILL` (forced) to clean up hung tasks.
+
+---
+
+## Platform-Specific Process Group Management
+
+*   **POSIX**: To ensure that child processes launched by commands are fully cleaned up (and not orphaned), commands are spawned with `start_new_session=True` (`src/mcp_yield_shell/process/spawn.py`).
+    *   Process signals are sent via `os.killpg(os.getpgid(pid), signal)` to terminate the entire process group.
+*   **Windows**: Spawning utilizes standard `asyncio.create_subprocess_shell` parameters. Process group termination is not natively supported via POSIX signals, so process termination is best-effort and acts on the primary PID.
+
+---
 
 ## Project Structure & Module Organization
 
-This is a Python 3.11 package using a `src/` layout. Runtime code lives in `src/mcp_yield_shell/`, with the MCP server entry points in `server.py` and `__main__.py`. Process lifecycle logic is grouped under `src/mcp_yield_shell/process/`. Tests live in `tests/` and mirror the main behavior areas, for example `test_config.py`, `test_ring_buffer.py`, and `test_security.py`. Release automation is in `scripts/release.py`, package metadata is in `pyproject.toml`, and CI publishing configuration is in `.github/workflows/publish.yml`.
+This is a Python 3.11 package using a `src/` layout:
+*   `src/mcp_yield_shell/server.py` and `__main__.py` contain the MCP server wiring and CLI entry points.
+*   `src/mcp_yield_shell/config.py` handles environment-based configuration parsing.
+*   `src/mcp_yield_shell/security.py` controls allowed path roots, command regex rules, and environment overlays/redactions.
+*   `src/mcp_yield_shell/process/` contains execution, buffer, and lifecycle management.
+*   `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`).
+
+---
 
 ## Build, Test, and Development Commands
 
-- `uv sync`: install runtime and development dependencies from `pyproject.toml` and `uv.lock`.
-- `uv run mcp-yield-shell`: run the MCP server locally.
-- `uv run pytest`: run the full test suite configured under `tests/`.
-- `uv run ruff check .`: lint imports and Python style issues.
-- `uv run pyright`: type-check the `src/` package with basic checking.
-- `uv build`: build source and wheel distributions.
+*   `uv sync`: Install runtime and development dependencies from `pyproject.toml` and `uv.lock`.
+*   `uv run mcp-yield-shell`: Run the MCP server locally using stdio.
+*   `uv run pytest`: Run the full test suite.
+*   `uv run ruff check .`: Lint imports and check style rules.
+*   `uv run pyright`: Run static type-checking.
+*   `uv build`: Build wheel and source distributions.
+
+---
 
 ## Coding Style & Naming Conventions
 
-Use 4-space indentation and standard Python naming: `snake_case` for functions, variables, and modules; `PascalCase` for classes; uppercase names for constants. Keep modules focused around their current responsibilities rather than adding broad utility files. Ruff is configured for Python 3.11, 99-character lines, import sorting, and `E`, `F`, `I`, and `W` lint families.
+*   Use **4-space indentation** and standard Python naming conventions (`snake_case` for variables/functions, `PascalCase` for classes, uppercase for constants).
+*   Lines are capped at **99 characters** (configured in `tool.ruff`).
+*   Keep modules focused around their distinct responsibilities; avoid creating generic "utility" files.
+
+---
 
 ## Testing Guidelines
 
-Tests use `pytest` with `pytest-asyncio`; async tests are supported automatically by the project configuration. Name new test files `test_<area>.py` and test functions `test_<expected_behavior>`. Add focused tests near the behavior being changed, especially for process state transitions, timeout behavior, output truncation, cwd policy, and command security rules.
+*   Tests use `pytest` with `pytest-asyncio`. Async tests are supported automatically by the `asyncio_mode = "auto"` configuration.
+*   Name new test files `test_<area>.py` and test functions `test_<expected_behavior>`.
+*   Add tests for any edge cases introduced, specifically: process state transitions, timeouts, output truncation, CWD policy, and command security checks.
+
+---
 
 ## Commit & Pull Request Guidelines
 
-The existing history uses concise Conventional Commit-style prefixes such as `feat:`, `fix:`, `build:`, and `chore:`. Keep commit subjects imperative and scoped to one change. Pull requests should include a short behavior summary, tests run, linked issues when applicable, and notes for any security, configuration, or release-impacting changes.
-
-## Security & Configuration Tips
-
-This project executes shell commands, so treat policy changes as security-sensitive. Review updates to `YIELD_SHELL_ALLOWED_CWDS`, command allow/deny regexes, environment redaction, process termination, and output retention carefully. Do not commit local secrets or machine-specific MCP client configuration.
+*   Commit messages follow Conventional Commit-style prefixes (e.g. `feat:`, `fix:`, `build:`, `chore:`).
+*   Keep commit subjects imperative and focused on a single logical change.
+*   Pull requests should list running/tested cases, linked issues, and notes on security impact.
