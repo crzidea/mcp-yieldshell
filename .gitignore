@@ -161,4 +161,6 @@ Thumbs.db
 # Project specific
 .cybervisor/
 .prompts/
+.antigravitycli/
+
 
