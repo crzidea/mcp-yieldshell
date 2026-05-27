@@ -160,22 +160,13 @@ def main():
     print(f"Committed and tagged with v{new_version}")
 
     # 5. Push
-    if non_interactive:
-        push_confirm = True
-    else:
-        push_confirm = input("Push commit and tag to origin? (y/N): ").strip().lower() == 'y'
-
-    if push_confirm:
-        # Get current branch
-        branch_res = run_cmd("git branch --show-current")
-        branch = branch_res.stdout.strip()
-        print(f"Pushing to origin {branch}...")
-        run_cmd(f"git push origin {branch}")
-        run_cmd(f"git push origin v{new_version}")
-        print("Push complete. GitHub Action should trigger shortly!")
-    else:
-        print("\nPush skipped. You can manually push when ready using:")
-        print(f"  git push origin HEAD && git push origin v{new_version}")
+    # Get current branch
+    branch_res = run_cmd("git branch --show-current")
+    branch = branch_res.stdout.strip()
+    print(f"Pushing to origin {branch}...")
+    run_cmd(f"git push origin {branch}")
+    run_cmd(f"git push origin v{new_version}")
+    print("Push complete. GitHub Action should trigger shortly!")
 
 if __name__ == "__main__":
     main()
