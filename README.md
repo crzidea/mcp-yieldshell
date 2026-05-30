@@ -6,11 +6,11 @@ A drop-in shell MCP server that auto-yields long-running commands into managed b
 
 Most shell tools present a frustrating choice: either block the LLM agent until the command finishes, or force the agent to decide upfront that a command should run in the background.
 
-**YieldShell MCP** solves this by keeping normal foreground semantics for fast commands, then automatically promoting long-running commands into managed background processes after a brief delay (`yield_ms`, default: 1 second).
+**YieldShell MCP** solves this by keeping normal foreground semantics for fast commands, then automatically promoting long-running commands into managed background processes after a brief delay (`yield_ms`, default: 5 seconds).
 
 ```mermaid
 graph TD
-    A[exec_command] --> B["Wait for yield_ms (default: 1s)"]
+    A[exec_command] --> B["Wait for yield_ms (default: 5s)"]
     B --> C{Is process still running?}
     C -->|Yes| D["backgrounded<br>Returns process_id"]
     C -->|No| E["completed<br>Returns full output"]
@@ -147,7 +147,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
 
 *   **Output Statuses**:
     *   `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr.
-    *   `backgrounded`: Process auto-yielded. Returns `process_id` and `pid` for tracking.
+    *   `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, and a snapshot of initial stdout/stderr for tracking.
     *   `timed_out`: Process exceeded `timeout_ms` and was terminated.
     *   `stopped`: Process was explicitly terminated.
     *   `failed_to_start`: Command could not be spawned (e.g., bad directory or policy violation).
@@ -182,6 +182,7 @@ Block execution until the process exits or the wait timeout expires. This allows
     *   `max_output_bytes` (integer, optional): Maximum output bytes to return in the response.
 
 *   **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
+*   `wait` treats the tracked shell process exiting as completion. For normal process completion, stdout/stderr are drained before the response is returned. If descendant processes keep inherited pipes open after the tracked process exits, the server closes its drain tasks so `wait` can complete without blocking indefinitely.
 
 ### `stop`
 Gracefully terminate or force kill a running process.
@@ -215,6 +216,8 @@ To avoid sending duplicate data over the MCP protocol (which can consume context
 2. When calling `exec`, `read`, or `wait`, the response includes a `next_seq` value representing the index of the next chunk to be written.
 3. To retrieve only *new* output, call `read` with `since_seq` set to the previously received `next_seq`.
 4. Omitting `since_seq` returns the entire contents currently stored in the buffer (clamped by `max_output_bytes`).
+
+When a process exits normally, `exec`/`wait` responses include output drained through stdout/stderr EOF. If a descendant keeps inherited stdout/stderr open after the tracked process exits, the server stops waiting on those inherited pipes to avoid indefinite blocking; output written only by that descendant after the tracked process exits is not part of the managed process result.
 
 ---
 

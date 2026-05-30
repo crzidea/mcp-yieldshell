@@ -90,6 +90,47 @@ class TestLongCommand:
         assert "hello" in wait_result.get("stdout", "")
 
     @pytest.mark.asyncio
+    async def test_wait_includes_output_emitted_before_normal_exit(self, manager):
+        result = await manager.exec_command(
+            "python -c \"import sys,time; "
+            "sys.stdout.write(\\\"hello\\\\n\\\"); sys.stdout.flush(); time.sleep(0.2)\"",
+            yield_ms=0,
+        )
+        assert result["status"] == "backgrounded"
+
+        wait_result = await manager.wait_process(result["process_id"], timeout_ms=5000)
+
+        assert wait_result["status"] == "completed"
+        assert "hello" in wait_result.get("stdout", "")
+
+    @pytest.mark.asyncio
+    async def test_wait_completes_when_background_child_keeps_pipes_open(self, manager):
+        if sys.platform == "win32":
+            pytest.skip("POSIX process groups only")
+
+        result = await manager.exec_command(
+            "python -c \"import subprocess; subprocess.Popen([\\\"sleep\\\", \\\"30\\\"])\"",
+            yield_ms=0,
+        )
+        assert result["status"] == "backgrounded"
+        pid = result["process_id"]
+        mp = manager.get_process(pid)
+        assert mp is not None
+        pgid = mp.process_group_id
+
+        try:
+            wait_result = await manager.wait_process(pid, timeout_ms=5000)
+
+            assert wait_result["status"] == "completed"
+            assert wait_result["exit_code"] == 0
+        finally:
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @pytest.mark.asyncio
     async def test_timeout_force_kills_process_group_after_sigterm_is_ignored(self, manager):
         if sys.platform == "win32":
             pytest.skip("POSIX process groups only")
@@ -102,7 +143,9 @@ class TestLongCommand:
         )
         assert result["status"] == "backgrounded"
         pid = result["process_id"]
-        pgid = manager._processes[pid].process_group_id
+        mp = manager.get_process(pid)
+        assert mp is not None
+        pgid = mp.process_group_id
 
         try:
             wait_result = await manager.wait_process(pid, timeout_ms=5000)

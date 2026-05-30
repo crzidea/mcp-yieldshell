@@ -267,6 +267,17 @@ class ProcessManager:
             raise ProcessLookupError
         return os.getpgid(mp.proc.pid)
 
+    def _process_group_exists(self, mp: ManagedProcess) -> bool:
+        if sys.platform == "win32":
+            return mp.proc.returncode is None
+        try:
+            os.killpg(self._process_group_id(mp), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     async def _drain_stream(
         self, stream: asyncio.StreamReader | None, buf: RingBuffer
     ) -> None:
@@ -286,20 +297,14 @@ class ProcessManager:
         self, proc: asyncio.subprocess.Process, mp: ManagedProcess
     ) -> None:
         """Wait for process to exit and update status."""
+        wait_completed = False
         try:
-            returncode = await proc.wait()
-            # Ensure drain tasks finish before signaling completion so
-            # all output is buffered before any response reads happen.
-            if mp.drain_stdout is not None and not mp.drain_stdout.done():
-                try:
-                    await mp.drain_stdout
-                except Exception:
-                    pass
-            if mp.drain_stderr is not None and not mp.drain_stderr.done():
-                try:
-                    await mp.drain_stderr
-                except Exception:
-                    pass
+            returncode, wait_completed = await self._wait_for_returncode(proc)
+            if wait_completed:
+                await self._wait_for_process_group_exit(mp, timeout_sec=2.0)
+                await self._drain_with_timeout(mp, timeout_sec=1.0)
+            else:
+                self._cancel_drains(mp)
             mp.info.exit_code = returncode
             mp.info.signal = self._exit_signal(proc)
             mp.info.ended_at = time.time()
@@ -309,14 +314,81 @@ class ProcessManager:
                     mp.info.status = ProcessStatus.TIMED_OUT
                 else:
                     mp.info.status = ProcessStatus.COMPLETED
+        except asyncio.CancelledError:
+            raise
         except Exception:
             if mp.info.status == ProcessStatus.RUNNING:
                 mp.info.status = ProcessStatus.FAILED
+                mp.completion_event.set()
         finally:
             if mp.timeout_task is not None and not mp.timeout_task.done():
                 if not mp._timeout_triggered:
                     mp.timeout_task.cancel()
-            mp.completion_event.set()
+            pg_alive = self._process_group_exists(mp)
+            if mp._timeout_triggered and pg_alive:
+                pass
+            elif not wait_completed and pg_alive:
+                pass
+            else:
+                mp.completion_event.set()
+
+    async def _wait_for_process_group_exit(
+        self, mp: ManagedProcess, timeout_sec: float
+    ) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while self._process_group_exists(mp) and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+    async def _wait_for_returncode(
+        self, proc: asyncio.subprocess.Process
+    ) -> tuple[int, bool]:
+        wait_task = asyncio.create_task(proc.wait())
+        try:
+            while proc.returncode is None:
+                try:
+                    return (
+                        await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.25),
+                        True,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            if not wait_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(wait_task), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            return proc.returncode, wait_task.done()
+        finally:
+            if not wait_task.done():
+                wait_task.cancel()
+                try:
+                    await wait_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _drain_with_timeout(self, mp: ManagedProcess, timeout_sec: float) -> None:
+        """Drain stdout/stderr with a timeout; cancel tasks if they block."""
+        tasks = [
+            task
+            for task in (mp.drain_stdout, mp.drain_stderr)
+            if task is not None and not task.done()
+        ]
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_sec
+            )
+        except asyncio.TimeoutError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _cancel_drains(self, mp: ManagedProcess) -> None:
+        for task in (mp.drain_stdout, mp.drain_stderr):
+            if task is not None and not task.done():
+                task.cancel()
 
     def _exit_signal(self, proc: asyncio.subprocess.Process) -> str | None:
         """Determine signal name from process returncode on POSIX."""
@@ -351,13 +423,19 @@ class ProcessManager:
         try:
             await asyncio.wait_for(mp.completion_event.wait(), timeout=grace_period)
         except asyncio.TimeoutError:
-            # Force kill
+            pass
+
+        if self._process_group_exists(mp):
+            # Force kill any children that survived graceful termination, even if
+            # the shell process already exited.
             await kill_process(mp.proc, mp.process_group_id)
-            try:
-                await asyncio.wait_for(mp.completion_event.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        if mp.completion_event.is_set() and mp.info.status == ProcessStatus.COMPLETED:
+            await self._wait_for_process_group_exit(mp, timeout_sec=2.0)
+
+        if not self._process_group_exists(mp):
+            await self._drain_with_timeout(mp, timeout_sec=1.0)
+
+        mp.completion_event.set()
+        if mp.info.status == ProcessStatus.COMPLETED:
             mp.info.status = ProcessStatus.TIMED_OUT
 
     async def read_output(

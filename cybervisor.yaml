@@ -33,6 +33,9 @@ stages:
     read_only_paths:
       - "src/**"
       - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "AGENTS.md"
     max_retries: 5
     next_stage: Review Delivery Docs
 
@@ -86,9 +89,15 @@ stages:
     read_only_paths:
       - "src/**"
       - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "AGENTS.md"
     max_retries: 5
     max_iterations: 3
     max_iterations_next_stage: Implement
+    reset_iterations:
+      - Review Code
+      - Review Docs
 
   - name: Implement
     prompt_template: |
@@ -134,13 +143,13 @@ stages:
         Findings:
           description: Specific correctness, regression, or completeness issues found in the implementation.
           example: |
-            - The status history is not persisted after page refresh.
-            - The rejection path is not covered by tests.
+            - The drain task does not handle pipe EOF correctly on Linux.
+            - The timeout handler leaks the asyncio task reference if the process exits before timeout.
         Required Changes:
           description: Concrete fixes required before the implementation can be approved.
           example: |
-            - Persist review decisions in the backing store.
-            - Add regression coverage for reject and re-open flows.
+            - Handle EOF in drain tasks by catching BrokenPipeError and closing the buffer.
+            - Cancel the timeout task in the completion tracker to prevent resource leaks.
       routes:
         APPROVED:
           description: The implementation passed code review and is ready for documentation review.
@@ -166,11 +175,14 @@ stages:
 
       Review responsibilities:
       - use `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, and `.cybervisor/artifacts/tasks.md` to confirm the intended feature behavior, usage flow, and technical scope
-      - inspect the implementation together with `README.md` and the relevant files under `docs/`
-      - treat `README.md` and `docs/` as user-facing documentation for end users and contributors who need to use the feature, not as deep internal engineering design documents
+      - inspect the implementation together with `README.md`, `AGENTS.md`, and the relevant files under `docs/`
+      - `README.md` is the primary user-facing documentation covering installation, MCP client configuration, tool reference, configuration variables, and security notes
+      - `AGENTS.md` is the developer-facing documentation covering architecture, build/test commands, coding style, and testing guidelines
+      - `docs/` is for durable usage guidance, workflow explanations, and operational docs that exceed what fits in the README
       - confirm that user-facing behavior, usage instructions, setup steps, constraints, and the surface-level way the feature works are documented clearly enough for future users and contributors
+      - confirm that developer-facing docs reflect the current architecture, conventions, and development workflow
       - focus on tracked documentation only; durable guidance must live in `docs/` and, when relevant, `README.md`
-      - if documentation refinements are needed, edit `README.md` and the relevant files under `docs/` directly before finishing this stage
+      - if documentation refinements are needed, edit `README.md`, `AGENTS.md`, or the relevant files under `docs/` directly before finishing this stage
       - do not rewrite healthy documentation unnecessarily; preserve stable content and make the smallest edits needed
       - keep refinements focused on usage, setup, constraints, examples, troubleshooting, and concise surface-level behavior explanations
       - do not dive deeply into implementation internals, architecture details, or low-level technical design unless a user needs that detail to use or operate the feature correctly
@@ -183,13 +195,13 @@ stages:
         Findings:
           description: Specific documentation gaps or mismatches discovered during review.
           example: |
-            - `README.md` explains setup but does not mention the new retry configuration flag.
-            - The docs describe the old review flow and omit the new verification behavior.
+            - `README.md` explains setup but does not mention the new configuration variable.
+            - `AGENTS.md` omits the new module from the project structure section.
         Required Changes:
           description: Concrete documentation updates required before verification can begin.
           example: |
-            - Add a README section describing how to enable and use the retry flag.
-            - Update the pipeline docs to reflect the new review and verification sequence.
+            - Add the new env var to the Configuration Variables table in README.md.
+            - Update the module organization list in AGENTS.md.
       routes:
         APPROVED:
           description: The relevant tracked docs are aligned with the implementation and ready for verification.
@@ -201,37 +213,43 @@ stages:
       - .cybervisor/artifacts/spec.md
       - .cybervisor/artifacts/plan.md
       - .cybervisor/artifacts/tasks.md
+    read_only_paths:
+      - "src/**"
+      - "tests/**"
     max_retries: 5
     max_iterations: 5
     max_iterations_next_stage: Verify
 
   - name: Verify
     prompt_template: |
-      Verify the latest reviewed implementation from a user perspective.
+      Verify the latest reviewed implementation from a user and operator perspective.
 
       Verification responsibilities:
       - use `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, and `.cybervisor/artifacts/tasks.md` to confirm the intended workflow and acceptance expectations
-      - validate the primary user workflow end to end in the browser using automation tools such as Playwright
-      - use terminal test commands as supporting evidence, not as the only verification method
+      - run the full test suite with `uv run pytest` and inspect results
+      - run linting with `uv run ruff check .` and type-checking with `uv run pyright`
+      - verify the MCP server can start without errors using `uv run mcp-yieldshell`
       - check for user-facing regressions and missing acceptance criteria
       - do not silently patch implementation issues
     contract:
       fields:
         Verification Results:
-          description: User-visible verification evidence and observed outcomes.
+          description: Verification evidence and observed outcomes.
           example: |
-            - Approve flow works from the review screen.
-            - Reject flow completes, but the detail page still shows the old status.
+            - All 42 tests pass.
+            - Ruff reports no lint errors.
+            - Pyright reports no type errors.
+            - Server starts and responds to MCP tool calls correctly.
         Required Changes:
           description: Concrete fixes required before verification can pass.
           example: |
-            - Refresh the detail view from the latest persisted status after rejection.
-            - Add end-to-end coverage for the reject flow.
+            - Fix the failing test in test_integration.py.
+            - Resolve the pyright type error in process/manager.py.
       routes:
         APPROVED:
           description: Verification passed and no further implementation work is required.
         CHANGES_REQUESTED:
-          description: Verification found user-visible issues that must be fixed before the work can be accepted.
+          description: Verification found issues that must be fixed before the work can be accepted.
           next_stage: Review Code
           injections: [Verification Results, Required Changes]
     keep_artifacts:
