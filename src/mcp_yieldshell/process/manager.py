@@ -15,6 +15,8 @@ from ..types import ProcessInfo, ProcessStatus
 from .ring_buffer import RingBuffer
 from .spawn import kill_process, spawn_process, terminate_process
 
+MAX_EFFECTIVE_WAIT_MS = 55000
+
 
 class ManagedProcess:
     __slots__ = (
@@ -532,8 +534,10 @@ class ProcessManager:
         if mp is None:
             return {"process_id": process_id, "error": f"Unknown process_id: {process_id}"}
 
+        # Cap effective wait below typical MCP request timeout thresholds
+        effective_wait_ms = min(timeout_ms, MAX_EFFECTIVE_WAIT_MS)
+
         if mp.info.status != ProcessStatus.RUNNING:
-            # Already completed
             effective_max = self._max_output(max_output_bytes)
             stdout_data = mp.stdout_buf.read(max_bytes=effective_max)
             stderr_data = mp.stderr_buf.read(max_bytes=effective_max)
@@ -549,10 +553,9 @@ class ProcessManager:
                 "truncated": truncated,
             }
 
-        # Wait up to timeout
         try:
             await asyncio.wait_for(
-                mp.completion_event.wait(), timeout=timeout_ms / 1000.0
+                mp.completion_event.wait(), timeout=effective_wait_ms / 1000.0
             )
         except asyncio.TimeoutError:
             pass

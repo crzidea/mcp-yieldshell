@@ -20,7 +20,8 @@ graph TD
 
 *   **`ProcessManager`** (`src/mcp_yieldshell/process/manager.py`):
     *   Acts as the central registry tracking active and completed processes in a dictionary mapped by unique IDs (`proc_<hex>`).
-    *   Implements the core MCP tool logic (`exec_command`, `read_output`, `write_input`, `wait_process`, `stop_process`).
+    *   Implements the core MCP tool logic (`exec_command`, `read_output`, `write_input`, `wait_process`, `stop_process`, `list_processes`, `cleanup`).
+    *   `wait_process` caps its effective wait at `MAX_EFFECTIVE_WAIT_MS` (55 s) to avoid MCP request timeouts.
 *   **`ManagedProcess`** (`src/mcp_yieldshell/process/manager.py`):
     *   Groups the underlying `asyncio.subprocess.Process` handle with its stdout/stderr buffers, status, and active control tasks.
 *   **`RingBuffer`** (`src/mcp_yieldshell/process/ring_buffer.py`):

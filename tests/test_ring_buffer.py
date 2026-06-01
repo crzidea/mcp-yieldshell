@@ -155,8 +155,10 @@ class TestRingBufferUTF8:
     def test_clear(self):
         buf = RingBuffer(100)
         buf.append(b"hello")
+        total = buf.byte_count
         buf.clear()
-        assert buf.byte_count == 0
+        assert buf._retained_bytes == 0
+        assert buf.byte_count == total
         result = buf.read()
         assert result["text"] == ""
 

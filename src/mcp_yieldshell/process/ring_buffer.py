@@ -14,6 +14,7 @@ class RingBuffer:
         self._chunks: list[tuple[int, bytes]] = []  # [(seq, data), ...]
         self._seq_source: list[int] = seq_source if seq_source is not None else [1]
         self._total_bytes: int = 0
+        self._retained_bytes: int = 0
         self._evicted: bool = False
 
     @property
@@ -35,27 +36,28 @@ class RingBuffer:
         seq = self._seq_source[0]
         self._chunks.append((seq, data))
         self._total_bytes += len(data)
+        self._retained_bytes += len(data)
         self._seq_source[0] += 1
         # Evict oldest chunks until within capacity
-        while self._total_bytes > self._max_bytes and self._chunks:
+        while self._retained_bytes > self._max_bytes and self._chunks:
             self._evicted = True
             seq, chunk = self._chunks[0]
-            excess = self._total_bytes - self._max_bytes
+            excess = self._retained_bytes - self._max_bytes
             if len(chunk) <= excess:
                 # Remove entire first chunk
-                self._total_bytes -= len(chunk)
+                self._retained_bytes -= len(chunk)
                 self._chunks.pop(0)
             else:
                 # Remove part of first chunk
                 self._chunks[0] = (seq, chunk[excess:])
-                self._total_bytes -= excess
+                self._retained_bytes -= excess
                 break
 
     def read(self, since_seq: int | None = None, max_bytes: int | None = None) -> dict:
         """Read buffered output.
 
         Args:
-            since_seq: If provided, return output starting after this sequence.
+            since_seq: If provided, return output with sequence >= since_seq (from semantics).
                         If None, return all currently retained output.
             max_bytes:  Cap the returned text to this many bytes of output.
 
@@ -108,5 +110,5 @@ class RingBuffer:
     def clear(self) -> None:
         """Clear all buffered data."""
         self._chunks.clear()
-        self._total_bytes = 0
+        self._retained_bytes = 0
         self._evicted = False

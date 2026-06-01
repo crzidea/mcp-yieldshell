@@ -521,6 +521,142 @@ class TestReadStreamValidation:
 
 
 
+class TestUnknownProcessIds:
+    @pytest.mark.asyncio
+    async def test_read_unknown_process(self, manager):
+        result = await manager.read_output("proc_nonexistent")
+        assert "error" in result
+        assert result["process_id"] == "proc_nonexistent"
+
+    @pytest.mark.asyncio
+    async def test_wait_unknown_process(self, manager):
+        result = await manager.wait_process("proc_nonexistent")
+        assert "error" in result
+        assert result["process_id"] == "proc_nonexistent"
+
+    @pytest.mark.asyncio
+    async def test_stop_unknown_process(self, manager):
+        result = await manager.stop_process("proc_nonexistent")
+        assert "error" in result
+        assert result["process_id"] == "proc_nonexistent"
+        assert result["stopped"] is False
+
+    @pytest.mark.asyncio
+    async def test_write_unknown_process(self, manager):
+        result = await manager.write_input("proc_nonexistent", "hello")
+        assert result["ok"] is False
+        assert "Unknown" in result.get("error", "")
+
+
+class TestWaitCapBehavior:
+    @pytest.mark.asyncio
+    async def test_wait_large_timeout_returns_running(self, manager):
+        result = await manager.exec_command(
+            "sleep 60", yield_ms=0
+        )
+        assert result["status"] == "backgrounded"
+        pid = result["process_id"]
+        try:
+            wait_result = await manager.wait_process(pid, timeout_ms=500)
+            assert wait_result["status"] == "running"
+            assert wait_result["exit_code"] is None
+            assert "next_seq" in wait_result
+        finally:
+            await manager.stop_process(pid, force_after_ms=500)
+
+    @pytest.mark.asyncio
+    async def test_wait_already_completed_returns_immediately(self, manager):
+        result = await manager.exec_command("echo hello")
+        assert result["status"] == "completed"
+        ps_result = manager.list_processes(limit=1)
+        pid = ps_result["processes"][0]["process_id"]
+        wait_result = await manager.wait_process(pid, timeout_ms=5000)
+        assert wait_result["status"] == "completed"
+        assert "hello" in wait_result.get("stdout", "")
+
+
+class TestTimedOutStatus:
+    @pytest.mark.asyncio
+    async def test_exec_timeout_returns_timed_out(self, manager):
+        result = await manager.exec_command(
+            "sleep 60", yield_ms=0, timeout_ms=500
+        )
+        assert result["status"] == "backgrounded"
+        pid = result["process_id"]
+        await asyncio.sleep(1.0)
+        read_result = await manager.read_output(pid)
+        assert read_result["status"] in ("timed_out", "completed", "stopped")
+
+    @pytest.mark.asyncio
+    async def test_wait_sees_timed_out(self, manager):
+        result = await manager.exec_command(
+            "sleep 60", yield_ms=0, timeout_ms=500
+        )
+        assert result["status"] == "backgrounded"
+        pid = result["process_id"]
+        wait_result = await manager.wait_process(pid, timeout_ms=5000)
+        assert wait_result["status"] in ("timed_out", "completed", "stopped")
+
+
+class TestIncrementalReadSinceSeq:
+    @pytest.mark.asyncio
+    async def test_incremental_read_since_seq(self, manager):
+        result = await manager.exec_command(
+            f"{sys.executable} -c \""
+            "import time, sys\n"
+            "print('first', flush=True)\n"
+            "time.sleep(0.3)\n"
+            "print('second', flush=True)\n"
+            "time.sleep(0.3)\n"
+            "print('third', flush=True)\n"
+            "\"",
+            yield_ms=100,
+        )
+        assert result["status"] == "backgrounded"
+        pid = result["process_id"]
+        await asyncio.sleep(1.0)
+
+        first_read = await manager.read_output(pid)
+        assert "first" in first_read.get("stdout", "")
+        next_seq = first_read["next_seq"]
+
+        incremental_read = await manager.read_output(pid, since_seq=next_seq)
+        if "stdout" in incremental_read:
+            assert "first" not in incremental_read["stdout"]
+
+        await manager.stop_process(pid, force_after_ms=500)
+
+
+class TestRingBufferByteCount:
+    def test_byte_count_tracks_total_written(self):
+        from mcp_yieldshell.process.ring_buffer import RingBuffer
+
+        buf = RingBuffer(10)
+        buf.append(b"0123456789")
+        assert buf.byte_count == 10
+        buf.append(b"ABCDE")
+        assert buf.byte_count == 15
+
+    def test_byte_count_tracks_total_after_eviction(self):
+        from mcp_yieldshell.process.ring_buffer import RingBuffer
+
+        buf = RingBuffer(10)
+        buf.append(b"0123456789")
+        buf.append(b"ABCDE")
+        assert buf.byte_count == 15
+        assert buf._retained_bytes <= 10
+
+    def test_clear_resets_retained_but_not_total(self):
+        from mcp_yieldshell.process.ring_buffer import RingBuffer
+
+        buf = RingBuffer(100)
+        buf.append(b"hello")
+        assert buf.byte_count == 5
+        buf.clear()
+        assert buf._retained_bytes == 0
+        assert buf.byte_count == 5
+
+
 class TestDefectFixes:
     @pytest.mark.asyncio
     async def test_max_processes_allows_sequential(self, monkeypatch):

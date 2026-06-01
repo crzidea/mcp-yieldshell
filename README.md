@@ -138,7 +138,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
     *   `command` (string, **required**): The command string to execute in the shell.
     *   `cwd` (string, optional): Working directory for the command. Must be under allowed roots if `YIELDSHELL_ALLOWED_CWDS` is set. Defaults to `YIELDSHELL_DEFAULT_CWD`.
     *   `env` (object of string to string, optional): Additive environment variable overlay. Merged into the parent environment.
-    *   `shell` (string, optional): A custom shell path to execute commands (e.g. `/bin/zsh`). Internally executed using the platform's default shell handler if omitted.
+    *   `shell` (string, optional): Accepted but has no effect in v1. Commands always run via the platform's default shell.
     *   `stdin` (string, optional): Initial text input written to standard input immediately after spawning.
     *   `name` (string, optional): A human-readable label/name to identify this process.
     *   `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Clamped by `YIELDSHELL_MAX_YIELD_MS`. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (5000ms).
@@ -147,7 +147,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
 
 *   **Output Statuses**:
     *   `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr.
-    *   `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, and a snapshot of initial stdout/stderr for tracking.
+    *   `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, a snapshot of initial stdout/stderr, `duration_ms`, `truncated`, and a `message` string describing that the process is running in the background.
     *   `timed_out`: Process exceeded `timeout_ms` and was terminated.
     *   `stopped`: Process was explicitly terminated.
     *   `failed_to_start`: Command could not be spawned (e.g., bad directory or policy violation).
@@ -163,7 +163,7 @@ Read stdout and/or stderr output from a running or completed background process.
     *   `streams` (string, default: `"both"`): The streams to read. Options: `"both"`, `"stdout"`, or `"stderr"`.
 
 *   **Returns**:
-    *   `process_id`, `status`, `exit_code`, `signal`, `next_seq` (sequence index to use in subsequent `since_seq` reads), `stdout`/`stderr` text, and a `truncated` flag.
+    *   `process_id`, `status`, `exit_code`, `signal`, `next_seq` (sequence index to use in subsequent `since_seq` reads), `truncated` flag. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
 
 ### `write`
 Write text input to the standard input (`stdin`) of a running process.
@@ -182,6 +182,7 @@ Block execution until the process exits or the wait timeout expires. This allows
     *   `max_output_bytes` (integer, optional): Maximum output bytes to return in the response.
 
 *   **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
+*   The effective wait duration is capped at 55 seconds to stay well under typical MCP request timeouts, even if a larger `timeout_ms` is requested.
 *   `wait` treats the tracked shell process exiting as completion. For normal process completion, stdout/stderr are drained before the response is returned. If descendant processes keep inherited pipes open after the tracked process exits, the server closes its drain tasks so `wait` can complete without blocking indefinitely.
 
 ### `stop`
@@ -198,6 +199,11 @@ List all managed processes.
 *   **Parameters**:
     *   `include_completed` (boolean, default: `true`): If `false`, finished/stopped processes are excluded from the output.
     *   `limit` (integer, default: `50`): Maximum number of entries.
+*   **Returns**: `processes` — a list of process summary objects, each containing: `process_id`, `pid`, `name`, `command`, `cwd`, `status`, `exit_code`, `signal`, `started_at`, `ended_at`, `duration_ms`, `stdout_bytes`, `stderr_bytes`.
+
+### Error Responses
+
+All tools that accept a `process_id` parameter return a structured error dict when the ID is unknown, e.g. `{"process_id": "proc_abc123", "error": "Unknown process_id: proc_abc123"}`. Tools that accept `process_id` always include it in the response alongside the error.
 
 ### `cleanup`
 Prune completed or stopped process records to free memory.
@@ -205,6 +211,7 @@ Prune completed or stopped process records to free memory.
 *   **Parameters**:
     *   `completed_older_than_ms` (integer, default: `3600000`): Prunes completed processes older than this threshold (1 hour default).
     *   `stopped_older_than_ms` (integer, default: `3600000`): Prunes stopped, timed-out, or failed processes older than this threshold (1 hour default).
+*   **Returns**: `removed` — the count of process records that were pruned.
 
 ---
 
@@ -216,6 +223,7 @@ To avoid sending duplicate data over the MCP protocol (which can consume context
 2. When calling `exec`, `read`, or `wait`, the response includes a `next_seq` value representing the index of the next chunk to be written.
 3. To retrieve only *new* output, call `read` with `since_seq` set to the previously received `next_seq`.
 4. Omitting `since_seq` returns the entire contents currently stored in the buffer (clamped by `max_output_bytes`).
+5. If output exceeds the ring buffer's capacity between reads, older data is evicted and `since_seq` may no longer be available. In that case, `truncated` is set to `true` and the read returns data from the earliest retained sequence onward.
 
 When a process exits normally, `exec`/`wait` responses include output drained through stdout/stderr EOF. If a descendant keeps inherited stdout/stderr open after the tracked process exits, the server stops waiting on those inherited pipes to avoid indefinite blocking; output written only by that descendant after the tracked process exits is not part of the managed process result.
 
@@ -230,7 +238,7 @@ Configure the server by setting these environment variables prior to launch:
 | `YIELDSHELL_DEFAULT_CWD` | Current directory | The fallback working directory for commands. |
 | `YIELDSHELL_ALLOWED_CWDS` | *(none)* | A list of allowed directory paths separated by `os.pathsep` (e.g., `:` on UNIX, `;` on Windows). If set, all command execution paths must resolve inside one of these roots. |
 | `YIELDSHELL_MAX_OUTPUT_BYTES` | `20000` | The default and maximum capacity of the ring buffers for stdout/stderr. |
-| `YIELDSHELL_MAX_PROCESSES` | `50` | Maximum concurrent managed processes. Spawning a new command when this limit is reached will return `failed_to_start`. |
+| `YIELDSHELL_MAX_PROCESSES` | `50` | Maximum concurrent running processes. Completed, stopped, timed-out, and failed processes do not count against this limit. Spawning a new command when this limit is reached will return `failed_to_start`. |
 | `YIELDSHELL_DEFAULT_YIELD_MS` | `5000` | Fallback delay before auto-yielding. |
 | `YIELDSHELL_MAX_YIELD_MS` | `300000` | The maximum allowed value for the `yield_ms` parameter. |
 | `YIELDSHELL_DEFAULT_TIMEOUT_MS` | `0` | Default hard runtime limit (0 means no limit). |
