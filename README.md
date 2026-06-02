@@ -136,6 +136,8 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
 
 *   **Parameters**:
     *   `command` (string, **required**): The command string to execute in the shell.
+    *   `side_effects` (array of string, **required**): The side-effect categories this command may plausibly have. Must contain at least one entry drawn from the enum below. Use `["NONE"]` for commands with no meaningful side effects. `NONE` is exclusive and must not be combined with any other category. The server rejects the call with `failed_to_start` if any declared category is configured as blocked.
+        *   Allowed values: `NONE`, `MODIFIES_WORKSPACE_FILES`, `MODIFIES_PROTECTED_FILES`, `MODIFIES_OUTSIDE_WORKSPACE`, `DELETES_FILES`, `INSTALLS_DEPENDENCIES`, `CHANGES_SYSTEM_CONFIGURATION`, `BREAKS_OPERATING_SYSTEM`, `AFFECTS_PRODUCTION_SERVICES`, `STOPS_OR_RESTARTS_SERVICES`, `EXPOSES_SECRETS`, `CREATES_SECURITY_RISK`, `CHANGES_NETWORK_CONFIGURATION`, `MAKES_NETWORK_REQUESTS`, `RUNS_PRIVILEGED_COMMANDS`, `USES_DESTRUCTIVE_GIT_OPERATION`, `CONSUMES_SIGNIFICANT_RESOURCES`, `OTHER`, `UNKNOWN`.
     *   `cwd` (string, optional): Working directory for the command. Must be under allowed roots if `YIELDSHELL_ALLOWED_CWDS` is set. Defaults to `YIELDSHELL_DEFAULT_CWD`.
     *   `env` (object of string to string, optional): Additive environment variable overlay. Merged into the parent environment.
     *   `shell` (string, optional): Accepted but has no effect in v1. Commands always run via the platform's default shell.
@@ -245,12 +247,14 @@ Configure the server by setting these environment variables prior to launch:
 | `YIELDSHELL_DENY_COMMAND_REGEX` | *(none)* | A regular expression pattern. Commands matching this pattern are blocked before starting. |
 | `YIELDSHELL_ALLOW_COMMAND_REGEX` | *(none)* | A regular expression pattern. If set, only commands matching this pattern are permitted. |
 | `YIELDSHELL_REDACT_ENV_REGEX` | `TOKEN\|KEY\|SECRET\|PASSWORD` | Regex to identify sensitive environment variable keys. Their values are redacted in stdout/stderr outputs. |
+| `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` | `MODIFIES_PROTECTED_FILES,BREAKS_OPERATING_SYSTEM` | Comma-separated list of `side_effects` enum names the server should reject. Names are case-sensitive. Surrounding whitespace is trimmed and empty entries are ignored. Invalid names cause startup to fail. Set to `,` (or any value that resolves to no entries) to clear the default blocklist. |
 
 ---
 
 ## Security Notes
 
 *   **Arbitrary Code Execution**: This server executes shell commands on the host system. Always run the server inside a container, sandbox, or isolated development VM.
+*   **Side-Effect Declarations**: Every `exec` call must declare its plausible side-effect categories via `side_effects`. By default, `MODIFIES_PROTECTED_FILES` and `BREAKS_OPERATING_SYSTEM` are blocked. Operators can adjust the blocklist via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`. This is an explicit risk signal — it is not a complete sandbox, and LLM under-declaration remains possible.
 *   **Path Validation**: CWD path verification uses absolute paths (`resolve()`), preventing path-traversal attacks (`../`) outside the allowed roots.
 *   **Additive Environments**: The `env` argument overlays existing env parameters. It merges with the parent process environment instead of completely replacing it, protecting critical OS vars.
 *   **Best-effort Redaction**: While values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are scrubbed from outputs, this is a best-effort system. Sensitive data printed through complex formats or argument lists might not be caught.

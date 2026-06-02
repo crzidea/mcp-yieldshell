@@ -6,6 +6,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import Config
 from .process.manager import ProcessManager
+from .types import SideEffect
 
 mcp = FastMCP("YieldShell MCP")
 
@@ -22,6 +23,7 @@ def _get_manager() -> ProcessManager:
 @mcp.tool()
 async def exec(
     command: str,
+    side_effects: list[SideEffect],
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     shell: str | None = None,
@@ -31,9 +33,17 @@ async def exec(
     timeout_ms: int | None = None,
     max_output_bytes: int | None = None,
 ) -> dict:
-    """Execute a shell command with auto-yield for long-running processes."""
+    """Execute a shell command with auto-yield for long-running processes.
+
+    Callers must declare every plausible side effect category in ``side_effects``.
+    If no meaningful side effect is expected, pass ``[SideEffect.NONE]`` or
+    ``["NONE"]``. ``NONE`` is exclusive and must not be combined with any other
+    category. The server rejects the command before spawning a process if any
+    declared category is configured as blocked.
+    """
     return await _get_manager().exec_command(
         command=command,
+        side_effects=side_effects,
         cwd=cwd,
         env_overlay=env,
         shell=shell,

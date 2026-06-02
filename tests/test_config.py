@@ -2,7 +2,10 @@
 
 import os
 
+import pytest
+
 from mcp_yieldshell.config import Config
+from mcp_yieldshell.types import DEFAULT_BLOCKED_SIDE_EFFECTS, SideEffect
 
 
 class TestConfigDefaults:
@@ -90,3 +93,128 @@ class TestConfigFromEnv:
         monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "abc")
         config = Config()
         assert config.max_processes == 50
+
+
+class TestBlockedSideEffectsDefaults:
+    def test_unset_uses_default_blocked_set(self, monkeypatch):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        assert config.blocked_side_effects == DEFAULT_BLOCKED_SIDE_EFFECTS
+
+    def test_unset_default_blocks_modifies_protected_files(self, monkeypatch):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        assert SideEffect.MODIFIES_PROTECTED_FILES in config.blocked_side_effects
+
+    def test_unset_default_blocks_breaks_operating_system(self, monkeypatch):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        assert SideEffect.BREAKS_OPERATING_SYSTEM in config.blocked_side_effects
+
+    def test_empty_string_uses_default_blocked_set(self, monkeypatch):
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "")
+        config = Config()
+        assert config.blocked_side_effects == DEFAULT_BLOCKED_SIDE_EFFECTS
+
+    def test_whitespace_only_uses_default_blocked_set(self, monkeypatch):
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "   ")
+        config = Config()
+        assert config.blocked_side_effects == DEFAULT_BLOCKED_SIDE_EFFECTS
+
+
+class TestBlockedSideEffectsFromEnv:
+    def test_single_value_parsed(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "DELETES_FILES"
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset({SideEffect.DELETES_FILES})
+
+    def test_multiple_values_parsed(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "DELETES_FILES,MAKES_NETWORK_REQUESTS,INSTALLS_DEPENDENCIES",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {
+                SideEffect.DELETES_FILES,
+                SideEffect.MAKES_NETWORK_REQUESTS,
+                SideEffect.INSTALLS_DEPENDENCIES,
+            }
+        )
+
+    def test_whitespace_trimmed(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "  DELETES_FILES  ,\t MAKES_NETWORK_REQUESTS \t",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {SideEffect.DELETES_FILES, SideEffect.MAKES_NETWORK_REQUESTS}
+        )
+
+    def test_empty_entries_ignored(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            ",,DELETES_FILES, ,,",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset({SideEffect.DELETES_FILES})
+
+    def test_can_clear_blocked_categories(self, monkeypatch):
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
+        config = Config()
+        assert config.blocked_side_effects == frozenset()
+
+    def test_override_default_to_unblock_modifies_protected_files(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OPERATING_SYSTEM"
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {SideEffect.BREAKS_OPERATING_SYSTEM}
+        )
+
+
+class TestBlockedSideEffectsInvalid:
+    def test_lowercase_value_fails_clearly(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "modifies_protected_files"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "modifies_protected_files" in message
+        assert "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS" in message
+        assert "case-sensitive" in message
+
+    def test_typo_value_fails_clearly(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "DELETES_FILE"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "DELETES_FILE" in message
+        assert "DELETES_FILES" in message  # listed in the valid set
+
+    def test_completely_unknown_value_fails_clearly(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "TELEPORT_COWS"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "TELEPORT_COWS" in message
+        assert "Valid values" in message
+
+    def test_mixed_valid_and_invalid_fails_clearly(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "DELETES_FILES,TELEPORT_COWS,MAKES_NETWORK_REQUESTS",
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "TELEPORT_COWS" in message

@@ -21,12 +21,16 @@ graph TD
 *   **`ProcessManager`** (`src/mcp_yieldshell/process/manager.py`):
     *   Acts as the central registry tracking active and completed processes in a dictionary mapped by unique IDs (`proc_<hex>`).
     *   Implements the core MCP tool logic (`exec_command`, `read_output`, `write_input`, `wait_process`, `stop_process`, `list_processes`, `cleanup`).
+    *   `exec_command` enforces the required `side_effects` declaration (see `src/mcp_yieldshell/types.py`) before cwd validation, command policy evaluation, process-limit checks, environment overlay building, and subprocess spawn.
     *   `wait_process` caps its effective wait at `MAX_EFFECTIVE_WAIT_MS` (55 s) to avoid MCP request timeouts.
 *   **`ManagedProcess`** (`src/mcp_yieldshell/process/manager.py`):
     *   Groups the underlying `asyncio.subprocess.Process` handle with its stdout/stderr buffers, status, and active control tasks.
 *   **`RingBuffer`** (`src/mcp_yieldshell/process/ring_buffer.py`):
     *   Maintains a fixed-size, byte-capped buffer for stdout and stderr to avoid unbounded memory growth.
     *   Tracks sequence numbers for chunks of bytes. Readers query the buffer with `since_seq` to retrieve incremental logs.
+*   **`SideEffect`** (`src/mcp_yieldshell/types.py`):
+    *   String enum of the canonical side-effect categories a command can declare. Shared with config parsing, MCP schema generation, and runtime validation.
+    *   Default blocked set: `MODIFIES_PROTECTED_FILES`, `BREAKS_OPERATING_SYSTEM`. Configurable via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`.
 
 ---
 
@@ -52,10 +56,11 @@ Whenever a command is executed, `ProcessManager` schedules several async tasks:
 
 This is a Python 3.11 package using a `src/` layout:
 *   `src/mcp_yieldshell/server.py` and `__main__.py` contain the MCP server wiring and CLI entry points.
-*   `src/mcp_yieldshell/config.py` handles environment-based configuration parsing.
+*   `src/mcp_yieldshell/config.py` handles environment-based configuration parsing, including the `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` blocklist.
+*   `src/mcp_yieldshell/types.py` defines the `SideEffect` enum, default blocked set, and process status types.
 *   `src/mcp_yieldshell/security.py` controls allowed path roots, command regex rules, and environment overlays/redactions.
 *   `src/mcp_yieldshell/process/` contains execution, buffer, and lifecycle management.
-*   `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`).
+*   `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`, `test_side_effects.py`).
 
 ---
 

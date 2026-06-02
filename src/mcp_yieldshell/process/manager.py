@@ -7,11 +7,11 @@ import os
 import sys
 import time
 import uuid
-from typing import Any
+from typing import Any, Iterable
 
 from ..config import Config
 from ..security import redact_text
-from ..types import ProcessInfo, ProcessStatus
+from ..types import ProcessInfo, ProcessStatus, SideEffect
 from .ring_buffer import RingBuffer
 from .spawn import kill_process, spawn_process, terminate_process
 
@@ -81,9 +81,74 @@ class ProcessManager:
             return self._config.default_timeout_ms
         return max(0, requested)
 
+    def _normalize_side_effects(
+        self, side_effects: Iterable[Any] | None
+    ) -> list[SideEffect] | None:
+        """Coerce ``side_effects`` entries into ``SideEffect`` enum members.
+
+        Accepts ``SideEffect`` instances or strings. Returns ``None`` when
+        ``side_effects`` itself is ``None``. Raises ``TypeError`` when an
+        entry is not a string and not a ``SideEffect``.
+        """
+        if side_effects is None:
+            return None
+        normalized: list[SideEffect] = []
+        for item in side_effects:
+            if isinstance(item, SideEffect):
+                normalized.append(item)
+            elif isinstance(item, str):
+                normalized.append(SideEffect(item))
+            else:
+                raise TypeError(
+                    f"side_effects entries must be SideEffect or str, got {type(item).__name__}"
+                )
+        return normalized
+
+    def _check_side_effects(
+        self, side_effects: Iterable[SideEffect] | None
+    ) -> str | None:
+        """Validate the side-effect declaration.
+
+        Returns an error message if the declaration is invalid (empty list,
+        ``NONE`` combined with another value, or any declared category is
+        configured as blocked). Returns ``None`` when the declaration is
+        allowed and execution can proceed.
+        """
+        try:
+            declared = self._normalize_side_effects(side_effects)
+        except ValueError as exc:
+            return f"Invalid side_effects: {exc}"
+        except TypeError as exc:
+            return str(exc)
+        if declared is None:
+            return "side_effects is required"
+        if not declared:
+            return (
+                'side_effects must not be empty; pass ["NONE"] for commands '
+                "with no side effects"
+            )
+        has_none = SideEffect.NONE in declared
+        non_none = [s for s in declared if s is not SideEffect.NONE]
+        if has_none and non_none:
+            return (
+                "side_effects=NONE is exclusive and cannot be combined with other "
+                f"categories: {[s.name for s in non_none]}"
+            )
+
+        blocked = self._config.blocked_side_effects
+        hits = [s for s in declared if s in blocked]
+        if hits:
+            names = ", ".join(s.name for s in hits)
+            return (
+                f"Side-effect category blocked by policy: {names}. "
+                "Re-declare with an allowed category or update operator policy."
+            )
+        return None
+
     async def exec_command(
         self,
         command: str,
+        side_effects: list[SideEffect] | Iterable[SideEffect],
         cwd: str | None = None,
         env_overlay: dict[str, str] | None = None,
         shell: str | None = None,
@@ -93,8 +158,20 @@ class ProcessManager:
         timeout_ms: int | None = None,
         max_output_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """Execute a shell command with auto-yield behavior."""
+        """Execute a shell command with auto-yield behavior.
+
+        The ``side_effects`` declaration is validated before any cwd or command
+        policy check, before process-limit checks, before environment overlay
+        construction, and before subprocess spawn.
+        """
         from ..security import build_env, resolve_cwd, validate_command
+
+        # Validate side-effect declaration first so blocked categories never
+        # reach cwd resolution, command policy, process limits, env overlay
+        # building, or process spawn.
+        side_effects_error = self._check_side_effects(side_effects)
+        if side_effects_error:
+            return {"status": "failed_to_start", "error": side_effects_error}
 
         # Validate command policy
         cmd_error = validate_command(self._config, command)
