@@ -44,37 +44,37 @@ async def exec(
     The server rejects the call with ``failed_to_start`` (and stops before
     cwd validation, command policy, process-limit checks, env construction,
     and spawn) if any declared category is configured as blocked. By
-    default, ``MODIFIES_PROTECTED_FILES``, ``BREAKS_OPERATING_SYSTEM``,
-    ``GENERATES_EXECUTABLE_CONTENT``, ``BREAKS_OS_USER_SETTINGS``, and
-    ``KILLS_AGENT_PROCESS`` are blocked. The error message names
+    default, ``KILLS_AGENT_PROCESS``, ``MODIFIES_OS_SETTINGS``,
+    ``MODIFIES_OS_USER_SETTINGS``, ``MODIFIES_PROTECTED_FILES``, and
+    ``RUNS_INLINE_CODE`` are blocked. The error message names
     each blocked category, states that execution was stopped by policy
     before the process started, and gives a category-specific safer next
     action.
 
-    ``GENERATES_EXECUTABLE_CONTENT`` covers opaque inline content that is
-    difficult to inspect before execution (long generated code, scripts,
-    shell pipelines, SQL, configuration, heredocs, encoded payloads, and
-    generated files executed immediately). When a command falls into that
-    category, prefer writing the content to a reviewable workspace file
-    and executing it in a small, inspectable step rather than piping or
-    inlining it as a single ``exec`` call. ``GENERATES_EXECUTABLE_CONTENT``
-    is in the default blocklist; the safer next action is to write a
-    reviewable file and then run it.
+    ``RUNS_INLINE_CODE`` covers commands that execute code supplied inline
+    to an interpreter or shell (e.g. ``python -c``, ``node -e``,
+    ``curl ... | sh``). It does not cover simply creating a script or
+    executable file unless the same command also executes inline code.
+    When a command falls into that category, prefer writing the content to
+    a reviewable workspace file and executing it in a small, inspectable
+    step rather than piping or inlining it as a single ``exec`` call.
+    ``RUNS_INLINE_CODE`` is in the default blocklist; the safer next
+    action is to write a reviewable file and then run it.
 
     Concise examples (full guidance and the complete side-effect taxonomy
     live in the README):
 
     *   Read-only command: ``side_effects=["NONE"]``
     *   Workspace write: ``side_effects=["MODIFIES_WORKSPACE_FILES"]``
-    *   Dependency install: ``side_effects=["INSTALLS_DEPENDENCIES",
+    *   Dependency install: ``side_effects=["CHANGES_PACKAGES_OR_DEPENDENCIES",
         "MAKES_NETWORK_REQUESTS"]``
     *   Network access: ``side_effects=["MAKES_NETWORK_REQUESTS"]``
     *   Destructive file ops: ``side_effects=["DELETES_FILES"]``
     *   Privileged command: ``side_effects=["RUNS_PRIVILEGED_COMMANDS"]``
     *   Protected-file change: ``side_effects=["MODIFIES_PROTECTED_FILES"]``
-    *   Inline generated content: prefer to write the content to a
+    *   Inline code execution: prefer to write the content to a
         reviewable file and run it; declaring
-        ``side_effects=["GENERATES_EXECUTABLE_CONTENT"]`` will be rejected
+        ``side_effects=["RUNS_INLINE_CODE"]`` will be rejected
         under the default policy.
     """
     return await _get_manager().exec_command(

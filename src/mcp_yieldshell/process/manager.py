@@ -23,24 +23,27 @@ _BLOCKED_CATEGORY_GUIDANCE: dict[SideEffect, str] = {
         "Do not modify protected files; use a workspace-scoped path or ask "
         "the operator to update the policy via MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS."
     ),
-    SideEffect.BREAKS_OPERATING_SYSTEM: (
-        "Do not run OS-breaking or system-damaging commands; re-declare with "
-        "a safer category or request an explicit policy override."
+    SideEffect.MODIFIES_OS_SETTINGS: (
+        "Do not change OS-level configuration such as systemd units, kernel "
+        "parameters, /etc files, package manager system config, or global "
+        "service defaults; re-declare with a safer category or request an "
+        "explicit policy override."
+    ),
+    SideEffect.MODIFIES_OS_USER_SETTINGS: (
+        "Do not change user-level configuration such as shell rc files, XDG "
+        "config directories, dotfiles, or per-user application preferences; "
+        "re-declare with a safer category or request an explicit policy "
+        "override."
     ),
     SideEffect.DELETES_FILES: (
         "Avoid deletion; prefer reversible edits, or request explicit "
         "confirmation when deletion is truly required."
     ),
-    SideEffect.GENERATES_EXECUTABLE_CONTENT: (
-        "Do not pipe or inline large generated code, scripts, shell "
-        "pipelines, SQL, configuration, heredocs, or encoded payloads into "
-        "a single exec call; create or edit a reviewable workspace file "
-        "and execute it in a small, inspectable step."
-    ),
-    SideEffect.BREAKS_OS_USER_SETTINGS: (
-        "Do not run commands that may damage or globally disrupt settings "
-        "for the current OS user; re-declare with a safer category or "
-        "request an explicit policy override."
+    SideEffect.RUNS_INLINE_CODE: (
+        "Do not execute code supplied inline to an interpreter or shell "
+        "(e.g. python -c, node -e, curl ... | sh); create or edit a "
+        "reviewable workspace file and execute it in a small, inspectable "
+        "step."
     ),
     SideEffect.KILLS_AGENT_PROCESS: (
         "Do not run commands that may terminate the MCP client, agent, or "

@@ -106,33 +106,33 @@ class TestBlockedSideEffectsDefaults:
         config = Config()
         assert SideEffect.MODIFIES_PROTECTED_FILES in config.blocked_side_effects
 
-    def test_unset_default_blocks_breaks_operating_system(self, monkeypatch):
+    def test_unset_default_blocks_modifies_os_settings(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        assert SideEffect.BREAKS_OPERATING_SYSTEM in config.blocked_side_effects
+        assert SideEffect.MODIFIES_OS_SETTINGS in config.blocked_side_effects
 
-    def test_unset_default_blocks_generates_executable_content(self, monkeypatch):
+    def test_unset_default_blocks_runs_inline_code(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         assert (
-            SideEffect.GENERATES_EXECUTABLE_CONTENT
+            SideEffect.RUNS_INLINE_CODE
             in config.blocked_side_effects
         )
 
-    def test_unset_default_blocks_breaks_os_user_settings(self, monkeypatch):
+    def test_unset_default_blocks_modifies_os_user_settings(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        assert SideEffect.BREAKS_OS_USER_SETTINGS in config.blocked_side_effects
+        assert SideEffect.MODIFIES_OS_USER_SETTINGS in config.blocked_side_effects
 
     def test_unset_default_blocks_kills_agent_process(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         assert SideEffect.KILLS_AGENT_PROCESS in config.blocked_side_effects
 
-    def test_default_blocked_set_includes_inline_generated_content(self, monkeypatch):
+    def test_default_blocked_set_includes_runs_inline_code(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         assert (
-            SideEffect.GENERATES_EXECUTABLE_CONTENT in DEFAULT_BLOCKED_SIDE_EFFECTS
+            SideEffect.RUNS_INLINE_CODE in DEFAULT_BLOCKED_SIDE_EFFECTS
         )
 
     def test_empty_string_uses_default_blocked_set(self, monkeypatch):
@@ -157,14 +157,14 @@ class TestBlockedSideEffectsFromEnv:
     def test_multiple_values_parsed(self, monkeypatch):
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
-            "DELETES_FILES,MAKES_NETWORK_REQUESTS,INSTALLS_DEPENDENCIES",
+            "DELETES_FILES,MAKES_NETWORK_REQUESTS,CHANGES_PACKAGES_OR_DEPENDENCIES",
         )
         config = Config()
         assert config.blocked_side_effects == frozenset(
             {
                 SideEffect.DELETES_FILES,
                 SideEffect.MAKES_NETWORK_REQUESTS,
-                SideEffect.INSTALLS_DEPENDENCIES,
+                SideEffect.CHANGES_PACKAGES_OR_DEPENDENCIES,
             }
         )
 
@@ -193,11 +193,11 @@ class TestBlockedSideEffectsFromEnv:
 
     def test_override_default_to_unblock_modifies_protected_files(self, monkeypatch):
         monkeypatch.setenv(
-            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OPERATING_SYSTEM"
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_OS_SETTINGS"
         )
         config = Config()
         assert config.blocked_side_effects == frozenset(
-            {SideEffect.BREAKS_OPERATING_SYSTEM}
+            {SideEffect.MODIFIES_OS_SETTINGS}
         )
 
     def test_explicit_env_can_clear_all_defaults(self, monkeypatch):
@@ -205,7 +205,7 @@ class TestBlockedSideEffectsFromEnv:
         config = Config()
         assert config.blocked_side_effects == frozenset()
         assert (
-            SideEffect.GENERATES_EXECUTABLE_CONTENT
+            SideEffect.RUNS_INLINE_CODE
             not in config.blocked_side_effects
         )
         assert (
@@ -213,11 +213,11 @@ class TestBlockedSideEffectsFromEnv:
             not in config.blocked_side_effects
         )
         assert (
-            SideEffect.BREAKS_OPERATING_SYSTEM
+            SideEffect.MODIFIES_OS_SETTINGS
             not in config.blocked_side_effects
         )
         assert (
-            SideEffect.BREAKS_OS_USER_SETTINGS
+            SideEffect.MODIFIES_OS_USER_SETTINGS
             not in config.blocked_side_effects
         )
         assert (
@@ -225,44 +225,44 @@ class TestBlockedSideEffectsFromEnv:
             not in config.blocked_side_effects
         )
 
-    def test_explicit_env_can_add_inline_generated_only(self, monkeypatch):
+    def test_explicit_env_can_add_runs_inline_code_only(self, monkeypatch):
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
-            "GENERATES_EXECUTABLE_CONTENT",
+            "RUNS_INLINE_CODE",
         )
         config = Config()
         assert config.blocked_side_effects == frozenset(
-            {SideEffect.GENERATES_EXECUTABLE_CONTENT}
+            {SideEffect.RUNS_INLINE_CODE}
         )
         assert (
             SideEffect.MODIFIES_PROTECTED_FILES
             not in config.blocked_side_effects
         )
 
-    def test_explicit_env_can_combine_inline_generated_with_other(
+    def test_explicit_env_can_combine_runs_inline_code_with_other(
         self, monkeypatch
     ):
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
-            "DELETES_FILES,GENERATES_EXECUTABLE_CONTENT,MODIFIES_PROTECTED_FILES",
+            "DELETES_FILES,RUNS_INLINE_CODE,MODIFIES_PROTECTED_FILES",
         )
         config = Config()
         assert config.blocked_side_effects == frozenset(
             {
                 SideEffect.DELETES_FILES,
-                SideEffect.GENERATES_EXECUTABLE_CONTENT,
+                SideEffect.RUNS_INLINE_CODE,
                 SideEffect.MODIFIES_PROTECTED_FILES,
             }
         )
 
-    def test_explicit_env_can_add_breaks_os_user_settings_only(self, monkeypatch):
+    def test_explicit_env_can_add_modifies_os_user_settings_only(self, monkeypatch):
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
-            "BREAKS_OS_USER_SETTINGS",
+            "MODIFIES_OS_USER_SETTINGS",
         )
         config = Config()
         assert config.blocked_side_effects == frozenset(
-            {SideEffect.BREAKS_OS_USER_SETTINGS}
+            {SideEffect.MODIFIES_OS_USER_SETTINGS}
         )
         assert (
             SideEffect.MODIFIES_PROTECTED_FILES
@@ -288,13 +288,13 @@ class TestBlockedSideEffectsFromEnv:
     ):
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
-            "DELETES_FILES,BREAKS_OS_USER_SETTINGS,KILLS_AGENT_PROCESS",
+            "DELETES_FILES,MODIFIES_OS_USER_SETTINGS,KILLS_AGENT_PROCESS",
         )
         config = Config()
         assert config.blocked_side_effects == frozenset(
             {
                 SideEffect.DELETES_FILES,
-                SideEffect.BREAKS_OS_USER_SETTINGS,
+                SideEffect.MODIFIES_OS_USER_SETTINGS,
                 SideEffect.KILLS_AGENT_PROCESS,
             }
         )
@@ -341,3 +341,39 @@ class TestBlockedSideEffectsInvalid:
             Config()
         message = str(excinfo.value)
         assert "TELEPORT_COWS" in message
+
+    def test_old_name_breaks_operating_system_rejected(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OPERATING_SYSTEM"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "BREAKS_OPERATING_SYSTEM" in message
+
+    def test_old_name_generates_executable_content_rejected(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "GENERATES_EXECUTABLE_CONTENT"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "GENERATES_EXECUTABLE_CONTENT" in message
+
+    def test_old_name_breaks_os_user_settings_rejected(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OS_USER_SETTINGS"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "BREAKS_OS_USER_SETTINGS" in message
+
+    def test_old_name_install_dependencies_rejected(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "INSTALLS_DEPENDENCIES"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            Config()
+        message = str(excinfo.value)
+        assert "INSTALLS_DEPENDENCIES" in message

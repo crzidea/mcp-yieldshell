@@ -45,30 +45,34 @@ class TestExecSchema:
         expected = [member.value for member in SideEffect]
         assert enum_values == expected
         for canonical in (
-            "NONE",
-            "MODIFIES_WORKSPACE_FILES",
-            "MODIFIES_PROTECTED_FILES",
-            "MODIFIES_OUTSIDE_WORKSPACE",
-            "DELETES_FILES",
-            "INSTALLS_DEPENDENCIES",
-            "CHANGES_SYSTEM_CONFIGURATION",
-            "BREAKS_OPERATING_SYSTEM",
-            "AFFECTS_PRODUCTION_SERVICES",
-            "STOPS_OR_RESTARTS_SERVICES",
-            "EXPOSES_SECRETS",
-            "CREATES_SECURITY_RISK",
             "CHANGES_NETWORK_CONFIGURATION",
-            "MAKES_NETWORK_REQUESTS",
-            "RUNS_PRIVILEGED_COMMANDS",
-            "USES_DESTRUCTIVE_GIT_OPERATION",
+            "CHANGES_PACKAGES_OR_DEPENDENCIES",
             "CONSUMES_SIGNIFICANT_RESOURCES",
-            "GENERATES_EXECUTABLE_CONTENT",
-            "BREAKS_OS_USER_SETTINGS",
+            "DELETES_FILES",
+            "EXPOSES_SECRETS",
             "KILLS_AGENT_PROCESS",
+            "MAKES_NETWORK_REQUESTS",
+            "MODIFIES_OS_SETTINGS",
+            "MODIFIES_OS_USER_SETTINGS",
+            "MODIFIES_OUTSIDE_WORKSPACE",
+            "MODIFIES_PRODUCTION_SERVICES",
+            "MODIFIES_PROTECTED_FILES",
+            "MODIFIES_SECURITY_CONTROLS",
+            "MODIFIES_WORKSPACE_FILES",
+            "NONE",
             "OTHER",
+            "RUNS_INLINE_CODE",
+            "RUNS_PRIVILEGED_COMMANDS",
+            "STOPS_OR_RESTARTS_SERVICES",
             "UNKNOWN",
+            "USES_DESTRUCTIVE_GIT_OPERATION",
         ):
             assert canonical in enum_values
+
+    def test_side_effect_enum_schema_order_is_alphabetical(self):
+        schema = _exec_tool_schema()
+        enum_values = schema["$defs"]["SideEffect"]["enum"]
+        assert enum_values == sorted(enum_values)
 
     def test_side_effect_enum_def_is_type_string(self):
         schema = _exec_tool_schema()
@@ -155,15 +159,15 @@ class TestBlockedRejection:
         assert "blocked by policy" in result["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_blocked_breaks_operating_system_rejected(self, monkeypatch):
+    async def test_blocked_modifies_os_settings_rejected(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["BREAKS_OPERATING_SYSTEM"]
+            "echo hello", side_effects=["MODIFIES_OS_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
-        assert "BREAKS_OPERATING_SYSTEM" in result["error"]
+        assert "MODIFIES_OS_SETTINGS" in result["error"]
 
     @pytest.mark.asyncio
     async def test_rejection_names_all_blocked_categories(self, monkeypatch):
@@ -248,21 +252,21 @@ class TestBlockedRejection:
         assert "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS" in message
 
     @pytest.mark.asyncio
-    async def test_blocked_breaks_operating_system_feedback_safer_action(
+    async def test_blocked_modifies_os_settings_feedback_safer_action(
         self, monkeypatch
     ):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["BREAKS_OPERATING_SYSTEM"]
+            "echo hello", side_effects=["MODIFIES_OS_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
         message = result["error"]
-        assert "BREAKS_OPERATING_SYSTEM" in message
+        assert "MODIFIES_OS_SETTINGS" in message
         assert "stopped by policy" in message.lower()
         # Category-specific corrective guidance:
-        assert "OS-breaking" in message or "system-damaging" in message
+        assert "OS-level" in message or "systemd" in message or "/etc" in message
         assert "re-declare" in message.lower()
 
     @pytest.mark.asyncio
@@ -284,7 +288,7 @@ class TestBlockedRejection:
         assert "reversible" in message.lower()
 
     @pytest.mark.asyncio
-    async def test_blocked_generates_executable_content_default_rejected(
+    async def test_blocked_runs_inline_code_default_rejected(
         self, monkeypatch
     ):
         """The new category is in the default blocklist when env is unset."""
@@ -292,11 +296,11 @@ class TestBlockedRejection:
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["GENERATES_EXECUTABLE_CONTENT"]
+            "echo hello", side_effects=["RUNS_INLINE_CODE"]
         )
         assert result["status"] == "failed_to_start"
         message = result["error"]
-        assert "GENERATES_EXECUTABLE_CONTENT" in message
+        assert "RUNS_INLINE_CODE" in message
         assert "stopped by policy" in message.lower()
         # Category-specific safer-next-action guidance:
         assert "reviewable" in message.lower()
@@ -304,61 +308,61 @@ class TestBlockedRejection:
         assert "inspectable" in message.lower()
 
     @pytest.mark.asyncio
-    async def test_blocked_generates_executable_content_unblocked_by_env(
+    async def test_blocked_runs_inline_code_unblocked_by_env(
         self, monkeypatch
     ):
-        """Operators can clear the default blocklist to allow inline content."""
+        """Operators can clear the default blocklist to allow inline code."""
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["GENERATES_EXECUTABLE_CONTENT"]
+            "echo hello", side_effects=["RUNS_INLINE_CODE"]
         )
         assert result["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_blocked_generates_executable_content_blocked_alongside_other(
+    async def test_blocked_runs_inline_code_blocked_alongside_other(
         self, monkeypatch
     ):
         """Operators can reconfigure the blocklist to include the new category."""
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
-            "DELETES_FILES,GENERATES_EXECUTABLE_CONTENT",
+            "DELETES_FILES,RUNS_INLINE_CODE",
         )
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
             "echo hello",
-            side_effects=["DELETES_FILES", "GENERATES_EXECUTABLE_CONTENT"],
+            side_effects=["DELETES_FILES", "RUNS_INLINE_CODE"],
         )
         assert result["status"] == "failed_to_start"
         message = result["error"]
-        assert "GENERATES_EXECUTABLE_CONTENT" in message
+        assert "RUNS_INLINE_CODE" in message
         assert "DELETES_FILES" in message
         # The category-specific safer-next-action must be present for the
         # new category even when reported alongside another category.
         assert "reviewable" in message.lower()
 
     @pytest.mark.asyncio
-    async def test_blocked_breaks_os_user_settings_default_rejected(
+    async def test_blocked_modifies_os_user_settings_default_rejected(
         self, monkeypatch
     ):
-        """BREAKS_OS_USER_SETTINGS is in the default blocklist when env is unset."""
+        """MODIFIES_OS_USER_SETTINGS is in the default blocklist when env is unset."""
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+            "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
         message = result["error"]
-        assert "BREAKS_OS_USER_SETTINGS" in message
+        assert "MODIFIES_OS_USER_SETTINGS" in message
         assert "stopped by policy" in message.lower()
         # Category-specific safer-next-action guidance:
-        assert "os user" in message.lower() or "user settings" in message.lower()
+        assert "user" in message.lower() or "settings" in message.lower()
 
     @pytest.mark.asyncio
-    async def test_blocked_breaks_os_user_settings_unblocked_by_env(
+    async def test_blocked_modifies_os_user_settings_unblocked_by_env(
         self, monkeypatch
     ):
         """Operators can clear the default blocklist to allow OS user settings."""
@@ -366,23 +370,23 @@ class TestBlockedRejection:
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+            "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_blocked_breaks_os_user_settings_feedback_safer_action(
+    async def test_blocked_modifies_os_user_settings_feedback_safer_action(
         self, monkeypatch
     ):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+            "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
         message = result["error"]
-        assert "BREAKS_OS_USER_SETTINGS" in message
+        assert "MODIFIES_OS_USER_SETTINGS" in message
         assert "stopped by policy" in message.lower()
         # Category-specific corrective guidance:
         assert "re-declare" in message.lower()
@@ -439,7 +443,7 @@ class TestBlockedRejection:
     async def test_multi_blocked_feedback_lists_every_category(self, monkeypatch):
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
-            "MODIFIES_PROTECTED_FILES,DELETES_FILES,GENERATES_EXECUTABLE_CONTENT",
+            "MODIFIES_PROTECTED_FILES,DELETES_FILES,RUNS_INLINE_CODE",
         )
         config = Config()
         mgr = ProcessManager(config)
@@ -448,33 +452,33 @@ class TestBlockedRejection:
             side_effects=[
                 "MODIFIES_PROTECTED_FILES",
                 "DELETES_FILES",
-                "GENERATES_EXECUTABLE_CONTENT",
+                "RUNS_INLINE_CODE",
             ],
         )
         assert result["status"] == "failed_to_start"
         message = result["error"]
         assert "MODIFIES_PROTECTED_FILES" in message
         assert "DELETES_FILES" in message
-        assert "GENERATES_EXECUTABLE_CONTENT" in message
+        assert "RUNS_INLINE_CODE" in message
         # Each category must surface its own guidance line.
         assert "MODIFIES_PROTECTED_FILES:" in message
         assert "DELETES_FILES:" in message
-        assert "GENERATES_EXECUTABLE_CONTENT:" in message
+        assert "RUNS_INLINE_CODE:" in message
 
     @pytest.mark.asyncio
     async def test_generic_category_gets_fallback_guidance(self, monkeypatch):
         """Categories without custom guidance still get a fallback line."""
         monkeypatch.setenv(
-            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "INSTALLS_DEPENDENCIES"
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "CHANGES_PACKAGES_OR_DEPENDENCIES"
         )
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["INSTALLS_DEPENDENCIES"]
+            "echo hello", side_effects=["CHANGES_PACKAGES_OR_DEPENDENCIES"]
         )
         assert result["status"] == "failed_to_start"
         message = result["error"]
-        assert "INSTALLS_DEPENDENCIES" in message
+        assert "CHANGES_PACKAGES_OR_DEPENDENCIES" in message
         assert "stopped by policy" in message.lower()
         # The fallback generic guidance must be present.
         assert "re-declare" in message.lower() or "operator policy" in message.lower()
@@ -492,12 +496,12 @@ class TestConfigEmptyBlockSet:
         assert result["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_unblocking_allows_breaks_os_user_settings(self, monkeypatch):
+    async def test_unblocking_allows_modifies_os_user_settings(self, monkeypatch):
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+            "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "completed"
 
@@ -575,17 +579,17 @@ class TestRejectionOrdering:
         """A blocked inline-generated call must reject before cwd policy."""
         monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", "/allowed")
         monkeypatch.setenv(
-            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "GENERATES_EXECUTABLE_CONTENT"
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "RUNS_INLINE_CODE"
         )
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
             "echo hello",
             cwd="/etc",
-            side_effects=["GENERATES_EXECUTABLE_CONTENT"],
+            side_effects=["RUNS_INLINE_CODE"],
         )
         assert result["status"] == "failed_to_start"
-        assert "GENERATES_EXECUTABLE_CONTENT" in result["error"]
+        assert "RUNS_INLINE_CODE" in result["error"]
         assert "not under allowed roots" not in result["error"]
 
     @pytest.mark.asyncio
@@ -593,15 +597,15 @@ class TestRejectionOrdering:
         """A blocked inline-generated call must reject before command policy."""
         monkeypatch.setenv("YIELDSHELL_DENY_COMMAND_REGEX", r"echo")
         monkeypatch.setenv(
-            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "GENERATES_EXECUTABLE_CONTENT"
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "RUNS_INLINE_CODE"
         )
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["GENERATES_EXECUTABLE_CONTENT"]
+            "echo hello", side_effects=["RUNS_INLINE_CODE"]
         )
         assert result["status"] == "failed_to_start"
-        assert "GENERATES_EXECUTABLE_CONTENT" in result["error"]
+        assert "RUNS_INLINE_CODE" in result["error"]
         assert "denied by policy" not in result["error"]
 
     @pytest.mark.asyncio
@@ -609,35 +613,35 @@ class TestRejectionOrdering:
         """A blocked inline-generated call must reject before the process limit."""
         monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "1")
         monkeypatch.setenv(
-            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "GENERATES_EXECUTABLE_CONTENT"
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "RUNS_INLINE_CODE"
         )
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
             "sleep 60",
-            side_effects=["GENERATES_EXECUTABLE_CONTENT"],
+            side_effects=["RUNS_INLINE_CODE"],
             yield_ms=0,
         )
         assert result["status"] == "failed_to_start"
-        assert "GENERATES_EXECUTABLE_CONTENT" in result["error"]
+        assert "RUNS_INLINE_CODE" in result["error"]
         assert "limit" not in result["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_breaks_os_user_settings_runs_before_cwd_policy(self, monkeypatch):
-        """A blocked BREAKS_OS_USER_SETTINGS must reject before cwd policy."""
+    async def test_modifies_os_user_settings_runs_before_cwd_policy(self, monkeypatch):
+        """A blocked MODIFIES_OS_USER_SETTINGS must reject before cwd policy."""
         monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", "/allowed")
         monkeypatch.setenv(
-            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OS_USER_SETTINGS"
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_OS_USER_SETTINGS"
         )
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
             "echo hello",
             cwd="/etc",
-            side_effects=["BREAKS_OS_USER_SETTINGS"],
+            side_effects=["MODIFIES_OS_USER_SETTINGS"],
         )
         assert result["status"] == "failed_to_start"
-        assert "BREAKS_OS_USER_SETTINGS" in result["error"]
+        assert "MODIFIES_OS_USER_SETTINGS" in result["error"]
         assert "not under allowed roots" not in result["error"]
 
     @pytest.mark.asyncio
@@ -659,21 +663,21 @@ class TestRejectionOrdering:
         assert "not under allowed roots" not in result["error"]
 
     @pytest.mark.asyncio
-    async def test_breaks_os_user_settings_runs_before_command_policy(
+    async def test_modifies_os_user_settings_runs_before_command_policy(
         self, monkeypatch
     ):
-        """A blocked BREAKS_OS_USER_SETTINGS must reject before command policy."""
+        """A blocked MODIFIES_OS_USER_SETTINGS must reject before command policy."""
         monkeypatch.setenv("YIELDSHELL_DENY_COMMAND_REGEX", r"echo")
         monkeypatch.setenv(
-            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OS_USER_SETTINGS"
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_OS_USER_SETTINGS"
         )
         config = Config()
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
-            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+            "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
-        assert "BREAKS_OS_USER_SETTINGS" in result["error"]
+        assert "MODIFIES_OS_USER_SETTINGS" in result["error"]
         assert "denied by policy" not in result["error"]
 
     @pytest.mark.asyncio
@@ -699,28 +703,27 @@ class TestSideEffectEnumCanonical:
     def test_canonical_names_match_spec(self):
         names = {member.name for member in SideEffect}
         expected = {
-            "NONE",
-            "MODIFIES_WORKSPACE_FILES",
-            "MODIFIES_PROTECTED_FILES",
-            "MODIFIES_OUTSIDE_WORKSPACE",
-            "DELETES_FILES",
-            "INSTALLS_DEPENDENCIES",
-            "CHANGES_SYSTEM_CONFIGURATION",
-            "BREAKS_OPERATING_SYSTEM",
-            "AFFECTS_PRODUCTION_SERVICES",
-            "STOPS_OR_RESTARTS_SERVICES",
-            "EXPOSES_SECRETS",
-            "CREATES_SECURITY_RISK",
             "CHANGES_NETWORK_CONFIGURATION",
-            "MAKES_NETWORK_REQUESTS",
-            "RUNS_PRIVILEGED_COMMANDS",
-            "USES_DESTRUCTIVE_GIT_OPERATION",
+            "CHANGES_PACKAGES_OR_DEPENDENCIES",
             "CONSUMES_SIGNIFICANT_RESOURCES",
-            "GENERATES_EXECUTABLE_CONTENT",
-            "BREAKS_OS_USER_SETTINGS",
+            "DELETES_FILES",
+            "EXPOSES_SECRETS",
             "KILLS_AGENT_PROCESS",
+            "MAKES_NETWORK_REQUESTS",
+            "MODIFIES_OS_SETTINGS",
+            "MODIFIES_OS_USER_SETTINGS",
+            "MODIFIES_OUTSIDE_WORKSPACE",
+            "MODIFIES_PRODUCTION_SERVICES",
+            "MODIFIES_PROTECTED_FILES",
+            "MODIFIES_SECURITY_CONTROLS",
+            "MODIFIES_WORKSPACE_FILES",
+            "NONE",
             "OTHER",
+            "RUNS_INLINE_CODE",
+            "RUNS_PRIVILEGED_COMMANDS",
+            "STOPS_OR_RESTARTS_SERVICES",
             "UNKNOWN",
+            "USES_DESTRUCTIVE_GIT_OPERATION",
         }
         assert names == expected
 
@@ -730,9 +733,9 @@ class TestSideEffectEnumCanonical:
             assert member.value.isupper() or member.value.replace("_", "").isalpha()
             assert " " not in member.value
 
-    def test_generates_executable_content_is_canonical_name(self):
-        assert hasattr(SideEffect, "GENERATES_EXECUTABLE_CONTENT")
-        assert SideEffect.GENERATES_EXECUTABLE_CONTENT.value == "GENERATES_EXECUTABLE_CONTENT"
+    def test_runs_inline_code_is_canonical_name(self):
+        assert hasattr(SideEffect, "RUNS_INLINE_CODE")
+        assert SideEffect.RUNS_INLINE_CODE.value == "RUNS_INLINE_CODE"
 
 
 class TestExecDocstring:
@@ -746,26 +749,26 @@ class TestExecDocstring:
         assert "NONE" in doc
         assert "exclusive" in doc.lower()
 
-    def test_docstring_surfaces_inline_generated_content_category(self):
+    def test_docstring_surfaces_inline_code_category(self):
         doc = exec.__doc__ or ""
-        assert "GENERATES_EXECUTABLE_CONTENT" in doc
+        assert "RUNS_INLINE_CODE" in doc
 
     def test_docstring_states_category_in_default_blocklist(self):
         doc = exec.__doc__ or ""
         # The docstring must explicitly say the category is in the default
         # blocklist so agents learn it from the schema alone.
         assert "default blocklist" in doc.lower() or "default" in doc.lower()
-        assert "GENERATES_EXECUTABLE_CONTENT" in doc
+        assert "RUNS_INLINE_CODE" in doc
         # Find a sentence that includes the category and a default-blocklist cue.
         lowered = doc.lower()
-        idx = lowered.find("generates_executable_content")
+        idx = lowered.find("runs_inline_code")
         assert idx != -1
-        window = lowered[max(0, idx - 120): idx + 200]
+        window = lowered[max(0, idx - 200): idx + 200]
         assert "default" in window
 
-    def test_docstring_mentions_breaks_os_user_settings(self):
+    def test_docstring_mentions_modifies_os_user_settings(self):
         doc = exec.__doc__ or ""
-        assert "BREAKS_OS_USER_SETTINGS" in doc
+        assert "MODIFIES_OS_USER_SETTINGS" in doc
 
     def test_docstring_mentions_kills_agent_process(self):
         doc = exec.__doc__ or ""
@@ -785,10 +788,10 @@ class TestExecDocstring:
             "MODIFIES_WORKSPACE_FILES",
             "MODIFIES_PROTECTED_FILES",
             "DELETES_FILES",
-            "INSTALLS_DEPENDENCIES",
+            "CHANGES_PACKAGES_OR_DEPENDENCIES",
             "MAKES_NETWORK_REQUESTS",
             "RUNS_PRIVILEGED_COMMANDS",
-            "GENERATES_EXECUTABLE_CONTENT",
+            "RUNS_INLINE_CODE",
         ):
             assert canonical in doc, f"missing example for {canonical}"
 
@@ -803,7 +806,7 @@ class TestReadmeSideEffectsGuide:
 
     def test_readme_lists_all_allowed_enum_values(self, readme_text):
         # The full enum list including the new value must appear in README.
-        assert "GENERATES_EXECUTABLE_CONTENT" in readme_text
+        assert "RUNS_INLINE_CODE" in readme_text
 
     def test_readme_documents_required_and_exclusive_rules(self, readme_text):
         lowered = readme_text.lower()
@@ -820,13 +823,13 @@ class TestReadmeSideEffectsGuide:
             "MODIFIES_WORKSPACE_FILES",
             "MODIFIES_PROTECTED_FILES",
             "DELETES_FILES",
-            "INSTALLS_DEPENDENCIES",
+            "CHANGES_PACKAGES_OR_DEPENDENCIES",
             "MAKES_NETWORK_REQUESTS",
             "RUNS_PRIVILEGED_COMMANDS",
         ):
             assert canonical in readme_text, f"README missing example for {canonical}"
 
-    def test_readme_warns_about_large_inline_generated_content(
+    def test_readme_warns_about_inline_code_execution(
         self, readme_text
     ):
         lowered = readme_text.lower()
@@ -834,34 +837,34 @@ class TestReadmeSideEffectsGuide:
         assert "reviewable" in lowered
         assert "workspace" in lowered
         # The new category must be in the readme's discussion of inline content.
-        assert "GENERATES_EXECUTABLE_CONTENT" in readme_text
+        assert "RUNS_INLINE_CODE" in readme_text
 
-    def test_readme_default_blocklist_mentions_inline_generated(self, readme_text):
+    def test_readme_default_blocklist_mentions_runs_inline_code(self, readme_text):
         # The expanded default blocklist must be visible in the README
         # (configuration table and/or security section).
-        assert "GENERATES_EXECUTABLE_CONTENT" in readme_text
+        assert "RUNS_INLINE_CODE" in readme_text
         # And the security text must reflect the expanded default.
         assert (
             "MODIFIES_PROTECTED_FILES" in readme_text
-            and "BREAKS_OPERATING_SYSTEM" in readme_text
-            and "GENERATES_EXECUTABLE_CONTENT" in readme_text
+            and "MODIFIES_OS_SETTINGS" in readme_text
+            and "RUNS_INLINE_CODE" in readme_text
         )
 
-    def test_readme_default_blocklist_mentions_breaks_os_user_settings(
+    def test_readme_default_blocklist_mentions_modifies_os_user_settings(
         self, readme_text
     ):
-        assert "BREAKS_OS_USER_SETTINGS" in readme_text
+        assert "MODIFIES_OS_USER_SETTINGS" in readme_text
 
     def test_readme_default_blocklist_mentions_kills_agent_process(
         self, readme_text
     ):
         assert "KILLS_AGENT_PROCESS" in readme_text
 
-    def test_readme_documents_breaks_os_user_settings_scoping(self, readme_text):
+    def test_readme_documents_modifies_os_user_settings_scoping(self, readme_text):
         lowered = readme_text.lower()
-        assert "os user settings" in lowered or "user settings" in lowered
-        # Must be distinct from BREAKS_OPERATING_SYSTEM
-        assert "breaks_os_user_settings" in lowered
+        assert "user-level" in lowered or "user settings" in lowered
+        # Must be distinct from MODIFIES_OS_SETTINGS
+        assert "modifies_os_user_settings" in lowered
 
     def test_readme_documents_kills_agent_process_scoping(self, readme_text):
         lowered = readme_text.lower()

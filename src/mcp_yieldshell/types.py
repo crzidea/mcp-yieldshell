@@ -22,45 +22,64 @@ class SideEffect(str, Enum):
     ``[SideEffect.NONE]``. ``NONE`` is exclusive and must not be combined
     with any other category.
 
-    ``GENERATES_EXECUTABLE_CONTENT`` covers opaque inline content that is
-    difficult to inspect before execution: long generated code, scripts,
-    shell pipelines, SQL, configuration, heredocs, encoded payloads, and
-    generated files that are executed immediately. Prefer writing such
-    content to a reviewable workspace file and executing it in a small,
-    inspectable step.
+    ``RUNS_INLINE_CODE`` covers commands that execute code supplied inline
+    to an interpreter or shell, such as ``python -c``, ``node -e``,
+    ``ruby -e``, ``perl -e``, shell heredocs piped into interpreters, or
+    ``curl ... | sh``. It does not cover simply creating a script or
+    executable file unless the same command also executes inline code.
+    Prefer writing such content to a reviewable workspace file and
+    executing it in a small, inspectable step.
+
+    ``MODIFIES_OS_SETTINGS`` covers commands that change OS-level
+    configuration such as systemd units, kernel parameters, ``/etc``
+    files, package manager system config, or global service defaults.
+
+    ``MODIFIES_OS_USER_SETTINGS`` covers commands that change user-level
+    configuration such as shell rc files, XDG config directories,
+    dotfiles, or per-user application preferences.
+
+    ``MODIFIES_SECURITY_CONTROLS`` covers commands that alter security
+    posture such as firewall rules, SELinux/AppArmor policies, file
+    permissions on security-sensitive paths, or authentication
+    configuration.
+
+    ``MODIFIES_PRODUCTION_SERVICES`` covers commands that affect live
+    production services, databases, or deployed infrastructure.
+
+    ``CHANGES_PACKAGES_OR_DEPENDENCIES`` covers commands that install,
+    upgrade, remove, or otherwise modify package or dependency state.
     """
 
-    NONE = "NONE"
-    MODIFIES_WORKSPACE_FILES = "MODIFIES_WORKSPACE_FILES"
-    MODIFIES_PROTECTED_FILES = "MODIFIES_PROTECTED_FILES"
-    MODIFIES_OUTSIDE_WORKSPACE = "MODIFIES_OUTSIDE_WORKSPACE"
-    DELETES_FILES = "DELETES_FILES"
-    INSTALLS_DEPENDENCIES = "INSTALLS_DEPENDENCIES"
-    CHANGES_SYSTEM_CONFIGURATION = "CHANGES_SYSTEM_CONFIGURATION"
-    BREAKS_OPERATING_SYSTEM = "BREAKS_OPERATING_SYSTEM"
-    AFFECTS_PRODUCTION_SERVICES = "AFFECTS_PRODUCTION_SERVICES"
-    STOPS_OR_RESTARTS_SERVICES = "STOPS_OR_RESTARTS_SERVICES"
-    EXPOSES_SECRETS = "EXPOSES_SECRETS"
-    CREATES_SECURITY_RISK = "CREATES_SECURITY_RISK"
     CHANGES_NETWORK_CONFIGURATION = "CHANGES_NETWORK_CONFIGURATION"
-    MAKES_NETWORK_REQUESTS = "MAKES_NETWORK_REQUESTS"
-    RUNS_PRIVILEGED_COMMANDS = "RUNS_PRIVILEGED_COMMANDS"
-    USES_DESTRUCTIVE_GIT_OPERATION = "USES_DESTRUCTIVE_GIT_OPERATION"
+    CHANGES_PACKAGES_OR_DEPENDENCIES = "CHANGES_PACKAGES_OR_DEPENDENCIES"
     CONSUMES_SIGNIFICANT_RESOURCES = "CONSUMES_SIGNIFICANT_RESOURCES"
-    GENERATES_EXECUTABLE_CONTENT = "GENERATES_EXECUTABLE_CONTENT"
-    BREAKS_OS_USER_SETTINGS = "BREAKS_OS_USER_SETTINGS"
+    DELETES_FILES = "DELETES_FILES"
+    EXPOSES_SECRETS = "EXPOSES_SECRETS"
     KILLS_AGENT_PROCESS = "KILLS_AGENT_PROCESS"
+    MAKES_NETWORK_REQUESTS = "MAKES_NETWORK_REQUESTS"
+    MODIFIES_OS_SETTINGS = "MODIFIES_OS_SETTINGS"
+    MODIFIES_OS_USER_SETTINGS = "MODIFIES_OS_USER_SETTINGS"
+    MODIFIES_OUTSIDE_WORKSPACE = "MODIFIES_OUTSIDE_WORKSPACE"
+    MODIFIES_PRODUCTION_SERVICES = "MODIFIES_PRODUCTION_SERVICES"
+    MODIFIES_PROTECTED_FILES = "MODIFIES_PROTECTED_FILES"
+    MODIFIES_SECURITY_CONTROLS = "MODIFIES_SECURITY_CONTROLS"
+    MODIFIES_WORKSPACE_FILES = "MODIFIES_WORKSPACE_FILES"
+    NONE = "NONE"
     OTHER = "OTHER"
+    RUNS_INLINE_CODE = "RUNS_INLINE_CODE"
+    RUNS_PRIVILEGED_COMMANDS = "RUNS_PRIVILEGED_COMMANDS"
+    STOPS_OR_RESTARTS_SERVICES = "STOPS_OR_RESTARTS_SERVICES"
     UNKNOWN = "UNKNOWN"
+    USES_DESTRUCTIVE_GIT_OPERATION = "USES_DESTRUCTIVE_GIT_OPERATION"
 
 
 DEFAULT_BLOCKED_SIDE_EFFECTS: frozenset[SideEffect] = frozenset(
     {
-        SideEffect.MODIFIES_PROTECTED_FILES,
-        SideEffect.BREAKS_OPERATING_SYSTEM,
-        SideEffect.GENERATES_EXECUTABLE_CONTENT,
-        SideEffect.BREAKS_OS_USER_SETTINGS,
         SideEffect.KILLS_AGENT_PROCESS,
+        SideEffect.MODIFIES_OS_SETTINGS,
+        SideEffect.MODIFIES_OS_USER_SETTINGS,
+        SideEffect.MODIFIES_PROTECTED_FILES,
+        SideEffect.RUNS_INLINE_CODE,
     }
 )
 

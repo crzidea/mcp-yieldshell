@@ -30,7 +30,7 @@ graph TD
     *   Tracks sequence numbers for chunks of bytes. Readers query the buffer with `since_seq` to retrieve incremental logs.
 *   **`SideEffect`** (`src/mcp_yieldshell/types.py`):
     *   String enum of the canonical side-effect categories a command can declare. Shared with config parsing, MCP schema generation, and runtime validation.
-    *   Default blocked set: `MODIFIES_PROTECTED_FILES`, `BREAKS_OPERATING_SYSTEM`, `GENERATES_EXECUTABLE_CONTENT`, `BREAKS_OS_USER_SETTINGS`, `KILLS_AGENT_PROCESS`. Configurable via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`.
+    *   Default blocked set: `KILLS_AGENT_PROCESS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_PROTECTED_FILES`, `RUNS_INLINE_CODE`. Configurable via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`.
 
 ---
 
