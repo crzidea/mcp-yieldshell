@@ -119,6 +119,16 @@ class TestBlockedSideEffectsDefaults:
             in config.blocked_side_effects
         )
 
+    def test_unset_default_blocks_breaks_os_user_settings(self, monkeypatch):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        assert SideEffect.BREAKS_OS_USER_SETTINGS in config.blocked_side_effects
+
+    def test_unset_default_blocks_kills_agent_process(self, monkeypatch):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        assert SideEffect.KILLS_AGENT_PROCESS in config.blocked_side_effects
+
     def test_default_blocked_set_includes_inline_generated_content(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         assert (
@@ -206,6 +216,14 @@ class TestBlockedSideEffectsFromEnv:
             SideEffect.BREAKS_OPERATING_SYSTEM
             not in config.blocked_side_effects
         )
+        assert (
+            SideEffect.BREAKS_OS_USER_SETTINGS
+            not in config.blocked_side_effects
+        )
+        assert (
+            SideEffect.KILLS_AGENT_PROCESS
+            not in config.blocked_side_effects
+        )
 
     def test_explicit_env_can_add_inline_generated_only(self, monkeypatch):
         monkeypatch.setenv(
@@ -234,6 +252,50 @@ class TestBlockedSideEffectsFromEnv:
                 SideEffect.DELETES_FILES,
                 SideEffect.GENERATES_EXECUTABLE_CONTENT,
                 SideEffect.MODIFIES_PROTECTED_FILES,
+            }
+        )
+
+    def test_explicit_env_can_add_breaks_os_user_settings_only(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "BREAKS_OS_USER_SETTINGS",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {SideEffect.BREAKS_OS_USER_SETTINGS}
+        )
+        assert (
+            SideEffect.MODIFIES_PROTECTED_FILES
+            not in config.blocked_side_effects
+        )
+
+    def test_explicit_env_can_add_kills_agent_process_only(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "KILLS_AGENT_PROCESS",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {SideEffect.KILLS_AGENT_PROCESS}
+        )
+        assert (
+            SideEffect.MODIFIES_PROTECTED_FILES
+            not in config.blocked_side_effects
+        )
+
+    def test_explicit_env_can_combine_new_categories_with_others(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "DELETES_FILES,BREAKS_OS_USER_SETTINGS,KILLS_AGENT_PROCESS",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {
+                SideEffect.DELETES_FILES,
+                SideEffect.BREAKS_OS_USER_SETTINGS,
+                SideEffect.KILLS_AGENT_PROCESS,
             }
         )
 

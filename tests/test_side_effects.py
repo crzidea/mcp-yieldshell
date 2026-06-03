@@ -63,6 +63,8 @@ class TestExecSchema:
             "USES_DESTRUCTIVE_GIT_OPERATION",
             "CONSUMES_SIGNIFICANT_RESOURCES",
             "GENERATES_EXECUTABLE_CONTENT",
+            "BREAKS_OS_USER_SETTINGS",
+            "KILLS_AGENT_PROCESS",
             "OTHER",
             "UNKNOWN",
         ):
@@ -338,6 +340,102 @@ class TestBlockedRejection:
         assert "reviewable" in message.lower()
 
     @pytest.mark.asyncio
+    async def test_blocked_breaks_os_user_settings_default_rejected(
+        self, monkeypatch
+    ):
+        """BREAKS_OS_USER_SETTINGS is in the default blocklist when env is unset."""
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+        )
+        assert result["status"] == "failed_to_start"
+        message = result["error"]
+        assert "BREAKS_OS_USER_SETTINGS" in message
+        assert "stopped by policy" in message.lower()
+        # Category-specific safer-next-action guidance:
+        assert "os user" in message.lower() or "user settings" in message.lower()
+
+    @pytest.mark.asyncio
+    async def test_blocked_breaks_os_user_settings_unblocked_by_env(
+        self, monkeypatch
+    ):
+        """Operators can clear the default blocklist to allow OS user settings."""
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+        )
+        assert result["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_blocked_breaks_os_user_settings_feedback_safer_action(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+        )
+        assert result["status"] == "failed_to_start"
+        message = result["error"]
+        assert "BREAKS_OS_USER_SETTINGS" in message
+        assert "stopped by policy" in message.lower()
+        # Category-specific corrective guidance:
+        assert "re-declare" in message.lower()
+
+    @pytest.mark.asyncio
+    async def test_blocked_kills_agent_process_default_rejected(
+        self, monkeypatch
+    ):
+        """KILLS_AGENT_PROCESS is in the default blocklist when env is unset."""
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
+        )
+        assert result["status"] == "failed_to_start"
+        message = result["error"]
+        assert "KILLS_AGENT_PROCESS" in message
+        assert "stopped by policy" in message.lower()
+        # Category-specific safer-next-action guidance:
+        assert "agent" in message.lower() or "mcp" in message.lower()
+
+    @pytest.mark.asyncio
+    async def test_blocked_kills_agent_process_unblocked_by_env(
+        self, monkeypatch
+    ):
+        """Operators can clear the default blocklist to allow agent process."""
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
+        )
+        assert result["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_blocked_kills_agent_process_feedback_safer_action(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
+        )
+        assert result["status"] == "failed_to_start"
+        message = result["error"]
+        assert "KILLS_AGENT_PROCESS" in message
+        assert "stopped by policy" in message.lower()
+        # Category-specific corrective guidance:
+        assert "re-declare" in message.lower()
+
+    @pytest.mark.asyncio
     async def test_multi_blocked_feedback_lists_every_category(self, monkeypatch):
         monkeypatch.setenv(
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
@@ -390,6 +488,26 @@ class TestConfigEmptyBlockSet:
         mgr = ProcessManager(config)
         result = await mgr.exec_command(
             "echo hello", side_effects=["MODIFIES_PROTECTED_FILES"]
+        )
+        assert result["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_unblocking_allows_breaks_os_user_settings(self, monkeypatch):
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+        )
+        assert result["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_unblocking_allows_kills_agent_process(self, monkeypatch):
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
         )
         assert result["status"] == "completed"
 
@@ -504,6 +622,78 @@ class TestRejectionOrdering:
         assert "GENERATES_EXECUTABLE_CONTENT" in result["error"]
         assert "limit" not in result["error"].lower()
 
+    @pytest.mark.asyncio
+    async def test_breaks_os_user_settings_runs_before_cwd_policy(self, monkeypatch):
+        """A blocked BREAKS_OS_USER_SETTINGS must reject before cwd policy."""
+        monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", "/allowed")
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OS_USER_SETTINGS"
+        )
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello",
+            cwd="/etc",
+            side_effects=["BREAKS_OS_USER_SETTINGS"],
+        )
+        assert result["status"] == "failed_to_start"
+        assert "BREAKS_OS_USER_SETTINGS" in result["error"]
+        assert "not under allowed roots" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_kills_agent_process_runs_before_cwd_policy(self, monkeypatch):
+        """A blocked KILLS_AGENT_PROCESS must reject before cwd policy."""
+        monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", "/allowed")
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "KILLS_AGENT_PROCESS"
+        )
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello",
+            cwd="/etc",
+            side_effects=["KILLS_AGENT_PROCESS"],
+        )
+        assert result["status"] == "failed_to_start"
+        assert "KILLS_AGENT_PROCESS" in result["error"]
+        assert "not under allowed roots" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_breaks_os_user_settings_runs_before_command_policy(
+        self, monkeypatch
+    ):
+        """A blocked BREAKS_OS_USER_SETTINGS must reject before command policy."""
+        monkeypatch.setenv("YIELDSHELL_DENY_COMMAND_REGEX", r"echo")
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "BREAKS_OS_USER_SETTINGS"
+        )
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["BREAKS_OS_USER_SETTINGS"]
+        )
+        assert result["status"] == "failed_to_start"
+        assert "BREAKS_OS_USER_SETTINGS" in result["error"]
+        assert "denied by policy" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_kills_agent_process_runs_before_command_policy(
+        self, monkeypatch
+    ):
+        """A blocked KILLS_AGENT_PROCESS must reject before command policy."""
+        monkeypatch.setenv("YIELDSHELL_DENY_COMMAND_REGEX", r"echo")
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "KILLS_AGENT_PROCESS"
+        )
+        config = Config()
+        mgr = ProcessManager(config)
+        result = await mgr.exec_command(
+            "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
+        )
+        assert result["status"] == "failed_to_start"
+        assert "KILLS_AGENT_PROCESS" in result["error"]
+        assert "denied by policy" not in result["error"]
+
 
 class TestSideEffectEnumCanonical:
     def test_canonical_names_match_spec(self):
@@ -527,6 +717,8 @@ class TestSideEffectEnumCanonical:
             "USES_DESTRUCTIVE_GIT_OPERATION",
             "CONSUMES_SIGNIFICANT_RESOURCES",
             "GENERATES_EXECUTABLE_CONTENT",
+            "BREAKS_OS_USER_SETTINGS",
+            "KILLS_AGENT_PROCESS",
             "OTHER",
             "UNKNOWN",
         }
@@ -570,6 +762,14 @@ class TestExecDocstring:
         assert idx != -1
         window = lowered[max(0, idx - 120): idx + 200]
         assert "default" in window
+
+    def test_docstring_mentions_breaks_os_user_settings(self):
+        doc = exec.__doc__ or ""
+        assert "BREAKS_OS_USER_SETTINGS" in doc
+
+    def test_docstring_mentions_kills_agent_process(self):
+        doc = exec.__doc__ or ""
+        assert "KILLS_AGENT_PROCESS" in doc
 
     def test_docstring_includes_safer_next_action_hint(self):
         doc = exec.__doc__ or ""
@@ -646,6 +846,27 @@ class TestReadmeSideEffectsGuide:
             and "BREAKS_OPERATING_SYSTEM" in readme_text
             and "GENERATES_EXECUTABLE_CONTENT" in readme_text
         )
+
+    def test_readme_default_blocklist_mentions_breaks_os_user_settings(
+        self, readme_text
+    ):
+        assert "BREAKS_OS_USER_SETTINGS" in readme_text
+
+    def test_readme_default_blocklist_mentions_kills_agent_process(
+        self, readme_text
+    ):
+        assert "KILLS_AGENT_PROCESS" in readme_text
+
+    def test_readme_documents_breaks_os_user_settings_scoping(self, readme_text):
+        lowered = readme_text.lower()
+        assert "os user settings" in lowered or "user settings" in lowered
+        # Must be distinct from BREAKS_OPERATING_SYSTEM
+        assert "breaks_os_user_settings" in lowered
+
+    def test_readme_documents_kills_agent_process_scoping(self, readme_text):
+        lowered = readme_text.lower()
+        assert "agent" in lowered or "mcp" in lowered
+        assert "kills_agent_process" in lowered
 
     def test_readme_explains_operator_override(self, readme_text):
         # Operators must be able to clear or override the default blocklist.

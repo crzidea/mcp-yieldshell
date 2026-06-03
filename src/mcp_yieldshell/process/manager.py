@@ -37,6 +37,16 @@ _BLOCKED_CATEGORY_GUIDANCE: dict[SideEffect, str] = {
         "a single exec call; create or edit a reviewable workspace file "
         "and execute it in a small, inspectable step."
     ),
+    SideEffect.BREAKS_OS_USER_SETTINGS: (
+        "Do not run commands that may damage or globally disrupt settings "
+        "for the current OS user; re-declare with a safer category or "
+        "request an explicit policy override."
+    ),
+    SideEffect.KILLS_AGENT_PROCESS: (
+        "Do not run commands that may terminate the MCP client, agent, or "
+        "related process running the agent workflow; re-declare with a "
+        "safer category or request an explicit policy override."
+    ),
 }
 
 

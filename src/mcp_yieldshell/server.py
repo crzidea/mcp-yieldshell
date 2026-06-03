@@ -44,8 +44,9 @@ async def exec(
     The server rejects the call with ``failed_to_start`` (and stops before
     cwd validation, command policy, process-limit checks, env construction,
     and spawn) if any declared category is configured as blocked. By
-    default, ``MODIFIES_PROTECTED_FILES``, ``BREAKS_OPERATING_SYSTEM``, and
-    ``GENERATES_EXECUTABLE_CONTENT`` are blocked. The error message names
+    default, ``MODIFIES_PROTECTED_FILES``, ``BREAKS_OPERATING_SYSTEM``,
+    ``GENERATES_EXECUTABLE_CONTENT``, ``BREAKS_OS_USER_SETTINGS``, and
+    ``KILLS_AGENT_PROCESS`` are blocked. The error message names
     each blocked category, states that execution was stopped by policy
     before the process started, and gives a category-specific safer next
     action.

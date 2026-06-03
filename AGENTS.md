@@ -30,7 +30,7 @@ graph TD
     *   Tracks sequence numbers for chunks of bytes. Readers query the buffer with `since_seq` to retrieve incremental logs.
 *   **`SideEffect`** (`src/mcp_yieldshell/types.py`):
     *   String enum of the canonical side-effect categories a command can declare. Shared with config parsing, MCP schema generation, and runtime validation.
-    *   Default blocked set: `MODIFIES_PROTECTED_FILES`, `BREAKS_OPERATING_SYSTEM`. Configurable via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`.
+    *   Default blocked set: `MODIFIES_PROTECTED_FILES`, `BREAKS_OPERATING_SYSTEM`, `GENERATES_EXECUTABLE_CONTENT`, `BREAKS_OS_USER_SETTINGS`, `KILLS_AGENT_PROCESS`. Configurable via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`.
 
 ---
 
@@ -61,6 +61,7 @@ This is a Python 3.11 package using a `src/` layout:
 *   `src/mcp_yieldshell/security.py` controls allowed path roots, command regex rules, and environment overlays/redactions.
 *   `src/mcp_yieldshell/process/` contains execution, buffer, and lifecycle management.
 *   `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`, `test_side_effects.py`).
+*   `scripts/release.py` automates version bumps, lock refresh, staging, commit, tag, and push.
 
 ---
 
@@ -72,6 +73,7 @@ This is a Python 3.11 package using a `src/` layout:
 *   `uv run ruff check .`: Lint imports and check style rules.
 *   `uv run pyright`: Run static type-checking.
 *   `uv build`: Build wheel and source distributions.
+*   `python scripts/release.py [patch|minor|major|<version>] [-y|--yes]`: Bumps version in `pyproject.toml`, refreshes `uv.lock` (via `uv lock`), stages both files, commits, tags, and pushes. The script aborts before commit/tag/push if `uv.lock` is missing or the lock refresh fails.
 
 ---
 
@@ -87,7 +89,7 @@ This is a Python 3.11 package using a `src/` layout:
 
 *   Tests use `pytest` with `pytest-asyncio`. Async tests are supported automatically by the `asyncio_mode = "auto"` configuration.
 *   Name new test files `test_<area>.py` and test functions `test_<expected_behavior>`.
-*   Add tests for any edge cases introduced, specifically: process state transitions, timeouts, output truncation, CWD policy, and command security checks.
+*   Add tests for any edge cases introduced, specifically: process state transitions, timeouts, output truncation, CWD policy, command security checks, side-effect validation, and release script lock refresh/staging behavior.
 
 ---
 
