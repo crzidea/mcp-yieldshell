@@ -49,8 +49,8 @@ uv run mcp-yieldshell
 
 To configure the server in Claude Desktop, add the configuration below to your Claude Desktop config file:
 
-*   **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-*   **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+* **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+* **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
 #### Production (via uvx)
 
@@ -108,9 +108,9 @@ To configure the server in Cursor:
 1. Open **Cursor Settings** -> **Features** -> **MCP**.
 2. Click **+ Add New MCP Server**.
 3. Fill out the form:
-   - **Name**: `yieldshell`
-   - **Type**: `stdio`
-   - **Command**: `uvx mcp-yieldshell` (or `uv --directory /path/to/mcp-yieldshell run mcp-yieldshell` for local development)
+  - **Name**: `yieldshell`
+  - **Type**: `stdio`
+  - **Command**: `uvx mcp-yieldshell` (or `uv --directory /path/to/mcp-yieldshell run mcp-yieldshell` for local development)
 
 ### OpenCode
 
@@ -134,93 +134,92 @@ Add to your OpenCode MCP settings:
 ### `exec`
 Execute a shell command. If the command runs longer than `yield_ms`, it yields a `process_id` and runs in the background.
 
-*   **Parameters**:
-    *   `command` (string, **required**): The command string to execute in the shell.
-    *   `side_effects` (array of string, **required**): The side-effect categories this command may plausibly have. Must contain at least one entry drawn from the enum below. Use `["NONE"]` for commands with no meaningful side effects. `NONE` is exclusive and must not be combined with any other category. The server rejects the call with `failed_to_start` if any declared category is configured as blocked.
-        *   Allowed values: `CHANGES_NETWORK_CONFIGURATION`, `CHANGES_PACKAGES_OR_DEPENDENCIES`, `CONSUMES_SIGNIFICANT_RESOURCES`, `DELETES_FILES`, `EXPOSES_SECRETS`, `KILLS_AGENT_PROCESS`, `MAKES_NETWORK_REQUESTS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_OUTSIDE_WORKSPACE`, `MODIFIES_PRODUCTION_SERVICES`, `MODIFIES_PROTECTED_FILES`, `MODIFIES_SECURITY_CONTROLS`, `MODIFIES_WORKSPACE_FILES`, `NONE`, `OTHER`, `RUNS_INLINE_CODE`, `RUNS_PRIVILEGED_COMMANDS`, `STOPS_OR_RESTARTS_SERVICES`, `UNKNOWN`, `USES_DESTRUCTIVE_GIT_OPERATION`.
-        *   `RUNS_INLINE_CODE` is in the default blocklist. It covers commands that execute code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `curl ... | sh`). It does not cover simply creating a script or executable file unless the same command also executes inline code. The safer next action is to write the content to a reviewable workspace file and execute it in a small, inspectable step. Operators can unblock the category via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
-    *   `cwd` (string, optional): Working directory for the command. Must be under allowed roots if `YIELDSHELL_ALLOWED_CWDS` is set. Defaults to `YIELDSHELL_DEFAULT_CWD`.
-    *   `env` (object of string to string, optional): Additive environment variable overlay. Merged into the parent environment.
-    *   `shell` (string, optional): Accepted but has no effect in v1. Commands always run via the platform's default shell.
-    *   `stdin` (string, optional): Initial text input written to standard input immediately after spawning.
-    *   `name` (string, optional): A human-readable label/name to identify this process.
-    *   `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Clamped by `YIELDSHELL_MAX_YIELD_MS`. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (5000ms).
-    *   `timeout_ms` (integer, optional): Total execution runtime limit in milliseconds. Process is killed if it runs longer than this. Defaults to `YIELDSHELL_DEFAULT_TIMEOUT_MS` (0 = no limit).
-    *   `max_output_bytes` (integer, optional): Maximum output bytes to capture in stdout/stderr ring buffers. Subject to `YIELDSHELL_MAX_OUTPUT_BYTES` cap.
+* **Parameters**:
+  * `command` (string, **required**): The command string to execute in the shell.
+  * `side_effects` (array of string, **required**): The side-effect categories this command may plausibly have. Must contain at least one entry drawn from the enum below. Use `["NONE"]` for commands with no meaningful side effects. `NONE` is exclusive and must not be combined with any other category. The server rejects the call with `failed_to_start` if any declared category is configured as blocked.
+    * Allowed values: `CHANGES_NETWORK_CONFIGURATION`, `CHANGES_PACKAGES_OR_DEPENDENCIES`, `CONSUMES_SIGNIFICANT_RESOURCES`, `DELETES_FILES`, `EXPOSES_SECRETS`, `KILLS_AGENT_PROCESS`, `MAKES_NETWORK_REQUESTS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_OUTSIDE_WORKSPACE`, `MODIFIES_PRODUCTION_SERVICES`, `MODIFIES_PROTECTED_FILES`, `MODIFIES_SECURITY_CONTROLS`, `MODIFIES_WORKSPACE_FILES`, `NONE`, `OTHER`, `RUNS_INLINE_CODE`, `RUNS_PRIVILEGED_COMMANDS`, `STOPS_OR_RESTARTS_SERVICES`, `UNKNOWN`, `USES_DESTRUCTIVE_GIT_OPERATION`.
+    * `RUNS_INLINE_CODE` is in the default blocklist. It covers commands that execute code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `curl ... | sh`). It does not cover simply creating a script or executable file unless the same command also executes inline code. The safer next action is to write the content to a reviewable workspace file and execute it in a small, inspectable step. Operators can unblock the category via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
+  * `cwd` (string, optional): Working directory for the command. Must be under allowed roots if `YIELDSHELL_ALLOWED_CWDS` is set. Defaults to `YIELDSHELL_DEFAULT_CWD`.
+  * `env` (object of string to string, optional): Additive environment variable overlay. Merged into the parent environment.
+  * `shell` (string, optional): Accepted but has no effect in v1. Commands always run via the platform's default shell.
+  * `stdin` (string, optional): Initial text input written to standard input immediately after spawning.
+  * `name` (string, optional): A human-readable label/name to identify this process.
+  * `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Clamped by `YIELDSHELL_MAX_YIELD_MS`. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (5000ms).
+  * `timeout_ms` (integer, optional): Total execution runtime limit in milliseconds. Process is killed if it runs longer than this. Defaults to `YIELDSHELL_DEFAULT_TIMEOUT_MS` (0 = no limit).
+  * `max_output_bytes` (integer, optional): Maximum output bytes to capture in stdout/stderr ring buffers. Subject to `YIELDSHELL_MAX_OUTPUT_BYTES` cap.
 
-*   **Side-Effects Guide**:
-    *   `side_effects` is required and must be a non-empty list. Declare every plausible side-effect category before running the command.
-    *   `NONE` is exclusive and valid only when no meaningful side effect is expected. Use `["NONE"]` for read-only commands.
-    *   The server rejects the call with `failed_to_start` if any declared category is blocked. Rejection runs before cwd validation, command policy, process-limit checks, env construction, and spawn.
-    *   Rejection messages name each blocked category, state that execution was stopped by policy before the process started, and provide a category-specific safer next action.
-    *   Categories are case-sensitive and must use the canonical enum names listed above.
-    *   **Discouraged**: executing code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `ruby -e`, `perl -e`, shell heredocs piped into interpreters, or `curl ... | sh`). Agents should prefer writing such content to a reviewable workspace file and executing it in a small, inspectable step with explicit matching `side_effects`. Declaring `RUNS_INLINE_CODE` is rejected under the default policy.
+* **Side-Effects Guide**:
+  * `side_effects` is required and must be a non-empty list. Declare every plausible side-effect category before running the command.
+  * `NONE` is exclusive and valid only when no meaningful side effect is expected. Use `["NONE"]` for read-only commands.
+  * The server rejects the call with `failed_to_start` if any declared category is blocked. Rejection messages name each blocked category, state that execution was stopped by policy before the process started, and provide a category-specific safer next action.
+  * Categories are case-sensitive and must use the canonical enum names listed above.
+  * **Discouraged**: executing code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `ruby -e`, `perl -e`, shell heredocs piped into interpreters, or `curl ... | sh`). Agents should prefer writing such content to a reviewable workspace file and executing it in a small, inspectable step with explicit matching `side_effects`. Declaring `RUNS_INLINE_CODE` is rejected under the default policy.
 
-*   **Side-Effect Examples**:
-    *   Read-only command: `side_effects=["NONE"]`
-    *   Workspace write: `side_effects=["MODIFIES_WORKSPACE_FILES"]`
-    *   Dependency install: `side_effects=["CHANGES_PACKAGES_OR_DEPENDENCIES", "MAKES_NETWORK_REQUESTS"]`
-    *   Network access: `side_effects=["MAKES_NETWORK_REQUESTS"]`
-    *   Destructive file operations: `side_effects=["DELETES_FILES"]`
-    *   Privileged command: `side_effects=["RUNS_PRIVILEGED_COMMANDS"]`
-    *   Protected-file changes: `side_effects=["MODIFIES_PROTECTED_FILES"]`
-    *   Inline code execution: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["RUNS_INLINE_CODE"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
+* **Side-Effect Examples**:
+  * Read-only command: `side_effects=["NONE"]`
+  * Workspace write: `side_effects=["MODIFIES_WORKSPACE_FILES"]`
+  * Dependency install: `side_effects=["CHANGES_PACKAGES_OR_DEPENDENCIES", "MAKES_NETWORK_REQUESTS"]`
+  * Network access: `side_effects=["MAKES_NETWORK_REQUESTS"]`
+  * Destructive file operations: `side_effects=["DELETES_FILES"]`
+  * Privileged command: `side_effects=["RUNS_PRIVILEGED_COMMANDS"]`
+  * Protected-file changes: `side_effects=["MODIFIES_PROTECTED_FILES"]`
+  * Inline code execution: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["RUNS_INLINE_CODE"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
 
-*   **Output Statuses**:
-    *   `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr.
-    *   `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, a snapshot of initial stdout/stderr, `duration_ms`, `truncated`, and a `message` string describing that the process is running in the background.
-    *   `timed_out`: Process exceeded `timeout_ms` and was terminated.
-    *   `stopped`: Process was explicitly terminated.
-    *   `failed_to_start`: Command could not be spawned (e.g., bad directory or policy violation).
-    *   `failed`: An internal execution error occurred.
+* **Output Statuses**:
+  * `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr.
+  * `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, a snapshot of initial stdout/stderr, `duration_ms`, `truncated`, and a `message` string describing that the process is running in the background.
+  * `timed_out`: Process exceeded `timeout_ms` and was terminated.
+  * `stopped`: Process was explicitly terminated.
+  * `failed_to_start`: Command could not be spawned (e.g., bad directory or policy violation).
+  * `failed`: An internal execution error occurred.
 
 ### `read`
 Read stdout and/or stderr output from a running or completed background process.
 
-*   **Parameters**:
-    *   `process_id` (string, **required**): Unique identifier of the process.
-    *   `since_seq` (integer, optional): Return only output appended after this sequence number. Enables efficient incremental log polling.
-    *   `max_output_bytes` (integer, optional): Clamps the response size. Defaults to the server cap.
-    *   `streams` (string, default: `"both"`): The streams to read. Options: `"both"`, `"stdout"`, or `"stderr"`.
+* **Parameters**:
+  * `process_id` (string, **required**): Unique identifier of the process.
+  * `since_seq` (integer, optional): Return only output appended after this sequence number. Enables efficient incremental log polling.
+  * `max_output_bytes` (integer, optional): Clamps the response size. Defaults to the server cap.
+  * `streams` (string, default: `"both"`): The streams to read. Options: `"both"`, `"stdout"`, or `"stderr"`.
 
-*   **Returns**:
-    *   `process_id`, `status`, `exit_code`, `signal`, `next_seq` (sequence index to use in subsequent `since_seq` reads), `truncated` flag. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
+* **Returns**:
+  * `process_id`, `status`, `exit_code`, `signal`, `next_seq` (sequence index to use in subsequent `since_seq` reads), `truncated` flag. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
 
 ### `write`
 Write text input to the standard input (`stdin`) of a running process.
 
-*   **Parameters**:
-    *   `process_id` (string, **required**): Unique identifier of the process.
-    *   `input` (string, **required**): Text input to write.
-    *   `newline` (boolean, default: `false`): If `true`, appends `\n` to the input.
+* **Parameters**:
+  * `process_id` (string, **required**): Unique identifier of the process.
+  * `input` (string, **required**): Text input to write.
+  * `newline` (boolean, default: `false`): If `true`, appends `\n` to the input.
 
 ### `wait`
 Block execution until the process exits or the wait timeout expires. This allows the LLM to pause and await completion without spawning a new execution loop.
 
-*   **Parameters**:
-    *   `process_id` (string, **required**): Unique identifier of the process.
-    *   `timeout_ms` (integer, default: `30000`): Maximum time to wait.
-    *   `max_output_bytes` (integer, optional): Maximum output bytes to return in the response.
+* **Parameters**:
+  * `process_id` (string, **required**): Unique identifier of the process.
+  * `timeout_ms` (integer, default: `30000`): Maximum time to wait.
+  * `max_output_bytes` (integer, optional): Maximum output bytes to return in the response.
 
-*   **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
-*   The effective wait duration is capped at 55 seconds to stay well under typical MCP request timeouts, even if a larger `timeout_ms` is requested.
-*   `wait` treats the tracked shell process exiting as completion. For normal process completion, stdout/stderr are drained before the response is returned. If descendant processes keep inherited pipes open after the tracked process exits, the server closes its drain tasks so `wait` can complete without blocking indefinitely.
+* **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
+* The effective wait duration is capped at 55 seconds to stay well under typical MCP request timeouts, even if a larger `timeout_ms` is requested.
+* `wait` treats the tracked shell process exiting as completion. For normal process completion, stdout/stderr are drained before the response is returned. If descendant processes keep inherited pipes open after the tracked process exits, the server closes its drain tasks so `wait` can complete without blocking indefinitely.
 
 ### `stop`
 Gracefully terminate or force kill a running process.
 
-*   **Parameters**:
-    *   `process_id` (string, **required**): Unique identifier of the process.
-    *   `signal` (string, default: `"SIGTERM"`): OS signal to send (e.g. `SIGTERM`, `SIGKILL`, `SIGINT`). Ignored on Windows.
-    *   `force_after_ms` (integer, default: `3000`): Grace period before escalating to force kill (`SIGKILL`).
+* **Parameters**:
+  * `process_id` (string, **required**): Unique identifier of the process.
+  * `signal` (string, default: `"SIGTERM"`): OS signal to send (e.g. `SIGTERM`, `SIGKILL`, `SIGINT`). Ignored on Windows.
+  * `force_after_ms` (integer, default: `3000`): Grace period before escalating to force kill (`SIGKILL`).
 
 ### `ps`
 List all managed processes.
 
-*   **Parameters**:
-    *   `include_completed` (boolean, default: `true`): If `false`, finished/stopped processes are excluded from the output.
-    *   `limit` (integer, default: `50`): Maximum number of entries.
-*   **Returns**: `processes` — a list of process summary objects, each containing: `process_id`, `pid`, `name`, `command`, `cwd`, `status`, `exit_code`, `signal`, `started_at`, `ended_at`, `duration_ms`, `stdout_bytes`, `stderr_bytes`.
+* **Parameters**:
+  * `include_completed` (boolean, default: `true`): If `false`, finished/stopped processes are excluded from the output.
+  * `limit` (integer, default: `50`): Maximum number of entries.
+* **Returns**: `processes` — a list of process summary objects, each containing: `process_id`, `pid`, `name`, `command`, `cwd`, `status`, `exit_code`, `signal`, `started_at`, `ended_at`, `duration_ms`, `stdout_bytes`, `stderr_bytes`.
 
 ### Error Responses
 
@@ -229,10 +228,10 @@ All tools that accept a `process_id` parameter return a structured error dict wh
 ### `cleanup`
 Prune completed or stopped process records to free memory.
 
-*   **Parameters**:
-    *   `completed_older_than_ms` (integer, default: `3600000`): Prunes completed processes older than this threshold (1 hour default).
-    *   `stopped_older_than_ms` (integer, default: `3600000`): Prunes stopped, timed-out, or failed processes older than this threshold (1 hour default).
-*   **Returns**: `removed` — the count of process records that were pruned.
+* **Parameters**:
+  * `completed_older_than_ms` (integer, default: `3600000`): Prunes completed processes older than this threshold (1 hour default).
+  * `stopped_older_than_ms` (integer, default: `3600000`): Prunes stopped, timed-out, or failed processes older than this threshold (1 hour default).
+* **Returns**: `removed` — the count of process records that were pruned.
 
 ---
 
@@ -272,21 +271,21 @@ Configure the server by setting these environment variables prior to launch:
 
 ## Security Notes
 
-*   **Arbitrary Code Execution**: This server executes shell commands on the host system. Always run the server inside a container, sandbox, or isolated development VM.
-*   **Side-Effect Declarations**: Every `exec` call must declare its plausible side-effect categories via `side_effects`. By default, `KILLS_AGENT_PROCESS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_PROTECTED_FILES`, and `RUNS_INLINE_CODE` are blocked. Operators can adjust the blocklist via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` (including cleared to `,` to disable every default). This is an explicit risk signal — it is not a complete sandbox, and LLM under-declaration remains possible.
-*   **Inline Code Execution**: The `RUNS_INLINE_CODE` default discourages agents from executing code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `ruby -e`, `perl -e`, shell heredocs piped into interpreters, or `curl ... | sh`). The safer pattern is to write the content to a reviewable workspace file and execute it in a small, inspectable step with explicit matching `side_effects`. Operators can override the default to permit the category.
-*   **OS User Settings Damage**: `MODIFIES_OS_USER_SETTINGS` covers commands that change user-level configuration such as shell rc files, XDG config directories, dotfiles, or per-user application preferences. This is distinct from `MODIFIES_OS_SETTINGS`, which covers broader OS-level configuration such as systemd units, kernel parameters, `/etc` files, and package manager system config. Blocked by default; operators can override.
-*   **Agent Process Termination**: `KILLS_AGENT_PROCESS` covers commands that may terminate the MCP client, agent, or related process running the agent workflow (e.g., `kill` commands targeting the agent PID, or commands that cause the agent to exit). This is distinct from `STOPS_OR_RESTARTS_SERVICES`, which covers OS-level services. Blocked by default; operators can override.
-*   **Path Validation**: CWD path verification uses absolute paths (`resolve()`), preventing path-traversal attacks (`../`) outside the allowed roots.
-*   **Additive Environments**: The `env` argument overlays existing env parameters. It merges with the parent process environment instead of completely replacing it, protecting critical OS vars.
-*   **Best-effort Redaction**: While values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are scrubbed from outputs, this is a best-effort system. Sensitive data printed through complex formats or argument lists might not be caught.
+* **Arbitrary Code Execution**: This server executes shell commands on the host system. Always run the server inside a container, sandbox, or isolated development VM.
+* **Side-Effect Declarations**: Every `exec` call must declare its plausible side-effect categories via `side_effects`. By default, `KILLS_AGENT_PROCESS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_PROTECTED_FILES`, and `RUNS_INLINE_CODE` are blocked. Operators can adjust the blocklist via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` (including cleared to `,` to disable every default). This is an explicit risk signal — it is not a complete sandbox, and LLM under-declaration remains possible.
+* **Inline Code Execution**: The `RUNS_INLINE_CODE` default discourages agents from executing code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `ruby -e`, `perl -e`, shell heredocs piped into interpreters, or `curl ... | sh`). The safer pattern is to write the content to a reviewable workspace file and execute it in a small, inspectable step with explicit matching `side_effects`. Operators can override the default to permit the category.
+* **OS User Settings Damage**: `MODIFIES_OS_USER_SETTINGS` covers commands that change user-level configuration such as shell rc files, XDG config directories, dotfiles, or per-user application preferences. This is distinct from `MODIFIES_OS_SETTINGS`, which covers broader OS-level configuration such as systemd units, kernel parameters, `/etc` files, and package manager system config. Blocked by default; operators can override.
+* **Agent Process Termination**: `KILLS_AGENT_PROCESS` covers commands that may terminate the MCP client, agent, or related process running the agent workflow (e.g., `kill` commands targeting the agent PID, or commands that cause the agent to exit). This is distinct from `STOPS_OR_RESTARTS_SERVICES`, which covers OS-level services. Blocked by default; operators can override.
+* **Path Validation**: CWD path verification uses absolute paths (`resolve()`), preventing path-traversal attacks (`../`) outside the allowed roots.
+* **Additive Environments**: The `env` argument overlays existing env parameters. It merges with the parent process environment instead of completely replacing it, protecting critical OS vars.
+* **Best-effort Redaction**: While values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are scrubbed from outputs, this is a best-effort system. Sensitive data printed through complex formats or argument lists might not be caught.
 
 ---
 
 ## Platform Support
 
-*   **POSIX (Linux & macOS)**: Fully supported. Spawns processes in distinct sessions (`start_new_session=True`), allowing signals (`SIGTERM`/`SIGKILL`) to target the entire process group. This ensures child processes started by commands (such as npm dev tasks) are completely cleaned up.
-*   **Windows**: Supported with best-effort process group controls. Windows lacks native POSIX signals, meaning `stop` and `timeout_ms` act on the primary process, and child subprocesses might persist if they do not exit cleanly.
+* **POSIX (Linux & macOS)**: Fully supported. Spawns processes in distinct sessions (`start_new_session=True`), allowing signals (`SIGTERM`/`SIGKILL`) to target the entire process group. This ensures child processes started by commands (such as npm dev tasks) are completely cleaned up.
+* **Windows**: Supported with best-effort process group controls. Windows lacks native POSIX signals, meaning `stop` and `timeout_ms` act on the primary process, and child subprocesses might persist if they do not exit cleanly.
 
 ---
 
