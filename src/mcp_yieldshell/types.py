@@ -21,6 +21,13 @@ class SideEffect(str, Enum):
     applies. If no meaningful side effect is expected, callers must pass
     ``[SideEffect.NONE]``. ``NONE`` is exclusive and must not be combined
     with any other category.
+
+    ``GENERATES_EXECUTABLE_CONTENT`` covers opaque inline content that is
+    difficult to inspect before execution: long generated code, scripts,
+    shell pipelines, SQL, configuration, heredocs, encoded payloads, and
+    generated files that are executed immediately. Prefer writing such
+    content to a reviewable workspace file and executing it in a small,
+    inspectable step.
     """
 
     NONE = "NONE"
@@ -40,12 +47,17 @@ class SideEffect(str, Enum):
     RUNS_PRIVILEGED_COMMANDS = "RUNS_PRIVILEGED_COMMANDS"
     USES_DESTRUCTIVE_GIT_OPERATION = "USES_DESTRUCTIVE_GIT_OPERATION"
     CONSUMES_SIGNIFICANT_RESOURCES = "CONSUMES_SIGNIFICANT_RESOURCES"
+    GENERATES_EXECUTABLE_CONTENT = "GENERATES_EXECUTABLE_CONTENT"
     OTHER = "OTHER"
     UNKNOWN = "UNKNOWN"
 
 
 DEFAULT_BLOCKED_SIDE_EFFECTS: frozenset[SideEffect] = frozenset(
-    {SideEffect.MODIFIES_PROTECTED_FILES, SideEffect.BREAKS_OPERATING_SYSTEM}
+    {
+        SideEffect.MODIFIES_PROTECTED_FILES,
+        SideEffect.BREAKS_OPERATING_SYSTEM,
+        SideEffect.GENERATES_EXECUTABLE_CONTENT,
+    }
 )
 
 

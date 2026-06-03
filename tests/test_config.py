@@ -111,6 +111,20 @@ class TestBlockedSideEffectsDefaults:
         config = Config()
         assert SideEffect.BREAKS_OPERATING_SYSTEM in config.blocked_side_effects
 
+    def test_unset_default_blocks_generates_executable_content(self, monkeypatch):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        config = Config()
+        assert (
+            SideEffect.GENERATES_EXECUTABLE_CONTENT
+            in config.blocked_side_effects
+        )
+
+    def test_default_blocked_set_includes_inline_generated_content(self, monkeypatch):
+        monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
+        assert (
+            SideEffect.GENERATES_EXECUTABLE_CONTENT in DEFAULT_BLOCKED_SIDE_EFFECTS
+        )
+
     def test_empty_string_uses_default_blocked_set(self, monkeypatch):
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "")
         config = Config()
@@ -174,6 +188,53 @@ class TestBlockedSideEffectsFromEnv:
         config = Config()
         assert config.blocked_side_effects == frozenset(
             {SideEffect.BREAKS_OPERATING_SYSTEM}
+        )
+
+    def test_explicit_env_can_clear_all_defaults(self, monkeypatch):
+        monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
+        config = Config()
+        assert config.blocked_side_effects == frozenset()
+        assert (
+            SideEffect.GENERATES_EXECUTABLE_CONTENT
+            not in config.blocked_side_effects
+        )
+        assert (
+            SideEffect.MODIFIES_PROTECTED_FILES
+            not in config.blocked_side_effects
+        )
+        assert (
+            SideEffect.BREAKS_OPERATING_SYSTEM
+            not in config.blocked_side_effects
+        )
+
+    def test_explicit_env_can_add_inline_generated_only(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "GENERATES_EXECUTABLE_CONTENT",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {SideEffect.GENERATES_EXECUTABLE_CONTENT}
+        )
+        assert (
+            SideEffect.MODIFIES_PROTECTED_FILES
+            not in config.blocked_side_effects
+        )
+
+    def test_explicit_env_can_combine_inline_generated_with_other(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS",
+            "DELETES_FILES,GENERATES_EXECUTABLE_CONTENT,MODIFIES_PROTECTED_FILES",
+        )
+        config = Config()
+        assert config.blocked_side_effects == frozenset(
+            {
+                SideEffect.DELETES_FILES,
+                SideEffect.GENERATES_EXECUTABLE_CONTENT,
+                SideEffect.MODIFIES_PROTECTED_FILES,
+            }
         )
 
 

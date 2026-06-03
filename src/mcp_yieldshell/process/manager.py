@@ -18,6 +18,47 @@ from .spawn import kill_process, spawn_process, terminate_process
 MAX_EFFECTIVE_WAIT_MS = 55000
 
 
+_BLOCKED_CATEGORY_GUIDANCE: dict[SideEffect, str] = {
+    SideEffect.MODIFIES_PROTECTED_FILES: (
+        "Do not modify protected files; use a workspace-scoped path or ask "
+        "the operator to update the policy via MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS."
+    ),
+    SideEffect.BREAKS_OPERATING_SYSTEM: (
+        "Do not run OS-breaking or system-damaging commands; re-declare with "
+        "a safer category or request an explicit policy override."
+    ),
+    SideEffect.DELETES_FILES: (
+        "Avoid deletion; prefer reversible edits, or request explicit "
+        "confirmation when deletion is truly required."
+    ),
+    SideEffect.GENERATES_EXECUTABLE_CONTENT: (
+        "Do not pipe or inline large generated code, scripts, shell "
+        "pipelines, SQL, configuration, heredocs, or encoded payloads into "
+        "a single exec call; create or edit a reviewable workspace file "
+        "and execute it in a small, inspectable step."
+    ),
+}
+
+
+def _format_blocked_message(blocked: list[SideEffect]) -> str:
+    """Build the operator- and agent-friendly rejection message."""
+    names = ", ".join(s.name for s in blocked)
+    parts = [
+        f"Side-effect category blocked by policy: {names}. "
+        "Execution was stopped by policy before the process started."
+    ]
+    for category in blocked:
+        guidance = _BLOCKED_CATEGORY_GUIDANCE.get(category)
+        if guidance:
+            parts.append(f"{category.name}: {guidance}")
+        else:
+            parts.append(
+                f"{category.name}: re-declare with an allowed category or "
+                "update operator policy."
+            )
+    return " ".join(parts)
+
+
 class ManagedProcess:
     __slots__ = (
         "info",
@@ -138,11 +179,7 @@ class ProcessManager:
         blocked = self._config.blocked_side_effects
         hits = [s for s in declared if s in blocked]
         if hits:
-            names = ", ".join(s.name for s in hits)
-            return (
-                f"Side-effect category blocked by policy: {names}. "
-                "Re-declare with an allowed category or update operator policy."
-            )
+            return _format_blocked_message(hits)
         return None
 
     async def exec_command(

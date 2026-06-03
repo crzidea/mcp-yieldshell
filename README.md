@@ -137,7 +137,8 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
 *   **Parameters**:
     *   `command` (string, **required**): The command string to execute in the shell.
     *   `side_effects` (array of string, **required**): The side-effect categories this command may plausibly have. Must contain at least one entry drawn from the enum below. Use `["NONE"]` for commands with no meaningful side effects. `NONE` is exclusive and must not be combined with any other category. The server rejects the call with `failed_to_start` if any declared category is configured as blocked.
-        *   Allowed values: `NONE`, `MODIFIES_WORKSPACE_FILES`, `MODIFIES_PROTECTED_FILES`, `MODIFIES_OUTSIDE_WORKSPACE`, `DELETES_FILES`, `INSTALLS_DEPENDENCIES`, `CHANGES_SYSTEM_CONFIGURATION`, `BREAKS_OPERATING_SYSTEM`, `AFFECTS_PRODUCTION_SERVICES`, `STOPS_OR_RESTARTS_SERVICES`, `EXPOSES_SECRETS`, `CREATES_SECURITY_RISK`, `CHANGES_NETWORK_CONFIGURATION`, `MAKES_NETWORK_REQUESTS`, `RUNS_PRIVILEGED_COMMANDS`, `USES_DESTRUCTIVE_GIT_OPERATION`, `CONSUMES_SIGNIFICANT_RESOURCES`, `OTHER`, `UNKNOWN`.
+        *   Allowed values: `NONE`, `MODIFIES_WORKSPACE_FILES`, `MODIFIES_PROTECTED_FILES`, `MODIFIES_OUTSIDE_WORKSPACE`, `DELETES_FILES`, `INSTALLS_DEPENDENCIES`, `CHANGES_SYSTEM_CONFIGURATION`, `BREAKS_OPERATING_SYSTEM`, `AFFECTS_PRODUCTION_SERVICES`, `STOPS_OR_RESTARTS_SERVICES`, `EXPOSES_SECRETS`, `CREATES_SECURITY_RISK`, `CHANGES_NETWORK_CONFIGURATION`, `MAKES_NETWORK_REQUESTS`, `RUNS_PRIVILEGED_COMMANDS`, `USES_DESTRUCTIVE_GIT_OPERATION`, `CONSUMES_SIGNIFICANT_RESOURCES`, `GENERATES_EXECUTABLE_CONTENT`, `OTHER`, `UNKNOWN`.
+        *   `GENERATES_EXECUTABLE_CONTENT` is in the default blocklist. It covers opaque inline content that is difficult to inspect before execution: long generated code, scripts, shell pipelines, SQL, configuration, heredocs, encoded payloads, and generated files executed immediately. The safer next action is to write the content to a reviewable workspace file and execute it in a small, inspectable step. Operators can unblock the category via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
     *   `cwd` (string, optional): Working directory for the command. Must be under allowed roots if `YIELDSHELL_ALLOWED_CWDS` is set. Defaults to `YIELDSHELL_DEFAULT_CWD`.
     *   `env` (object of string to string, optional): Additive environment variable overlay. Merged into the parent environment.
     *   `shell` (string, optional): Accepted but has no effect in v1. Commands always run via the platform's default shell.
@@ -146,6 +147,24 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
     *   `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Clamped by `YIELDSHELL_MAX_YIELD_MS`. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (5000ms).
     *   `timeout_ms` (integer, optional): Total execution runtime limit in milliseconds. Process is killed if it runs longer than this. Defaults to `YIELDSHELL_DEFAULT_TIMEOUT_MS` (0 = no limit).
     *   `max_output_bytes` (integer, optional): Maximum output bytes to capture in stdout/stderr ring buffers. Subject to `YIELDSHELL_MAX_OUTPUT_BYTES` cap.
+
+*   **Side-Effects Guide**:
+    *   `side_effects` is required and must be a non-empty list. Declare every plausible side-effect category before running the command.
+    *   `NONE` is exclusive and valid only when no meaningful side effect is expected. Use `["NONE"]` for read-only commands.
+    *   The server rejects the call with `failed_to_start` if any declared category is blocked. Rejection runs before cwd validation, command policy, process-limit checks, env construction, and spawn.
+    *   Rejection messages name each blocked category, state that execution was stopped by policy before the process started, and provide a category-specific safer next action.
+    *   Categories are case-sensitive and must use the canonical enum names listed above.
+    *   **Discouraged**: piping or inlining large generated code, scripts, shell pipelines, SQL, configuration, heredocs, encoded payloads, or generated files executed immediately into a single `exec` call. Agents should prefer writing such content to a reviewable workspace file and executing it in a small, inspectable step with explicit matching `side_effects`. Declaring `GENERATES_EXECUTABLE_CONTENT` is rejected under the default policy.
+
+*   **Side-Effect Examples**:
+    *   Read-only command: `side_effects=["NONE"]`
+    *   Workspace write: `side_effects=["MODIFIES_WORKSPACE_FILES"]`
+    *   Dependency install: `side_effects=["INSTALLS_DEPENDENCIES", "MAKES_NETWORK_REQUESTS"]`
+    *   Network access: `side_effects=["MAKES_NETWORK_REQUESTS"]`
+    *   Destructive file operations: `side_effects=["DELETES_FILES"]`
+    *   Privileged command: `side_effects=["RUNS_PRIVILEGED_COMMANDS"]`
+    *   Protected-file changes: `side_effects=["MODIFIES_PROTECTED_FILES"]`
+    *   Inline generated content: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["GENERATES_EXECUTABLE_CONTENT"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
 
 *   **Output Statuses**:
     *   `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr.
@@ -247,14 +266,15 @@ Configure the server by setting these environment variables prior to launch:
 | `YIELDSHELL_DENY_COMMAND_REGEX` | *(none)* | A regular expression pattern. Commands matching this pattern are blocked before starting. |
 | `YIELDSHELL_ALLOW_COMMAND_REGEX` | *(none)* | A regular expression pattern. If set, only commands matching this pattern are permitted. |
 | `YIELDSHELL_REDACT_ENV_REGEX` | `TOKEN\|KEY\|SECRET\|PASSWORD` | Regex to identify sensitive environment variable keys. Their values are redacted in stdout/stderr outputs. |
-| `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` | `MODIFIES_PROTECTED_FILES,BREAKS_OPERATING_SYSTEM` | Comma-separated list of `side_effects` enum names the server should reject. Names are case-sensitive. Surrounding whitespace is trimmed and empty entries are ignored. Invalid names cause startup to fail. Set to `,` (or any value that resolves to no entries) to clear the default blocklist. |
+| `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` | `MODIFIES_PROTECTED_FILES,BREAKS_OPERATING_SYSTEM,GENERATES_EXECUTABLE_CONTENT` | Comma-separated list of `side_effects` enum names the server should reject. Names are case-sensitive. Surrounding whitespace is trimmed and empty entries are ignored. Invalid names cause startup to fail. Set to `,` (or any value that resolves to no entries) to clear the default blocklist. |
 
 ---
 
 ## Security Notes
 
 *   **Arbitrary Code Execution**: This server executes shell commands on the host system. Always run the server inside a container, sandbox, or isolated development VM.
-*   **Side-Effect Declarations**: Every `exec` call must declare its plausible side-effect categories via `side_effects`. By default, `MODIFIES_PROTECTED_FILES` and `BREAKS_OPERATING_SYSTEM` are blocked. Operators can adjust the blocklist via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`. This is an explicit risk signal — it is not a complete sandbox, and LLM under-declaration remains possible.
+*   **Side-Effect Declarations**: Every `exec` call must declare its plausible side-effect categories via `side_effects`. By default, `MODIFIES_PROTECTED_FILES`, `BREAKS_OPERATING_SYSTEM`, and `GENERATES_EXECUTABLE_CONTENT` are blocked. Operators can adjust the blocklist via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` (including cleared to `,` to disable every default). This is an explicit risk signal — it is not a complete sandbox, and LLM under-declaration remains possible.
+*   **Inline Generated Content**: The `GENERATES_EXECUTABLE_CONTENT` default discourages agents from piping or inlining large generated code, scripts, shell pipelines, SQL, configuration, heredocs, encoded payloads, or generated files executed immediately into a single `exec` call. The safer pattern is to write the content to a reviewable workspace file and execute it in a small, inspectable step with explicit matching `side_effects`. Operators can override the default to permit the category.
 *   **Path Validation**: CWD path verification uses absolute paths (`resolve()`), preventing path-traversal attacks (`../`) outside the allowed roots.
 *   **Additive Environments**: The `env` argument overlays existing env parameters. It merges with the parent process environment instead of completely replacing it, protecting critical OS vars.
 *   **Best-effort Redaction**: While values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are scrubbed from outputs, this is a best-effort system. Sensitive data printed through complex formats or argument lists might not be caught.

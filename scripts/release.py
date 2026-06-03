@@ -13,6 +13,12 @@ def run_cmd(cmd, check=True):
         print(e.stderr)
         sys.exit(1)
 
+
+def run_interactive(cmd):
+    """Run a command, inheriting stdio (so the user sees prompts/output)."""
+    return subprocess.run(cmd, shell=True, check=True)
+
+
 def get_current_version():
     if not os.path.exists("pyproject.toml"):
         print("Error: pyproject.toml not found in the current directory.")
@@ -30,6 +36,7 @@ def get_current_version():
     if match:
         return match.group(1)
     return None
+
 
 def set_version(new_version):
     with open("pyproject.toml", "r") as f:
@@ -52,6 +59,22 @@ def set_version(new_version):
     with open("pyproject.toml", "w") as f:
         f.write(new_content)
 
+
+def refresh_lockfile():
+    """Regenerate ``uv.lock`` so it tracks the new project version.
+
+    Returns the CompletedProcess from ``uv lock`` for callers/tests that
+    want to inspect the result. Exits the process with a clear error if
+    ``uv`` is not available or the lock command fails, so the version bump
+    is never committed with a stale lock.
+    """
+    if not os.path.exists("uv.lock"):
+        print("Error: uv.lock not found in the current directory.")
+        sys.exit(1)
+    print("Refreshing uv.lock to match the new project version...")
+    return run_cmd("uv lock")
+
+
 def get_next_version(current_version, bump_type):
     match = re.match(r'^(\d+)\.(\d+)\.(\d+)(.*)$', current_version)
     if not match:
@@ -64,6 +87,7 @@ def get_next_version(current_version, bump_type):
     elif bump_type == "major":
         return f"{int(major) + 1}.0.0"
     return None
+
 
 def main():
     # Ensure we are in git repository root
@@ -153,13 +177,17 @@ def main():
     set_version(new_version)
     print(f"Updated pyproject.toml to version {new_version}")
 
-    # 4. Git commit and tag
-    run_cmd("git add pyproject.toml")
+    # 4. Refresh uv.lock to match the new project version. This step must
+    #    succeed before any commit or tag is created; if it fails, abort.
+    refresh_lockfile()
+
+    # 5. Git commit and tag
+    run_cmd("git add pyproject.toml uv.lock")
     run_cmd(f'git commit -m "chore: bump version to v{new_version}"')
     run_cmd(f'git tag v{new_version}')
     print(f"Committed and tagged with v{new_version}")
 
-    # 5. Push
+    # 6. Push
     # Get current branch
     branch_res = run_cmd("git branch --show-current")
     branch = branch_res.stdout.strip()

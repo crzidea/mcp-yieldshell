@@ -35,11 +35,46 @@ async def exec(
 ) -> dict:
     """Execute a shell command with auto-yield for long-running processes.
 
-    Callers must declare every plausible side effect category in ``side_effects``.
-    If no meaningful side effect is expected, pass ``[SideEffect.NONE]`` or
-    ``["NONE"]``. ``NONE`` is exclusive and must not be combined with any other
-    category. The server rejects the command before spawning a process if any
-    declared category is configured as blocked.
+    ``side_effects`` is required and must be a non-empty list. Declare every
+    plausible side-effect category before running the command. ``NONE`` is
+    exclusive and must not be combined with any other category; pass
+    ``[SideEffect.NONE]`` (or ``["NONE"]``) only when no meaningful side
+    effect is expected.
+
+    The server rejects the call with ``failed_to_start`` (and stops before
+    cwd validation, command policy, process-limit checks, env construction,
+    and spawn) if any declared category is configured as blocked. By
+    default, ``MODIFIES_PROTECTED_FILES``, ``BREAKS_OPERATING_SYSTEM``, and
+    ``GENERATES_EXECUTABLE_CONTENT`` are blocked. The error message names
+    each blocked category, states that execution was stopped by policy
+    before the process started, and gives a category-specific safer next
+    action.
+
+    ``GENERATES_EXECUTABLE_CONTENT`` covers opaque inline content that is
+    difficult to inspect before execution (long generated code, scripts,
+    shell pipelines, SQL, configuration, heredocs, encoded payloads, and
+    generated files executed immediately). When a command falls into that
+    category, prefer writing the content to a reviewable workspace file
+    and executing it in a small, inspectable step rather than piping or
+    inlining it as a single ``exec`` call. ``GENERATES_EXECUTABLE_CONTENT``
+    is in the default blocklist; the safer next action is to write a
+    reviewable file and then run it.
+
+    Concise examples (full guidance and the complete side-effect taxonomy
+    live in the README):
+
+    *   Read-only command: ``side_effects=["NONE"]``
+    *   Workspace write: ``side_effects=["MODIFIES_WORKSPACE_FILES"]``
+    *   Dependency install: ``side_effects=["INSTALLS_DEPENDENCIES",
+        "MAKES_NETWORK_REQUESTS"]``
+    *   Network access: ``side_effects=["MAKES_NETWORK_REQUESTS"]``
+    *   Destructive file ops: ``side_effects=["DELETES_FILES"]``
+    *   Privileged command: ``side_effects=["RUNS_PRIVILEGED_COMMANDS"]``
+    *   Protected-file change: ``side_effects=["MODIFIES_PROTECTED_FILES"]``
+    *   Inline generated content: prefer to write the content to a
+        reviewable file and run it; declaring
+        ``side_effects=["GENERATES_EXECUTABLE_CONTENT"]`` will be rejected
+        under the default policy.
     """
     return await _get_manager().exec_command(
         command=command,
