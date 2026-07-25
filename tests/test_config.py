@@ -136,6 +136,24 @@ class TestConfigFromEnv:
         config = Config()
         assert config.max_processes == 50
 
+    @pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+    def test_nonpositive_capacity_values_use_defaults(self, monkeypatch, value):
+        monkeypatch.setenv("YIELDSHELL_MAX_OUTPUT_BYTES", value)
+        monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", value)
+        config = Config()
+        assert config.max_output_bytes == 20000
+        assert config.max_processes == 50
+
+    @pytest.mark.parametrize("value", ["-1", "invalid"])
+    def test_invalid_timing_values_use_defaults(self, monkeypatch, value):
+        monkeypatch.setenv("YIELDSHELL_DEFAULT_YIELD_MS", value)
+        monkeypatch.setenv("YIELDSHELL_MAX_YIELD_MS", value)
+        monkeypatch.setenv("YIELDSHELL_DEFAULT_TIMEOUT_MS", value)
+        config = Config()
+        assert config.default_yield_ms == 30000
+        assert config.max_yield_ms == 300000
+        assert config.default_timeout_ms == 3600000
+
 
 class TestBlockedSideEffectsDefaults:
     def test_unset_uses_default_blocked_set(self, monkeypatch):

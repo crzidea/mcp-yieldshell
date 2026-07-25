@@ -150,6 +150,17 @@ class TestReleaseLockfileRefresh:
         # The shim must not have been invoked — the log file should not exist.
         assert not fake_repo["uv_log"].exists()
 
+    def test_release_rejects_current_version(
+        self, release_module, fake_repo, monkeypatch
+    ):
+        monkeypatch.chdir(fake_repo["repo"])
+        monkeypatch.setattr(sys, "argv", ["release.py", "0.3.0", "-y"])
+
+        with pytest.raises(SystemExit):
+            release_module.main()
+
+        assert not fake_repo["uv_log"].exists()
+
     def test_uv_lock_failure_aborts_release(self, release_module, fake_repo, monkeypatch):
         """If ``uv lock`` fails, the release script exits non-zero before any commit/tag."""
         # Make the uv shim fail.
@@ -198,6 +209,66 @@ class TestReleaseLockfileRefresh:
             text=True,
         )
         assert "bump version" not in head.stdout
+        assert fake_repo["pyproject"].read_text().count('version = "0.3.0"') == 1
+        assert "# touched by shim" not in fake_repo["lock"].read_text()
+
+    def test_run_cmd_does_not_interpret_shell_metacharacters(
+        self, release_module, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        marker = tmp_path / "injected"
+
+        result = release_module.run_cmd(
+            f"printf harmless;touch {marker}",
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert not marker.exists()
+
+    def test_release_commit_excludes_unrelated_staged_changes(
+        self, release_module, fake_repo, monkeypatch
+    ):
+        repo = fake_repo["repo"]
+        unrelated = repo / "unrelated.txt"
+        unrelated.write_text("initial\n")
+        subprocess.run(
+            ["git", "add", "unrelated.txt"], cwd=repo, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add unrelated"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        unrelated.write_text("staged user change\n")
+        subprocess.run(
+            ["git", "add", "unrelated.txt"], cwd=repo, check=True, capture_output=True
+        )
+
+        monkeypatch.chdir(repo)
+        monkeypatch.setattr(sys, "argv", ["release.py", "0.4.0"])
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: "y")
+
+        with pytest.raises(SystemExit):
+            release_module.main()
+
+        committed = subprocess.run(
+            ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        assert "unrelated.txt" not in committed
+        assert "unrelated.txt" in staged
 
     def test_release_stages_both_pyproject_and_lock(self, release_module, fake_repo, monkeypatch):
         """The release script must stage both ``pyproject.toml`` and ``uv.lock``."""

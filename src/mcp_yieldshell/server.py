@@ -42,6 +42,7 @@ async def exec(
     env: dict[str, str] | None = None,
     shell: str | None = None,
     stdin: str | None = None,
+    close_stdin: bool = True,
     name: str | None = None,
     yield_ms: int | None = None,
     timeout_ms: int | None = None,
@@ -90,6 +91,10 @@ async def exec(
         reviewable file and run it; declaring
         ``side_effects=["RUNS_INLINE_CODE"]`` will be rejected
         under the default policy.
+
+    Standard input is closed after ``stdin`` is written by default so
+    EOF-driven commands can complete. Set ``close_stdin=False`` when later
+    calls to ``write`` are expected.
     """
     return await _get_manager().exec_command(
         command=command,
@@ -98,6 +103,7 @@ async def exec(
         env_overlay=env,
         shell=shell,
         stdin=stdin,
+        close_stdin=close_stdin,
         name=name,
         yield_ms=yield_ms,
         timeout_ms=timeout_ms,
@@ -122,12 +128,18 @@ async def read(
 
 
 @mcp.tool()
-async def write(process_id: str, input: str, newline: bool = False) -> dict:
-    """Write to the stdin of a running process."""
+async def write(
+    process_id: str,
+    input: str,
+    newline: bool = False,
+    close_stdin: bool = False,
+) -> dict:
+    """Write to process stdin, optionally closing it afterward to send EOF."""
     return await _get_manager().write_input(
         process_id=process_id,
         input_data=input,
         newline=newline,
+        close_stdin=close_stdin,
     )
 
 

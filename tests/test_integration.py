@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import shutil
 import signal
 import sys
 
@@ -241,7 +242,7 @@ class TestWrite:
             "'"
         )
         result = await manager.exec_command(
-            cmd, yield_ms=200, side_effects=NONE
+            cmd, yield_ms=200, close_stdin=False, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
         pid = result["process_id"]
@@ -256,7 +257,7 @@ class TestWrite:
 
     @pytest.mark.asyncio
     async def test_write_after_initial_stdin(self, manager):
-        """Providing stdin in exec must not close the pipe; follow-up write must work."""
+        """An explicitly interactive exec keeps stdin open for follow-up writes."""
         cmd = (
             f"{sys.executable} -c '"
             "import sys\n"
@@ -265,7 +266,11 @@ class TestWrite:
             "'"
         )
         result = await manager.exec_command(
-            cmd, stdin="first\n", yield_ms=200, side_effects=NONE
+            cmd,
+            stdin="first\n",
+            close_stdin=False,
+            yield_ms=200,
+            side_effects=NONE,
         )
         assert result["status"] == "backgrounded"
         pid = result["process_id"]
@@ -280,6 +285,36 @@ class TestWrite:
         read2 = await manager.read_output(pid, since_seq=read1["next_seq"], streams="stdout")
         assert "got: second" in read2.get("stdout", "")
         await manager.stop_process(pid, force_after_ms=500)
+
+    @pytest.mark.asyncio
+    async def test_initial_stdin_is_closed_by_default(self, manager):
+        result = await manager.exec_command(
+            "wc -c",
+            stdin="hello",
+            yield_ms=2_000,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "completed"
+        assert result["stdout"].strip() == "5"
+
+    @pytest.mark.asyncio
+    async def test_write_can_close_stdin(self, manager):
+        result = await manager.exec_command(
+            "wc -c",
+            close_stdin=False,
+            yield_ms=100,
+            side_effects=NONE,
+        )
+        assert result["status"] == "backgrounded"
+
+        write_result = await manager.write_input(
+            result["process_id"], "hello", close_stdin=True
+        )
+        assert write_result["ok"] is True
+        completed = await manager.wait_process(result["process_id"], timeout_ms=2_000)
+        assert completed["status"] == "completed"
+        assert completed["stdout"].strip() == "5"
 
     @pytest.mark.asyncio
     async def test_write_unknown_process(self, manager):
@@ -315,6 +350,22 @@ class TestStop:
         assert stop_result["process_id"] == pid
 
     @pytest.mark.asyncio
+    async def test_invalid_signal_is_rejected_without_stopping_process(self, manager):
+        result = await manager.exec_command(
+            "sleep 30", yield_ms=0, side_effects=NONE
+        )
+        process_id = result["process_id"]
+
+        stop_result = await manager.stop_process(
+            process_id, signal_name="NOT_A_SIGNAL", force_after_ms=0
+        )
+
+        assert stop_result["stopped"] is False
+        assert "Invalid signal" in stop_result["error"]
+        assert (await manager.read_output(process_id))["status"] == "running"
+        await manager.stop_process(process_id, force_after_ms=100)
+
+    @pytest.mark.asyncio
     async def test_stop_unknown_process(self, manager):
         result = await manager.stop_process("proc_nonexistent")
         assert result["stopped"] is False
@@ -322,6 +373,17 @@ class TestStop:
 
 
 class TestTimeout:
+    @pytest.mark.asyncio
+    async def test_timeout_response_is_never_reported_as_backgrounded(self, manager):
+        result = await manager.exec_command(
+            "sleep 30",
+            yield_ms=2_000,
+            timeout_ms=50,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "timed_out"
+
     @pytest.mark.asyncio
     async def test_timeout_kills_process(self, manager):
         result = await manager.exec_command(
@@ -468,6 +530,39 @@ class TestRedaction:
         assert "changed-secret" in wait_result["stdout"]
         assert "snapshot-secret" not in read_result["stdout"]
 
+    @pytest.mark.asyncio
+    async def test_sensitive_env_overlay_is_redacted_across_tools(self):
+        manager = ProcessManager(Config())
+        secret = "overlay-secret-value"
+        command = (
+            f"{sys.executable} -c \"import os,time; "
+            "print(os.environ['API_TOKEN'], flush=True); time.sleep(0.2)\""
+        )
+        started = await manager.exec_command(
+            command,
+            env_overlay={"API_TOKEN": secret},
+            yield_ms=0,
+            name=secret,
+            side_effects=NONE,
+        )
+        process_id = started["process_id"]
+        await asyncio.sleep(0.1)
+
+        read_result = await manager.read_output(process_id)
+        wait_result = await manager.wait_process(process_id, timeout_ms=1_000)
+        listed = manager.list_processes()["processes"][0]
+
+        for value in (
+            started["stdout"],
+            read_result["stdout"],
+            wait_result["stdout"],
+            listed["name"],
+        ):
+            assert secret not in value
+        assert "[REDACTED:API_TOKEN]" in read_result["stdout"]
+        assert "[REDACTED:API_TOKEN]" in wait_result["stdout"]
+        assert listed["name"] == "[REDACTED:API_TOKEN]"
+
 
 
 class TestCleanup:
@@ -524,6 +619,11 @@ class TestPs:
             await manager.exec_command(f"echo test{i}", side_effects=NONE)
         result = manager.list_processes(limit=3)
         assert len(result["processes"]) <= 3
+
+    @pytest.mark.asyncio
+    async def test_ps_negative_limit_returns_no_processes(self, manager):
+        await manager.exec_command("echo test", side_effects=NONE)
+        assert manager.list_processes(limit=-1)["processes"] == []
 
 
 class TestProcessLimit:
@@ -753,6 +853,128 @@ class TestRingBufferByteCount:
 
 
 class TestDefectFixes:
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX custom shell")
+    async def test_exec_uses_requested_shell(self, manager):
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("bash is not installed")
+
+        result = await manager.exec_command(
+            'printf "%s" "$BASH_VERSION"',
+            shell=bash,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "completed"
+        assert result["stdout"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX custom shell")
+    async def test_requested_shell_cannot_bypass_command_policy(
+        self, monkeypatch
+    ):
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("bash is not installed")
+        monkeypatch.setenv("YIELDSHELL_DENY_COMMAND_REGEX", "bash")
+        manager = ProcessManager(Config())
+
+        result = await manager.exec_command(
+            "echo allowed-command",
+            shell=bash,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "failed_to_start"
+        assert "Shell rejected by policy" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_empty_requested_shell_is_rejected(self, manager):
+        result = await manager.exec_command(
+            "echo should-not-run",
+            shell="   ",
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "failed_to_start"
+        assert "must not be empty" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_wait_cursor_resumes_after_capped_snapshot(self, manager):
+        result = await manager.exec_command(
+            "printf 0123456789; sleep 0.1",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = result["process_id"]
+
+        waited = await manager.wait_process(
+            process_id, timeout_ms=2_000, max_output_bytes=4
+        )
+        remainder = await manager.read_output(
+            process_id,
+            since_seq=waited["next_seq"],
+            max_output_bytes=100,
+            streams="stdout",
+        )
+
+        assert waited["stdout"] + remainder["stdout"] == "0123456789"
+
+    @pytest.mark.asyncio
+    async def test_capped_incremental_read_returns_all_output(self, manager):
+        result = await manager.exec_command(
+            "printf 0123456789abcdef",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = result["process_id"]
+        await manager.wait_process(process_id, timeout_ms=2_000)
+
+        cursor = 1
+        output = ""
+        for _ in range(4):
+            page = await manager.read_output(
+                process_id,
+                since_seq=cursor,
+                max_output_bytes=5,
+                streams="stdout",
+            )
+            output += page["stdout"]
+            cursor = page["next_seq"]
+
+        assert output == "0123456789abcdef"
+
+    @pytest.mark.asyncio
+    async def test_descendant_status_and_write_use_same_running_state(
+        self, manager, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 10
+        )
+        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 10)
+        command = (
+            f"{sys.executable} -c 'import os,time; "
+            "pid=os.fork(); time.sleep(30) if pid == 0 else None; os._exit(0)'"
+        )
+        result = await manager.exec_command(
+            command,
+            close_stdin=False,
+            yield_ms=100,
+            side_effects=NONE,
+        )
+        process_id = result["process_id"]
+        await asyncio.sleep(0.1)
+
+        read_result = await manager.read_output(process_id)
+        write_result = await manager.write_input(process_id, "x")
+        running_only = manager.list_processes(include_completed=False)["processes"]
+
+        assert read_result["status"] == "running"
+        assert write_result["ok"] is True
+        assert any(item["process_id"] == process_id for item in running_only)
+        await manager.stop_process(process_id, force_after_ms=100)
+
     @pytest.mark.asyncio
     async def test_max_processes_allows_sequential(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "2")

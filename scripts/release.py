@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 import os
 import re
+import shlex
 import subprocess
 import sys
+from pathlib import Path
 
 
 def run_cmd(cmd, check=True):
     try:
-        return subprocess.run(cmd, shell=True, check=check, capture_output=True, text=True)
+        return subprocess.run(
+            shlex.split(cmd),
+            check=check,
+            capture_output=True,
+            text=True,
+        )
     except subprocess.CalledProcessError as e:
         print(f"Error running command: {cmd}")
         print(e.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error running command: {cmd}")
+        print(e)
         sys.exit(1)
 
 
 def run_interactive(cmd):
     """Run a command, inheriting stdio (so the user sees prompts/output)."""
-    return subprocess.run(cmd, shell=True, check=True)
+    return subprocess.run(shlex.split(cmd), check=True)
 
 
 def get_current_version():
@@ -101,7 +112,8 @@ def main():
         non_interactive = True
         sys.argv = [arg for arg in sys.argv if arg not in ("--yes", "-y")]
 
-    version_arg = sys.argv[1].lower() if len(sys.argv) > 1 else None
+    version_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    bump_arg = version_arg.lower() if version_arg else None
 
     # 1. Check git status
     status = run_cmd("git status --porcelain")
@@ -131,11 +143,11 @@ def main():
 
     new_version = None
     if version_arg:
-        if version_arg == "patch":
+        if bump_arg == "patch":
             new_version = next_patch
-        elif version_arg == "minor":
+        elif bump_arg == "minor":
             new_version = next_minor
-        elif version_arg == "major":
+        elif bump_arg == "major":
             new_version = next_major
         elif re.match(r'^\d+\.\d+\.\d+(?:[a-zA-Z0-9.-]+)?$', version_arg):
             new_version = version_arg
@@ -172,28 +184,48 @@ def main():
         confirm = input("Proceed with this version name? (y/N): ").strip().lower()
         if confirm != 'y':
             sys.exit(1)
+    if new_version == current_version:
+        print(f"Error: Version is already {current_version}.")
+        sys.exit(1)
 
-    # 3. Update version
-    set_version(new_version)
-    print(f"Updated pyproject.toml to version {new_version}")
+    branch_res = run_cmd("git branch --show-current")
+    branch = branch_res.stdout.strip()
+    if not branch:
+        print("Error: Cannot release from a detached HEAD.")
+        sys.exit(1)
 
-    # 4. Refresh uv.lock to match the new project version. This step must
-    #    succeed before any commit or tag is created; if it fails, abort.
-    refresh_lockfile()
+    tag = f"v{new_version}"
+    if run_cmd(f"git rev-parse -q --verify refs/tags/{tag}", check=False).returncode == 0:
+        print(f"Error: Tag {tag} already exists.")
+        sys.exit(1)
+
+    # 3-4. Update version artifacts transactionally through lock refresh.
+    if not Path("uv.lock").exists():
+        print("Error: uv.lock not found in the current directory.")
+        sys.exit(1)
+    pyproject_before = Path("pyproject.toml").read_bytes()
+    lock_before = Path("uv.lock").read_bytes()
+    try:
+        set_version(new_version)
+        print(f"Updated pyproject.toml to version {new_version}")
+        refresh_lockfile()
+    except BaseException:
+        Path("pyproject.toml").write_bytes(pyproject_before)
+        Path("uv.lock").write_bytes(lock_before)
+        raise
 
     # 5. Git commit and tag
     run_cmd("git add pyproject.toml uv.lock")
-    run_cmd(f'git commit -m "chore: bump version to v{new_version}"')
-    run_cmd(f'git tag v{new_version}')
+    run_cmd(
+        f'git commit --only pyproject.toml uv.lock '
+        f'-m "chore: bump version to v{new_version}"'
+    )
+    run_cmd(f"git tag {tag}")
     print(f"Committed and tagged with v{new_version}")
 
-    # 6. Push
-    # Get current branch
-    branch_res = run_cmd("git branch --show-current")
-    branch = branch_res.stdout.strip()
+    # 6. Push branch and tag atomically.
     print(f"Pushing to origin {branch}...")
-    run_cmd(f"git push origin {branch}")
-    run_cmd(f"git push origin v{new_version}")
+    run_cmd(f"git push --atomic origin {shlex.quote(branch)} {tag}")
     print("Push complete. GitHub Action should trigger shortly!")
 
 if __name__ == "__main__":

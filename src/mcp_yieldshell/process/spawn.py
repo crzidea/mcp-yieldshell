@@ -13,6 +13,7 @@ async def spawn_process(
     command: str,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
+    shell: str | None = None,
 ) -> asyncio.subprocess.Process:
     """Spawn a subprocess shell command with stdout/stderr/stdin pipes.
 
@@ -30,6 +31,8 @@ async def spawn_process(
         kwargs["env"] = env
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
+    if shell:
+        kwargs["executable"] = shell
 
     proc = await asyncio.create_subprocess_shell(command, **kwargs)
     return proc
@@ -51,14 +54,20 @@ async def terminate_process(
 ) -> None:
     """Send SIGTERM (or equivalent) to the process group."""
     if sys.platform == "win32":
-        proc.terminate()
+        try:
+            proc.terminate()
+        except (ProcessLookupError, PermissionError):
+            pass
     else:
         pid = proc.pid
         if pid is not None:
             try:
                 os.killpg(_process_group_id(pid, process_group_id), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
-                proc.terminate()
+                try:
+                    proc.terminate()
+                except (ProcessLookupError, PermissionError):
+                    pass
 
 
 async def kill_process(
@@ -66,14 +75,20 @@ async def kill_process(
 ) -> None:
     """Force kill the process group."""
     if sys.platform == "win32":
-        proc.kill()
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
     else:
         pid = proc.pid
         if pid is not None:
             try:
                 os.killpg(_process_group_id(pid, process_group_id), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                proc.kill()
+                try:
+                    proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
 
 
 def _process_group_id(pid: int, process_group_id: int | None) -> int:

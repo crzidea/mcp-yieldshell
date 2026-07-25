@@ -16,10 +16,11 @@ from mcp_yieldshell.policy import (
     MAX_EFFECTIVE_WAIT_MS,
     PROCESS_GROUP_EXIT_MS,
 )
+from mcp_yieldshell.process.managed import ManagedProcess
 from mcp_yieldshell.process.manager import ProcessManager
 from mcp_yieldshell.process.spawn import kill_process, terminate_process
 from mcp_yieldshell.server import _server_lifespan, mcp
-from mcp_yieldshell.types import ProcessStatus, SideEffect
+from mcp_yieldshell.types import ProcessInfo, ProcessStatus, SideEffect
 
 NONE = [SideEffect.NONE]
 
@@ -41,6 +42,40 @@ class TestSharedPolicy:
 
         assert signature(wait).parameters["timeout_ms"].default == MAX_EFFECTIVE_WAIT_MS
         assert signature(stop).parameters["force_after_ms"].default == GRACEFUL_STOP_MS
+
+
+class TestTerminalStateAccuracy:
+    @pytest.mark.asyncio
+    async def test_failed_force_kill_does_not_report_stopped(self, monkeypatch):
+        manager = ProcessManager(Config())
+        process = MagicMock()
+        process.pid = None
+        process.returncode = None
+        process.stdin = None
+        info = ProcessInfo(
+            process_id="proc_survivor",
+            pid=None,
+            command="survivor",
+            cwd=os.getcwd(),
+            name=None,
+            status=ProcessStatus.RUNNING,
+            started_at=time.time(),
+            start_monotonic=time.monotonic(),
+        )
+        managed = ManagedProcess(info, process, 100)
+        manager._processes[info.process_id] = managed
+        monkeypatch.setattr(manager, "_process_group_exists", lambda _mp: True)
+        monkeypatch.setattr(manager, "_wait_for_process_group_exit", AsyncMock())
+        monkeypatch.setattr(manager, "_drain_with_timeout", AsyncMock())
+
+        result = await manager.stop_process(
+            info.process_id,
+            force_after_ms=0,
+        )
+
+        assert result["stopped"] is False
+        assert "did not stop" in result["error"]
+        assert managed.info.status == ProcessStatus.RUNNING
 
 
 class TestAutomaticRetention:
@@ -171,8 +206,13 @@ class TestAutomaticRetention:
 
         assert listed["status"] == "running"
         assert read_result["status"] == "running"
-        assert manager.get_process(process_id).info.status == ProcessStatus.COMPLETED
+        managed = manager.get_process(process_id)
+        assert managed.info.status == ProcessStatus.COMPLETED
+        primary_ended_at = managed.info.ended_at
         await manager.stop_process(process_id, force_after_ms=100)
+        assert managed.info.ended_at is not None
+        assert primary_ended_at is not None
+        assert managed.info.ended_at > primary_ended_at
 
     @pytest.mark.asyncio
     async def test_observed_group_exit_is_monotonic(self, monkeypatch):
@@ -613,3 +653,35 @@ class TestRedactionAcrossTools:
         )
         assert "[REDACTED:MY_SECRET]" not in read_result["stdout"]
         assert "abcdefghijklmnop" not in read_result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_incremental_pages_cannot_reassemble_secret(self, monkeypatch):
+        monkeypatch.setenv("MY_SECRET", "abcdefghijklmnop")
+        manager = ProcessManager(Config())
+        started = await manager.exec_command(
+            "printf abcdefghijklmnop",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = started["process_id"]
+        await manager.wait_process(process_id, timeout_ms=2_000)
+
+        cursor = 1
+        pages = []
+        for _ in range(10):
+            page = await manager.read_output(
+                process_id,
+                since_seq=cursor,
+                max_output_bytes=5,
+                streams="stdout",
+            )
+            pages.append(page["stdout"])
+            if page["next_seq"] == cursor:
+                break
+            cursor = page["next_seq"]
+            if not page["truncated"]:
+                break
+
+        combined = "".join(pages)
+        assert "abcdefghijklmnop" not in combined
+        assert "[REDACTED:MY_SECRET]" in combined

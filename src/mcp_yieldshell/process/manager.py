@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import sys
 import time
@@ -17,107 +18,18 @@ from ..policy import (
     PENDING_SPAWN_SHUTDOWN_MS,
     PROCESS_GROUP_EXIT_MS,
 )
-from ..security import redact_text
+from ..security import (
+    StreamingRedactor,
+    collect_sensitive_env,
+    redact_text,
+)
+from ..side_effects import validate_side_effects
 from ..types import ProcessInfo, ProcessStatus, SideEffect
-from .ring_buffer import RingBuffer
+from .managed import ManagedProcess
+from .ring_buffer import RingBuffer, read_buffers
 from .spawn import kill_process, spawn_process, terminate_process
 
 _SHUTDOWN_REJECT_ERROR = "Server is shutting down"
-
-_BLOCKED_CATEGORY_GUIDANCE: dict[SideEffect, str] = {
-    SideEffect.MODIFIES_PROTECTED_FILES: (
-        "Do not modify protected files; use a workspace-scoped path or ask "
-        "the operator to update the policy via MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS."
-    ),
-    SideEffect.MODIFIES_OS_SETTINGS: (
-        "Do not change OS-level configuration such as systemd units, kernel "
-        "parameters, /etc files, package manager system config, or global "
-        "service defaults; re-declare with a safer category or request an "
-        "explicit policy override."
-    ),
-    SideEffect.MODIFIES_OS_USER_SETTINGS: (
-        "Do not change user-level configuration such as shell rc files, XDG "
-        "config directories, dotfiles, or per-user application preferences; "
-        "re-declare with a safer category or request an explicit policy "
-        "override."
-    ),
-    SideEffect.DELETES_FILES: (
-        "Avoid deletion; prefer reversible edits, or request explicit "
-        "confirmation when deletion is truly required."
-    ),
-    SideEffect.RUNS_INLINE_CODE: (
-        "Do not execute code supplied inline to an interpreter or shell "
-        "(e.g. python -c, node -e, curl ... | sh); create or edit a "
-        "reviewable workspace file and execute it in a small, inspectable "
-        "step."
-    ),
-    SideEffect.KILLS_AGENT_PROCESS: (
-        "Do not run commands that may terminate the MCP client, agent, or "
-        "related process running the agent workflow; re-declare with a "
-        "safer category or request an explicit policy override."
-    ),
-}
-
-
-def _format_blocked_message(blocked: list[SideEffect]) -> str:
-    """Build the operator- and agent-friendly rejection message."""
-    names = ", ".join(s.name for s in blocked)
-    parts = [
-        f"Side-effect category blocked by policy: {names}. "
-        "Execution was stopped by policy before the process started."
-    ]
-    for category in blocked:
-        guidance = _BLOCKED_CATEGORY_GUIDANCE.get(category)
-        if guidance:
-            parts.append(f"{category.name}: {guidance}")
-        else:
-            parts.append(
-                f"{category.name}: re-declare with an allowed category or "
-                "update operator policy."
-            )
-    return " ".join(parts)
-
-
-class ManagedProcess:
-    __slots__ = (
-        "info",
-        "proc",
-        "stdout_buf",
-        "stderr_buf",
-        "drain_stdout",
-        "drain_stderr",
-        "completion_event",
-        "completion_task",
-        "timeout_task",
-        "group_watch_task",
-        "process_group_id",
-        "process_group_exited",
-        "_seq_source",
-        "_timeout_triggered",
-    )
-
-    def __init__(
-        self,
-        info: ProcessInfo,
-        proc: asyncio.subprocess.Process,
-        max_output_bytes: int,
-        process_group_id: int | None = None,
-    ) -> None:
-        self.info = info
-        self.proc = proc
-        self.process_group_id = process_group_id
-        self.process_group_exited = False
-        self._seq_source: list[int] = [1]
-        self.stdout_buf = RingBuffer(max_output_bytes, seq_source=self._seq_source)
-        self.stderr_buf = RingBuffer(max_output_bytes, seq_source=self._seq_source)
-        self.drain_stdout: asyncio.Task[None] | None = None
-        self.drain_stderr: asyncio.Task[None] | None = None
-        self.completion_event: asyncio.Event = asyncio.Event()
-        self.completion_task: asyncio.Task[None] | None = None
-        self.timeout_task: asyncio.Task[None] | None = None
-        self.group_watch_task: asyncio.Task[None] | None = None
-        self._timeout_triggered = False
-
 
 class ProcessManager:
     """Registry and lifecycle manager for managed shell processes."""
@@ -155,13 +67,34 @@ class ProcessManager:
         return {"status": "failed_to_start", "error": _SHUTDOWN_REJECT_ERROR}
 
     def _new_id(self) -> str:
-        return f"proc_{uuid.uuid4().hex[:12]}"
+        while True:
+            process_id = f"proc_{uuid.uuid4().hex[:12]}"
+            if process_id not in self._processes:
+                return process_id
 
     def _max_output(self, requested: int | None) -> int:
         cap = self._config.max_output_bytes
         if requested is None or requested <= 0:
             return cap
         return min(requested, cap)
+
+    def _read_snapshot(
+        self, mp: ManagedProcess, max_output_bytes: int
+    ) -> dict[str, Any]:
+        data = read_buffers(
+            {"stdout": mp.stdout_buf, "stderr": mp.stderr_buf},
+            since_seq=None,
+            max_bytes=max_output_bytes,
+        )
+        return {
+            "stdout": self._redact(mp, data["texts"]["stdout"]),
+            "stderr": self._redact(mp, data["texts"]["stderr"]),
+            "next_seq": data["next_seq"],
+            "truncated": data["truncated"],
+        }
+
+    def _redact(self, mp: ManagedProcess, text: str) -> str:
+        return redact_text(self._config, text, mp.sensitive_env)
 
     def _clamp_yield_ms(self, requested: int | None) -> int:
         selected = self._config.default_yield_ms if requested is None else requested
@@ -225,66 +158,6 @@ class ProcessManager:
             if task is not None and task is not current and not task.done():
                 task.cancel()
 
-    def _normalize_side_effects(
-        self, side_effects: Iterable[Any] | None
-    ) -> list[SideEffect] | None:
-        """Coerce ``side_effects`` entries into ``SideEffect`` enum members.
-
-        Accepts ``SideEffect`` instances or strings. Returns ``None`` when
-        ``side_effects`` itself is ``None``. Raises ``TypeError`` when an
-        entry is not a string and not a ``SideEffect``.
-        """
-        if side_effects is None:
-            return None
-        normalized: list[SideEffect] = []
-        for item in side_effects:
-            if isinstance(item, SideEffect):
-                normalized.append(item)
-            elif isinstance(item, str):
-                normalized.append(SideEffect(item))
-            else:
-                raise TypeError(
-                    f"side_effects entries must be SideEffect or str, got {type(item).__name__}"
-                )
-        return normalized
-
-    def _check_side_effects(
-        self, side_effects: Iterable[SideEffect] | None
-    ) -> str | None:
-        """Validate the side-effect declaration.
-
-        Returns an error message if the declaration is invalid (empty list,
-        ``NONE`` combined with another value, or any declared category is
-        configured as blocked). Returns ``None`` when the declaration is
-        allowed and execution can proceed.
-        """
-        try:
-            declared = self._normalize_side_effects(side_effects)
-        except ValueError as exc:
-            return f"Invalid side_effects: {exc}"
-        except TypeError as exc:
-            return str(exc)
-        if declared is None:
-            return "side_effects is required"
-        if not declared:
-            return (
-                'side_effects must not be empty; pass ["NONE"] for commands '
-                "with no side effects"
-            )
-        has_none = SideEffect.NONE in declared
-        non_none = [s for s in declared if s is not SideEffect.NONE]
-        if has_none and non_none:
-            return (
-                "side_effects=NONE is exclusive and cannot be combined with other "
-                f"categories: {[s.name for s in non_none]}"
-            )
-
-        blocked = self._config.blocked_side_effects
-        hits = [s for s in declared if s in blocked]
-        if hits:
-            return _format_blocked_message(hits)
-        return None
-
     async def exec_command(
         self,
         command: str,
@@ -293,6 +166,7 @@ class ProcessManager:
         env_overlay: dict[str, str] | None = None,
         shell: str | None = None,
         stdin: str | None = None,
+        close_stdin: bool = True,
         name: str | None = None,
         yield_ms: int | None = None,
         timeout_ms: int | None = None,
@@ -309,49 +183,60 @@ class ProcessManager:
         # Validate side-effect declaration first so blocked categories never
         # reach cwd resolution, command policy, process limits, env overlay
         # building, or process spawn.
-        side_effects_error = self._check_side_effects(side_effects)
+        side_effects_error = validate_side_effects(
+            side_effects, self._config.blocked_side_effects
+        )
         if side_effects_error:
             return {"status": "failed_to_start", "error": side_effects_error}
 
-        # Validate command policy
+        # Validate command and explicit shell policy
         cmd_error = validate_command(self._config, command)
         if cmd_error:
             return {"status": "failed_to_start", "error": cmd_error}
+        if shell is not None:
+            if not shell.strip():
+                return {
+                    "status": "failed_to_start",
+                    "error": "Shell executable must not be empty",
+                }
+            shell_error = validate_command(self._config, shell)
+            if shell_error:
+                return {
+                    "status": "failed_to_start",
+                    "error": f"Shell rejected by policy: {shell_error}",
+                }
 
         # Resolve and validate cwd
         resolved_cwd, cwd_error = resolve_cwd(self._config, cwd)
         if cwd_error:
             return {"status": "failed_to_start", "error": cwd_error}
 
-        async with self._shutdown_lock:
-            if self._shutdown_complete or self._shutdown_requested:
-                return self._shutdown_reject_response()
-
         self._reap_terminal_processes()
 
-        # Check process count limit
-        running_count = sum(
-            1 for p in self._processes.values() if self._has_live_work(p)
-        ) + self._pending_spawns
-        if running_count >= self._config.max_processes:
-            return {
-                "status": "failed_to_start",
-                "error": f"Maximum process limit ({self._config.max_processes}) reached",
-            }
-
-        # Build environment
-        env = build_env(self._config, env_overlay)
-        effective_yield = self._clamp_yield_ms(yield_ms)
-        effective_timeout = self._clamp_timeout_ms(timeout_ms)
-        effective_max_output = self._max_output(max_output_bytes)
-
-        # Spawn process
+        # Atomically reserve capacity before environment construction and spawn.
         async with self._shutdown_lock:
             if self._shutdown_complete or self._shutdown_requested:
                 return self._shutdown_reject_response()
+            running_count = sum(
+                1 for p in self._processes.values() if self._has_live_work(p)
+            ) + self._pending_spawns
+            if running_count >= self._config.max_processes:
+                return {
+                    "status": "failed_to_start",
+                    "error": (
+                        f"Maximum process limit ({self._config.max_processes}) reached"
+                    ),
+                }
             self._pending_spawns += 1
+
         try:
-            proc = await spawn_process(command, cwd=resolved_cwd, env=env)
+            env = build_env(self._config, env_overlay)
+            effective_yield = self._clamp_yield_ms(yield_ms)
+            effective_timeout = self._clamp_timeout_ms(timeout_ms)
+            effective_max_output = self._max_output(max_output_bytes)
+            proc = await spawn_process(
+                command, cwd=resolved_cwd, env=env, shell=shell
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -376,16 +261,22 @@ class ProcessManager:
             start_monotonic=start_time,
         )
 
-        mp = ManagedProcess(info, proc, effective_max_output, process_group_id)
+        mp = ManagedProcess(
+            info,
+            proc,
+            effective_max_output,
+            process_group_id,
+            collect_sensitive_env(self._config, env_overlay),
+        )
 
         # Start drain tasks immediately after spawn to prevent blocking on full pipe buffers
         drain_tasks = [
             asyncio.create_task(
-                self._drain_stream(proc.stdout, mp.stdout_buf),
+                self._drain_stream(proc.stdout, mp.stdout_buf, mp.sensitive_env),
                 name=f"drain-stdout-{process_id}",
             ),
             asyncio.create_task(
-                self._drain_stream(proc.stderr, mp.stderr_buf),
+                self._drain_stream(proc.stderr, mp.stderr_buf, mp.sensitive_env),
                 name=f"drain-stderr-{process_id}",
             ),
         ]
@@ -408,14 +299,17 @@ class ProcessManager:
                 name=f"timeout-{process_id}",
             )
 
-        # Write initial stdin if provided; keep pipe open for follow-up writes
-        if stdin is not None:
-            try:
+        # Write initial input, then close by default so EOF-driven commands finish.
+        try:
+            if stdin is not None:
                 if proc.stdin is not None:
                     proc.stdin.write(stdin.encode("utf-8"))
                     await proc.stdin.drain()
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
+            if close_stdin:
+                self._close_stdin(mp)
 
         # Wait up to yield_ms for completion
         try:
@@ -430,11 +324,10 @@ class ProcessManager:
         duration_ms = (time.monotonic() - start_time) * 1000
 
         # Prepare output for response
-        stdout_data = mp.stdout_buf.read(max_bytes=effective_max_output)
-        stderr_data = mp.stderr_buf.read(max_bytes=effective_max_output)
-        truncated = stdout_data["truncated"] or stderr_data["truncated"]
-        stdout_text = redact_text(self._config, stdout_data["text"])
-        stderr_text = redact_text(self._config, stderr_data["text"])
+        snapshot = self._read_snapshot(mp, effective_max_output)
+        truncated = snapshot["truncated"]
+        stdout_text = snapshot["stdout"]
+        stderr_text = snapshot["stderr"]
 
         if (
             mp.info.status == ProcessStatus.COMPLETED
@@ -531,19 +424,33 @@ class ProcessManager:
         return True
 
     async def _drain_stream(
-        self, stream: asyncio.StreamReader | None, buf: RingBuffer
+        self,
+        stream: asyncio.StreamReader | None,
+        buf: RingBuffer,
+        sensitive_env: tuple[tuple[str, str], ...] = (),
     ) -> None:
         """Read from a subprocess stream into a ring buffer."""
         if stream is None:
             return
-        while True:
-            try:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        redactor = StreamingRedactor(sensitive_env)
+        try:
+            while True:
                 chunk = await stream.read(4096)
                 if not chunk:
                     break
-                buf.append(chunk)
-            except Exception:
-                break
+                text = decoder.decode(chunk, final=False)
+                if text:
+                    redacted = redactor.feed(text)
+                    if redacted:
+                        buf.append(redacted.encode("utf-8"))
+        except Exception:
+            pass
+        finally:
+            tail = decoder.decode(b"", final=True)
+            redacted = redactor.feed(tail, final=True)
+            if redacted:
+                buf.append(redacted.encode("utf-8"))
 
     async def _track_completion(
         self, proc: asyncio.subprocess.Process, mp: ManagedProcess
@@ -682,9 +589,14 @@ class ProcessManager:
             await asyncio.sleep(timeout_sec)
         except asyncio.CancelledError:
             return
-        mp._timeout_triggered = True
+        # The subprocess may have exited naturally while its completion tracker
+        # was waiting to run. Do not relabel that race as a timeout.
+        if mp.proc.returncode is not None and not self._process_group_exists(mp):
+            return
         if not self._has_live_work(mp):
             return
+        mp._timeout_triggered = True
+        mp.info.status = ProcessStatus.TIMED_OUT
         # Graceful termination
         await terminate_process(mp.proc, mp.process_group_id)
         grace_period = GRACEFUL_STOP_MS / 1000.0
@@ -702,8 +614,6 @@ class ProcessManager:
             await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
 
         mp.completion_event.set()
-        if mp.info.status == ProcessStatus.COMPLETED:
-            mp.info.status = ProcessStatus.TIMED_OUT
 
     async def read_output(
         self,
@@ -722,39 +632,31 @@ class ProcessManager:
 
         effective_max = self._max_output(max_output_bytes)
 
-        stdout_text = None
-        stderr_text = None
-        next_seq = 1
-        truncated = False
-
+        selected: dict[str, RingBuffer] = {}
         if streams in ("both", "stdout"):
-            data = mp.stdout_buf.read(since_seq=since_seq, max_bytes=effective_max)
-            stdout_text = redact_text(self._config, data["text"])
-            next_seq = max(next_seq, data["next_seq"])
-            truncated = truncated or data["truncated"]
-
+            selected["stdout"] = mp.stdout_buf
         if streams in ("both", "stderr"):
-            data = mp.stderr_buf.read(since_seq=since_seq, max_bytes=effective_max)
-            stderr_text = redact_text(self._config, data["text"])
-            next_seq = max(next_seq, data["next_seq"])
-            truncated = truncated or data["truncated"]
+            selected["stderr"] = mp.stderr_buf
+        data = read_buffers(selected, since_seq=since_seq, max_bytes=effective_max)
 
         result: dict[str, Any] = {
             "process_id": process_id,
             "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
-            "next_seq": next_seq,
-            "truncated": truncated,
+            "next_seq": data["next_seq"],
+            "truncated": data["truncated"],
         }
-        if stdout_text is not None:
-            result["stdout"] = stdout_text
-        if stderr_text is not None:
-            result["stderr"] = stderr_text
+        for stream, text in data["texts"].items():
+            result[stream] = self._redact(mp, text)
         return result
 
     async def write_input(
-        self, process_id: str, input_data: str, newline: bool = False
+        self,
+        process_id: str,
+        input_data: str,
+        newline: bool = False,
+        close_stdin: bool = False,
     ) -> dict[str, Any]:
         """Write to stdin of a managed process."""
         mp = self._processes.get(process_id)
@@ -764,7 +666,7 @@ class ProcessManager:
                 "error": f"Unknown process_id: {process_id}",
             }
 
-        if mp.info.status != ProcessStatus.RUNNING:
+        if self._reported_status(mp) != ProcessStatus.RUNNING.value:
             return {
                 "process_id": process_id,
                 "ok": False,
@@ -787,6 +689,21 @@ class ProcessManager:
             return {"process_id": process_id, "ok": True}
         except Exception as exc:
             return {"process_id": process_id, "ok": False, "error": str(exc)}
+        finally:
+            if close_stdin:
+                self._close_stdin(mp)
+
+    @staticmethod
+    def _close_stdin(mp: ManagedProcess) -> None:
+        stdin = mp.proc.stdin
+        if stdin is None:
+            return
+        is_closing = getattr(stdin, "is_closing", None)
+        if is_closing is not None and is_closing():
+            return
+        close = getattr(stdin, "close", None)
+        if close is not None:
+            close()
 
     async def wait_process(
         self,
@@ -802,43 +719,26 @@ class ProcessManager:
         # Cap effective wait below typical MCP request timeout thresholds
         effective_wait_ms = max(0, min(timeout_ms, MAX_EFFECTIVE_WAIT_MS))
 
-        if not self._has_live_work(mp):
-            effective_max = self._max_output(max_output_bytes)
-            stdout_data = mp.stdout_buf.read(max_bytes=effective_max)
-            stderr_data = mp.stderr_buf.read(max_bytes=effective_max)
-            truncated = stdout_data["truncated"] or stderr_data["truncated"]
-            return {
-                "process_id": process_id,
-                "status": self._reported_status(mp),
-                "exit_code": mp.info.exit_code,
-                "signal": mp.info.signal,
-                "stdout": redact_text(self._config, stdout_data["text"]),
-                "stderr": redact_text(self._config, stderr_data["text"]),
-                "next_seq": max(stdout_data["next_seq"], stderr_data["next_seq"]),
-                "truncated": truncated,
-            }
-
-        try:
-            await asyncio.wait_for(
-                mp.completion_event.wait(), timeout=effective_wait_ms / 1000.0
-            )
-        except asyncio.TimeoutError:
-            pass
+        if self._has_live_work(mp):
+            try:
+                await asyncio.wait_for(
+                    mp.completion_event.wait(), timeout=effective_wait_ms / 1000.0
+                )
+            except asyncio.TimeoutError:
+                pass
 
         effective_max = self._max_output(max_output_bytes)
-        stdout_data = mp.stdout_buf.read(max_bytes=effective_max)
-        stderr_data = mp.stderr_buf.read(max_bytes=effective_max)
-        truncated = stdout_data["truncated"] or stderr_data["truncated"]
+        snapshot = self._read_snapshot(mp, effective_max)
 
         return {
             "process_id": process_id,
             "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
-            "stdout": redact_text(self._config, stdout_data["text"]),
-            "stderr": redact_text(self._config, stderr_data["text"]),
-            "next_seq": max(stdout_data["next_seq"], stderr_data["next_seq"]),
-            "truncated": truncated,
+            "stdout": snapshot["stdout"],
+            "stderr": snapshot["stderr"],
+            "next_seq": snapshot["next_seq"],
+            "truncated": snapshot["truncated"],
         }
 
     async def stop_process(
@@ -866,6 +766,12 @@ class ProcessManager:
 
         # Send requested signal
         sig = get_signal(signal_name)
+        if sig is None:
+            return {
+                "process_id": process_id,
+                "stopped": False,
+                "error": f"Invalid signal: {signal_name!r}",
+            }
         if sig is not None and sys.platform != "win32" and mp.proc.pid is not None:
             try:
                 os.killpg(self._process_group_id(mp), sig)
@@ -878,7 +784,10 @@ class ProcessManager:
             await terminate_process(mp.proc)
 
         # Wait for grace period
-        await self._wait_for_process_group_exit(mp, timeout_sec=force_after_ms / 1000.0)
+        effective_force_ms = max(0, min(force_after_ms, MAX_EFFECTIVE_WAIT_MS))
+        await self._wait_for_process_group_exit(
+            mp, timeout_sec=effective_force_ms / 1000.0
+        )
 
         if self._process_group_exists(mp):
             # The primary shell may exit before a resistant descendant.
@@ -888,15 +797,23 @@ class ProcessManager:
             )
             await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
 
+        if self._process_group_exists(mp):
+            return {
+                "process_id": process_id,
+                "stopped": False,
+                "signal": signal_name,
+                "error": "Process group did not stop after force kill",
+            }
+
         # If the process exited due to our signal, mark it as STOPPED.
         # _track_completion may have set COMPLETED, but since we initiated
         # termination, the correct terminal status is STOPPED.
-        if mp.info.status == ProcessStatus.RUNNING:
-            # Process didn't exit even after force kill
+        if mp.info.status in (ProcessStatus.RUNNING, ProcessStatus.COMPLETED):
             mp.info.status = ProcessStatus.STOPPED
             mp.info.ended_at = time.time()
-        elif mp.info.status == ProcessStatus.COMPLETED:
-            mp.info.status = ProcessStatus.STOPPED
+            mp.info.duration_ms = (
+                time.monotonic() - mp.info.start_monotonic
+            ) * 1000
 
         stopped = mp.info.status == ProcessStatus.STOPPED
 
@@ -913,21 +830,21 @@ class ProcessManager:
         """List managed processes."""
         processes = []
         for mp in list(self._processes.values()):
-            if not include_completed and mp.info.status in (
-                ProcessStatus.COMPLETED,
-                ProcessStatus.STOPPED,
-                ProcessStatus.TIMED_OUT,
-                ProcessStatus.FAILED,
-            ):
+            reported_status = self._reported_status(mp)
+            if not include_completed and reported_status != ProcessStatus.RUNNING.value:
                 continue
             processes.append(
                 {
                     "process_id": mp.info.process_id,
                     "pid": mp.info.pid,
-                    "name": mp.info.name,
-                    "command": mp.info.command,
+                    "name": (
+                        self._redact(mp, mp.info.name)
+                        if mp.info.name is not None
+                        else None
+                    ),
+                    "command": self._redact(mp, mp.info.command),
                     "cwd": mp.info.cwd,
-                    "status": self._reported_status(mp),
+                    "status": reported_status,
                     "exit_code": mp.info.exit_code,
                     "signal": mp.info.signal,
                     "started_at": mp.info.started_at,
@@ -943,7 +860,7 @@ class ProcessManager:
                 }
             )
         processes.reverse()  # Most recent first
-        return {"processes": processes[:limit]}
+        return {"processes": processes[: max(0, limit)]}
 
     async def cleanup(
         self,

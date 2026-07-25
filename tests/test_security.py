@@ -4,7 +4,13 @@ import os
 from pathlib import Path
 
 from mcp_yieldshell.config import Config
-from mcp_yieldshell.security import build_env, redact_text, resolve_cwd, validate_command
+from mcp_yieldshell.security import (
+    StreamingRedactor,
+    build_env,
+    redact_text,
+    resolve_cwd,
+    validate_command,
+)
 
 
 class TestValidateCommand:
@@ -18,6 +24,7 @@ class TestValidateCommand:
         error = validate_command(config, "rm -rf /")
         assert error is not None
         assert "denied" in error.lower()
+        assert "rm -rf" not in error
 
     def test_deny_regex_allows_non_matching(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_DENY_COMMAND_REGEX", r"rm\s+-rf")
@@ -226,3 +233,31 @@ class TestRedactText:
         config = Config()
         assert config.redact_env_regex.search("API_TOKEN")
         assert config.redact_env_regex.search("PRIVATE_KEY")
+
+    def test_streaming_redactor_matches_across_chunks(self):
+        redactor = StreamingRedactor((("API_TOKEN", "secret-value"),))
+
+        output = (
+            redactor.feed("before secret")
+            + redactor.feed("-value after")
+            + redactor.feed("", final=True)
+        )
+
+        assert output == "before [REDACTED:API_TOKEN] after"
+
+    def test_streaming_redactor_does_not_delay_unrelated_text(self):
+        redactor = StreamingRedactor((("API_TOKEN", "secret-value"),))
+
+        assert redactor.feed("ordinary output") == "ordinary output"
+        assert redactor.feed("", final=True) == ""
+
+    def test_streaming_redactor_preserves_marker_split_across_chunks(self):
+        redactor = StreamingRedactor((("TOKEN", "MY_SECRET"),))
+
+        output = (
+            redactor.feed("[REDACTED:MY_")
+            + redactor.feed("SECRET]")
+            + redactor.feed("", final=True)
+        )
+
+        assert output == "[REDACTED:MY_SECRET]"

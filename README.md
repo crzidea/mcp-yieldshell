@@ -141,12 +141,13 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
     * `RUNS_INLINE_CODE` is in the default blocklist. It covers commands that execute code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `curl ... | sh`). It does not cover simply creating a script or executable file unless the same command also executes inline code. The safer next action is to write the content to a reviewable workspace file and execute it in a small, inspectable step. Operators can unblock the category via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
   * `cwd` (string, optional): Working directory for the command. Must be under allowed roots if `YIELDSHELL_ALLOWED_CWDS` is set. Defaults to `YIELDSHELL_DEFAULT_CWD`.
   * `env` (object of string to string, optional): Additive environment variable overlay. Merged into the parent environment.
-  * `shell` (string, optional): Accepted but has no effect in v1. Commands always run via the platform's default shell.
+  * `shell` (string, optional): Shell executable used to run the command. Defaults to the platform shell. Explicit shells are checked by the same allow/deny command policy.
   * `stdin` (string, optional): Initial text input written to standard input immediately after spawning.
+  * `close_stdin` (boolean, default: `true`): Close standard input after the initial input is written. Set to `false` when follow-up `write` calls are expected.
   * `name` (string, optional): A human-readable label/name to identify this process.
   * `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Both omitted and explicit values are clamped to the lesser of `YIELDSHELL_MAX_YIELD_MS` and the transport-safe 55,000ms ceiling. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (30,000ms).
   * `timeout_ms` (integer, optional): Total execution runtime limit in milliseconds. Process is terminated if it runs longer than this. Defaults to `YIELDSHELL_DEFAULT_TIMEOUT_MS` (3,600,000ms). Pass `0` explicitly for unlimited execution.
-  * `max_output_bytes` (integer, optional): Maximum output bytes to capture in stdout/stderr ring buffers. Subject to `YIELDSHELL_MAX_OUTPUT_BYTES` cap.
+  * `max_output_bytes` (integer, optional): Maximum bytes retained per stdout/stderr ring buffer and returned in total across both response streams. Subject to the `YIELDSHELL_MAX_OUTPUT_BYTES` cap.
 
 * **Side-Effects Guide**:
   * `side_effects` is required and must be a non-empty list. Declare every plausible side-effect category before running the command.
@@ -178,12 +179,12 @@ Read stdout and/or stderr output from a running or completed background process.
 
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
-  * `since_seq` (integer, optional): Return only output appended after this sequence number. Enables efficient incremental log polling.
-  * `max_output_bytes` (integer, optional): Clamps the response size. Defaults to the server cap.
+  * `since_seq` (integer, optional): Byte-position cursor returned as `next_seq` by the previous read. Enables lossless incremental log polling.
+  * `max_output_bytes` (integer, optional): Clamps total output returned across the selected streams. Defaults to the server cap.
   * `streams` (string, default: `"both"`): The streams to read. Options: `"both"`, `"stdout"`, or `"stderr"`.
 
 * **Returns**:
-  * `process_id`, `status`, `exit_code`, `signal`, `next_seq` (sequence index to use in subsequent `since_seq` reads), `truncated` flag. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
+  * `process_id`, `status`, `exit_code`, `signal`, `next_seq` (byte-position cursor to use in subsequent `since_seq` reads), `truncated` flag. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
 
 ### `write`
 Write text input to the standard input (`stdin`) of a running process.
@@ -192,6 +193,7 @@ Write text input to the standard input (`stdin`) of a running process.
   * `process_id` (string, **required**): Unique identifier of the process.
   * `input` (string, **required**): Text input to write.
   * `newline` (boolean, default: `false`): If `true`, appends `\n` to the input.
+  * `close_stdin` (boolean, default: `false`): Close standard input after this write, delivering EOF to the process.
 
 ### `wait`
 Block execution until the process exits or the wait timeout expires. This allows the LLM to pause and await completion without spawning a new execution loop.
@@ -199,7 +201,7 @@ Block execution until the process exits or the wait timeout expires. This allows
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
   * `timeout_ms` (integer, default: `55000`): Maximum time to wait.
-  * `max_output_bytes` (integer, optional): Maximum output bytes to return in the response.
+  * `max_output_bytes` (integer, optional): Maximum total output bytes to return across stdout and stderr.
 
 * **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
 * The effective wait duration is capped at 55 seconds to stay well under typical MCP request timeouts, even if a larger `timeout_ms` is requested.
@@ -210,8 +212,8 @@ Gracefully terminate or force kill a running process.
 
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
-  * `signal` (string, default: `"SIGTERM"`): OS signal to send (e.g. `SIGTERM`, `SIGKILL`, `SIGINT`). Ignored on Windows.
-  * `force_after_ms` (integer, default: `10000`): Grace period before escalating to force kill (`SIGKILL`). Shorter explicit values remain supported.
+  * `signal` (string, default: `"SIGTERM"`): OS signal to send (e.g. `SIGTERM`, `SIGKILL`, `SIGINT`). Invalid names are rejected without stopping the process. Valid names are ignored on Windows.
+  * `force_after_ms` (integer, default: `10000`): Grace period before escalating to force kill (`SIGKILL`), capped at the transport-safe 55-second ceiling.
 
 ### `ps`
 List all managed processes.
@@ -237,15 +239,19 @@ Prune completed, stopped, timed-out, and failed process records to free memory.
 
 ---
 
-## Sequence Number & Incremental Reads
+## Byte Cursors & Incremental Reads
 
-To avoid sending duplicate data over the MCP protocol (which can consume context window space), the server implements a sequence-based polling protocol:
+To avoid sending duplicate data over the MCP protocol (which can consume context window space), the server implements a byte-position polling protocol:
 
-1. Every output chunk appended to a process's ring buffer receives a unique, incremental sequence number (`seq`).
-2. When calling `exec`, `read`, or `wait`, the response includes a `next_seq` value representing the index of the next chunk to be written.
-3. To retrieve only *new* output, call `read` with `since_seq` set to the previously received `next_seq`.
+1. Every stdout/stderr byte receives a unique position in a cursor shared by both streams.
+2. `read` returns `next_seq`, the position immediately after the bytes actually returned. A response cap can therefore end safely inside a drain chunk.
+3. To retrieve the next output without gaps, call `read` with `since_seq` set to the previously returned `next_seq`.
 4. Omitting `since_seq` returns the entire contents currently stored in the buffer (clamped by `max_output_bytes`).
-5. If output exceeds the ring buffer's capacity between reads, older data is evicted and `since_seq` may no longer be available. In that case, `truncated` is set to `true` and the read returns data from the earliest retained sequence onward.
+5. If output exceeds the ring buffer's capacity between reads, older data is evicted and `since_seq` may no longer be available. In that case, `truncated` is set to `true` and the read returns data from the earliest retained position onward. Later reads report truncation only when their requested range overlaps evicted data.
+
+Cursor boundaries preserve valid UTF-8 characters. If a single character is larger than a very small requested page, that page may exceed `max_output_bytes` by at most three bytes so the cursor can make progress without corrupting the character.
+
+Incremental cursors are scoped to the selected `streams` value. Keep the same stream selection while advancing a cursor; switching from `stdout`-only or `stderr`-only polling to another selection can intentionally skip bytes from the previously unselected stream.
 
 When a process exits normally, `exec`/`wait` responses include output drained through stdout/stderr EOF. If a descendant keeps inherited stdout/stderr open after the tracked process exits, the server stops waiting on those inherited pipes to avoid indefinite blocking; output written only by that descendant after the tracked process exits is not part of the managed process result.
 
@@ -259,8 +265,8 @@ Configure the server by setting these environment variables prior to launch:
 |---|---|---|
 | `YIELDSHELL_DEFAULT_CWD` | Current directory | The fallback working directory for commands. |
 | `YIELDSHELL_ALLOWED_CWDS` | *(none)* | A list of allowed directory paths separated by `os.pathsep` (e.g., `:` on UNIX, `;` on Windows). If set, all command execution paths must resolve inside one of these roots. |
-| `YIELDSHELL_MAX_OUTPUT_BYTES` | `20000` | The default and maximum capacity of the ring buffers for stdout/stderr. |
-| `YIELDSHELL_MAX_PROCESSES` | `50` | Maximum concurrent live managed process groups, including descendants that outlive a completed shell. Spawning a new command when this limit is reached returns `failed_to_start`. |
+| `YIELDSHELL_MAX_OUTPUT_BYTES` | `20000` | The default and maximum capacity of the ring buffers for stdout/stderr. Nonpositive or nonnumeric values use the default. |
+| `YIELDSHELL_MAX_PROCESSES` | `50` | Maximum concurrent live managed process groups, including descendants that outlive a completed shell. Spawning a new command when this limit is reached returns `failed_to_start`. Nonpositive or nonnumeric values use the default. |
 | `YIELDSHELL_DEFAULT_YIELD_MS` | `30000` | Fallback delay before auto-yielding. Effective yields are also capped at 55,000ms. |
 | `YIELDSHELL_MAX_YIELD_MS` | `300000` | Configured maximum for `yield_ms`; the effective maximum is the lesser of this value and 55,000ms. |
 | `YIELDSHELL_DEFAULT_TIMEOUT_MS` | `3600000` | Default hard runtime limit (1 hour). An explicit tool argument of `0` means no limit. |
@@ -282,13 +288,13 @@ Configure the server by setting these environment variables prior to launch:
 * **Agent Process Termination**: `KILLS_AGENT_PROCESS` covers commands that may terminate the MCP client, agent, or related process running the agent workflow (e.g., `kill` commands targeting the agent PID, or commands that cause the agent to exit). This is distinct from `STOPS_OR_RESTARTS_SERVICES`, which covers OS-level services. Blocked by default; operators can override.
 * **Path Validation**: CWD path verification resolves traversal and symlinks, then requires the target to be an allowed root itself or a true descendant. Lexically similar siblings and symlink escapes are rejected before spawn.
 * **Additive Environments**: The `env` argument overlays existing env parameters. It merges with the parent process environment instead of completely replacing it, protecting critical OS vars.
-* **Best-effort Redaction**: At startup, values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are snapshotted, ordered longest first, and values shorter than 8 characters are excluded to avoid corrupting ordinary output. Restart the server to refresh the snapshot after parent-environment changes. Secrets not selected by the regex or printed through transformed formats might not be caught.
+* **Best-effort Redaction**: At startup, values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are snapshotted, ordered longest first, and values shorter than 8 characters are excluded to avoid corrupting ordinary output. Matching values supplied through an `env` overlay are added for that process. Redaction is applied while streams are drained, including across subprocess chunks and incremental read pages. Restart the server to refresh the parent-environment snapshot after changes. Secrets not selected by the regex or printed through transformed formats might not be caught.
 
 ## Lifecycle and Compatibility
 
 YieldShell gives graceful termination 10 seconds before force-killing, waits up to 5 seconds for a POSIX process group to disappear, and allows up to 3 seconds for final stream draining. On stdio server shutdown, all live managed processes are terminated concurrently using the same bounded graceful/forced policy. Already-terminal records are not changed by shutdown.
 
-The tool names, response fields, status values, side-effect validation order, running-process limit, ring-buffer behavior, and manual `cleanup` contract are unchanged. Behavioral changes are the 30-second auto-yield default, one-hour runtime default, 55-second effective request-wait ceiling, 10-second stop grace, automatic terminal-record retention, startup redaction snapshot, and shutdown containment. Use explicit shorter timing values where lower latency is preferred, and pass `timeout_ms=0` to retain unlimited runtime behavior.
+Current lifecycle defaults are a 30-second auto-yield, one-hour runtime timeout, 55-second effective request-wait and stop-grace ceilings, 10-second default stop grace, automatic terminal-record retention, streaming output redaction, and shutdown containment. Standard input closes after `exec` by default; callers that need an interactive session must set `close_stdin=false`. Use explicit shorter timing values where lower latency is preferred, and pass `timeout_ms=0` to retain unlimited runtime behavior.
 
 ---
 

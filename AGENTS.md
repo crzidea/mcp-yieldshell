@@ -23,14 +23,15 @@ graph TD
   * Implements the core MCP tool logic (`exec_command`, `read_output`, `write_input`, `wait_process`, `stop_process`, `list_processes`, `cleanup`).
   * `exec_command` enforces the required `side_effects` declaration (see `src/mcp_yieldshell/types.py`) before cwd validation, command policy evaluation, process-limit checks, environment overlay building, and subprocess spawn.
   * `wait_process` caps its effective wait at `MAX_EFFECTIVE_WAIT_MS` (55 s) to avoid MCP request timeouts.
-* **`ManagedProcess`** (`src/mcp_yieldshell/process/manager.py`):
+* **`ManagedProcess`** (`src/mcp_yieldshell/process/managed.py`):
   * Groups the underlying `asyncio.subprocess.Process` handle with its stdout/stderr buffers, status, and active control tasks.
 * **`RingBuffer`** (`src/mcp_yieldshell/process/ring_buffer.py`):
   * Maintains a fixed-size, byte-capped buffer for stdout and stderr to avoid unbounded memory growth.
-  * Tracks sequence numbers for chunks of bytes. Readers query the buffer with `since_seq` to retrieve incremental logs.
+  * Tracks shared byte-position cursors across stdout and stderr. Readers query the buffer with `since_seq` to retrieve lossless incremental logs, including responses capped inside an original drain chunk.
 * **`SideEffect`** (`src/mcp_yieldshell/types.py`):
   * String enum of the canonical side-effect categories a command can declare. Shared with config parsing, MCP schema generation, and runtime validation.
   * Default blocked set: `KILLS_AGENT_PROCESS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_PROTECTED_FILES`, `RUNS_INLINE_CODE`. Configurable via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`.
+  * Runtime declaration validation and blocked-category guidance live in `src/mcp_yieldshell/side_effects.py`.
 
 ---
 
@@ -38,7 +39,7 @@ graph TD
 
 Whenever a command is executed, `ProcessManager` schedules several async tasks:
 
-1. **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks and write directly to the corresponding `RingBuffer`. They must complete draining before a process is marked as fully completed.
+1. **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks, decode UTF-8 incrementally, redact configured secrets across chunk boundaries, and write sanitized bytes to the corresponding `RingBuffer`. They must complete draining before a process is marked as fully completed.
 2. **Completion Tracker** (`completion-<id>`): Waits for the process to exit using `await proc.wait()`, waits for outstanding drain tasks to finish, and sets the final exit code, signal info, and state transitions.
 3. **Timeout Handler** (`timeout-<id>`): Scheduled if `timeout_ms` is set. After sleeping, if the process is still running, it escalates from `SIGTERM` (graceful) to `SIGKILL` (forced) to clean up hung tasks. To prevent resource leaks, this task is cancelled immediately once the process exits naturally or is stopped.
 4. **Server Shutdown Path**: `ProcessManager.shutdown()` is invoked from the FastMCP lifespan finally block (`src/mcp_yieldshell/server.py`) and is responsible for idempotently terminating all live process groups with a bounded graceful phase, force-killing survivors, draining final output, and settling completion tasks.
@@ -60,10 +61,11 @@ This is a Python 3.11 package using a `src/` layout:
 * `src/mcp_yieldshell/policy.py` centralizes timing policy defaults and caps (`MAX_EFFECTIVE_WAIT_MS`, `GRACEFUL_STOP_MS`, etc.).
 * `src/mcp_yieldshell/config.py` handles environment-based configuration parsing, including the `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` blocklist.
 * `src/mcp_yieldshell/types.py` defines the `SideEffect` enum, default blocked set, and process status types.
+* `src/mcp_yieldshell/side_effects.py` validates declarations and formats blocked-category guidance.
 * `src/mcp_yieldshell/security.py` controls allowed path roots, command regex rules, and environment overlays/redactions.
-* `src/mcp_yieldshell/process/` contains execution, buffer, and lifecycle management.
+* `src/mcp_yieldshell/process/` contains managed-process state, execution, buffering, and lifecycle management.
 * `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`, `test_side_effects.py`, `test_lifecycle_hardening.py`).
-* `scripts/release.py` automates version bumps, lock refresh, staging, commit, tag, and push.
+* `scripts/release.py` automates transactional version/lock refresh, scoped staging and commit, tagging, and an atomic branch/tag push.
 
 ---
 

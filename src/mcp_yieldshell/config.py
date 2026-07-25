@@ -20,19 +20,19 @@ class Config:
         self.allowed_cwd_roots: list[str] = _parse_pathsep(
             os.environ.get("YIELDSHELL_ALLOWED_CWDS", "")
         )
-        self.max_output_bytes: int = _parse_int(
+        self.max_output_bytes: int = _parse_positive_int(
             os.environ.get("YIELDSHELL_MAX_OUTPUT_BYTES", ""), 20000
         )
-        self.max_processes: int = _parse_int(
+        self.max_processes: int = _parse_positive_int(
             os.environ.get("YIELDSHELL_MAX_PROCESSES", ""), 50
         )
-        self.default_yield_ms: int = _parse_int(
+        self.default_yield_ms: int = _parse_nonnegative_int(
             os.environ.get("YIELDSHELL_DEFAULT_YIELD_MS", ""), DEFAULT_YIELD_MS
         )
-        self.max_yield_ms: int = _parse_int(
+        self.max_yield_ms: int = _parse_nonnegative_int(
             os.environ.get("YIELDSHELL_MAX_YIELD_MS", ""), 300000
         )
-        self.default_timeout_ms: int = _parse_int(
+        self.default_timeout_ms: int = _parse_nonnegative_int(
             os.environ.get("YIELDSHELL_DEFAULT_TIMEOUT_MS", ""), DEFAULT_TIMEOUT_MS
         )
         self.process_retention_ms: int = _parse_nonnegative_int(
@@ -86,6 +86,11 @@ def _parse_int(value: str, default: int) -> int:
 def _parse_nonnegative_int(value: str, default: int) -> int:
     parsed = _parse_int(value, default)
     return parsed if parsed >= 0 else default
+
+
+def _parse_positive_int(value: str, default: int) -> int:
+    parsed = _parse_int(value, default)
+    return parsed if parsed > 0 else default
 
 
 def _parse_regex(value: str) -> re.Pattern[str] | None:
