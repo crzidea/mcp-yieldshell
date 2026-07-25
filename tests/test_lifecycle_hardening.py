@@ -19,7 +19,7 @@ from mcp_yieldshell.policy import (
 from mcp_yieldshell.process.managed import ManagedProcess
 from mcp_yieldshell.process.manager import ProcessManager
 from mcp_yieldshell.process.spawn import kill_process, terminate_process
-from mcp_yieldshell.server import _server_lifespan, mcp
+from mcp_yieldshell.server import _server_lifespan, create_server, mcp
 from mcp_yieldshell.types import ProcessInfo, ProcessStatus, SideEffect
 
 NONE = [SideEffect.NONE]
@@ -303,6 +303,18 @@ class TestManagerShutdown:
         monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 500)
         monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 500)
 
+    def test_process_group_id_does_not_depend_on_live_parent_lookup(
+        self, monkeypatch
+    ):
+        manager = ProcessManager(Config())
+        proc = MagicMock()
+        proc.pid = 12345
+        getpgid = MagicMock(side_effect=ProcessLookupError)
+        monkeypatch.setattr("mcp_yieldshell.process.manager.os.getpgid", getpgid)
+
+        assert manager._get_process_group_id(proc) == 12345
+        getpgid.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_shutdown_with_no_live_processes_is_idempotent(self):
         manager = ProcessManager(Config())
@@ -411,12 +423,42 @@ class TestManagerShutdown:
         waited = await manager.wait_process(result["process_id"], timeout_ms=2000)
         assert mp.info.status == ProcessStatus.COMPLETED
         assert waited["status"] == "running"
+        first_listing = manager.list_processes()["processes"][0]
+        assert first_listing["ended_at"] is None
+        first_duration = first_listing["duration_ms"]
+        await asyncio.sleep(0.05)
+        second_listing = manager.list_processes()["processes"][0]
+        assert second_listing["duration_ms"] > first_duration
 
         stopped = await manager.stop_process(result["process_id"])
 
         assert stopped["stopped"] is True
+        final_listing = manager.list_processes()["processes"][0]
+        assert final_listing["ended_at"] is not None
+        assert final_listing["duration_ms"] >= second_listing["duration_ms"]
         with pytest.raises(ProcessLookupError):
             os.killpg(group, 0)
+
+    @pytest.mark.asyncio
+    async def test_stop_reports_success_during_timeout_terminal_state(self):
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            "sleep 30",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None
+        mp.info.status = ProcessStatus.TIMED_OUT
+
+        stopped = await manager.stop_process(
+            result["process_id"],
+            force_after_ms=100,
+        )
+
+        assert stopped["stopped"] is True
+        assert stopped["error"] is None
+        assert mp.info.status == ProcessStatus.TIMED_OUT
 
     @pytest.mark.asyncio
     async def test_runtime_timeout_remains_active_for_live_descendant(self):
@@ -535,6 +577,35 @@ class TestServerLifespan:
                     raise error
 
         manager.shutdown.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_targets_manager_active_at_lifespan_entry(self, monkeypatch):
+        active_manager = AsyncMock()
+        replacement_manager = AsyncMock()
+        monkeypatch.setattr("mcp_yieldshell.server._manager", active_manager)
+
+        async with _server_lifespan(mcp):
+            monkeypatch.setattr(
+                "mcp_yieldshell.server._manager", replacement_manager
+            )
+
+        active_manager.shutdown.assert_awaited_once_with()
+        replacement_manager.shutdown.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_server_rejects_live_manager_replacement(self, monkeypatch):
+        monkeypatch.setattr("mcp_yieldshell.server._manager", None)
+        create_server(Config())
+        from mcp_yieldshell import server as server_module
+
+        active_manager = server_module._manager
+        assert active_manager is not None
+
+        with pytest.raises(RuntimeError, match="already initialized"):
+            create_server(Config())
+
+        assert server_module._manager is active_manager
+        await active_manager.shutdown()
 
 
 class TestSpawnRegistration:

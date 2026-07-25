@@ -622,6 +622,28 @@ class TestCleanup:
         assert cleanup_result["removed"] == 0
         await manager.stop_process(pid, force_after_ms=500)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("completed_older_than_ms", "stopped_older_than_ms"),
+        [(-1, 0), (0, -1)],
+    )
+    async def test_cleanup_rejects_negative_thresholds_without_removing_records(
+        self,
+        manager,
+        completed_older_than_ms,
+        stopped_older_than_ms,
+    ):
+        await manager.exec_command("echo retained", side_effects=NONE)
+
+        result = await manager.cleanup(
+            completed_older_than_ms=completed_older_than_ms,
+            stopped_older_than_ms=stopped_older_than_ms,
+        )
+
+        assert result["removed"] == 0
+        assert "non-negative" in result["error"]
+        assert len(manager.list_processes()["processes"]) == 1
+
 
 class TestPs:
     @pytest.mark.asyncio

@@ -21,11 +21,13 @@ class StreamingRedactor:
     """Redact sensitive values across arbitrary text chunk boundaries."""
 
     def __init__(self, sensitive_env: SensitiveEnv) -> None:
-        self._sensitive_env = sensitive_env
+        self._sensitive_env = tuple(
+            sorted(sensitive_env, key=lambda item: (-len(item[1]), item[0], item[1]))
+        )
         self._pending = ""
         self._secret_names: dict[str, str] = {}
         values: list[str] = []
-        for name, value in sensitive_env:
+        for name, value in self._sensitive_env:
             if value not in self._secret_names:
                 self._secret_names[value] = name
                 values.append(value)
@@ -56,7 +58,10 @@ class StreamingRedactor:
 
         def replace(match: re.Match[str]) -> str:
             if match.lastgroup == "marker":
-                return match.group(0)
+                return _redact_marker_secrets(
+                    match.group(0),
+                    self._sensitive_env,
+                )
             value = match.group(0)
             return f"[REDACTED:{self._secret_names[value]}]"
 
@@ -158,17 +163,16 @@ def redact_text(
     selected = config.sensitive_env if sensitive_env is None else sensitive_env
     if not selected:
         return text
-    # Marker-shaped secrets must be replaced before stashing markers; otherwise
-    # the marker regex treats the secret as an existing marker and restores it.
-    for name, value in selected:
-        if _REDACTED_MARKER_RE.fullmatch(value):
-            text = text.replace(value, f"[REDACTED:{name}]")
 
     placeholders: dict[str, str] = {}
 
     def _stash_marker(match: re.Match[str]) -> str:
+        marker = match.group(0)
+        redacted = _redact_marker_secrets(marker, selected)
+        if redacted != marker:
+            return redacted
         token = secrets.token_hex(16)
-        placeholders[token] = match.group(0)
+        placeholders[token] = marker
         return f"{_PLACEHOLDER_PREFIX}{token}\x1e"
 
     text = _REDACTED_MARKER_RE.sub(_stash_marker, text)
@@ -177,3 +181,14 @@ def redact_text(
     for token, marker in placeholders.items():
         text = text.replace(f"{_PLACEHOLDER_PREFIX}{token}\x1e", marker)
     return text
+
+
+def _redact_marker_secrets(marker: str, sensitive_env: SensitiveEnv) -> str:
+    """Preserve harmless markers without allowing them to conceal a secret."""
+    for name, value in sorted(
+        sensitive_env,
+        key=lambda item: (-len(item[1]), item[0], item[1]),
+    ):
+        if value in marker:
+            return f"[REDACTED:{name}]"
+    return marker

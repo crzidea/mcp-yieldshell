@@ -94,4 +94,6 @@ async def kill_process(
 def _process_group_id(pid: int, process_group_id: int | None) -> int:
     if process_group_id is not None:
         return process_group_id
-    return os.getpgid(pid)
+    # POSIX processes created by spawn_process() start a new session and are
+    # therefore process-group leaders whose PGID equals their PID.
+    return pid

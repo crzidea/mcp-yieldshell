@@ -247,6 +247,15 @@ class TestRedactText:
         result = redact_text(config, f"keep {marker} intact")
         assert result == f"keep {marker} intact"
 
+    def test_secret_inside_existing_marker_is_still_redacted(self, monkeypatch):
+        monkeypatch.setenv("MY_SECRET", "secretvalue123")
+        config = Config()
+
+        result = redact_text(config, "leak [REDACTED:secretvalue123] here")
+
+        assert result == "leak [REDACTED:MY_SECRET] here"
+        assert "secretvalue123" not in result
+
     def test_placeholder_shaped_output_is_not_corrupted(self, monkeypatch):
         monkeypatch.setenv("MY_SECRET", "secretvalue123")
         config = Config()
@@ -278,7 +287,7 @@ class TestRedactText:
         assert redactor.feed("", final=True) == ""
 
     def test_streaming_redactor_preserves_marker_split_across_chunks(self):
-        redactor = StreamingRedactor((("TOKEN", "MY_SECRET"),))
+        redactor = StreamingRedactor((("TOKEN", "secret-value"),))
 
         output = (
             redactor.feed("[REDACTED:MY_")
@@ -287,6 +296,18 @@ class TestRedactText:
         )
 
         assert output == "[REDACTED:MY_SECRET]"
+
+    def test_streaming_redactor_redacts_secret_inside_split_marker(self):
+        redactor = StreamingRedactor((("TOKEN", "secret-value"),))
+
+        output = (
+            redactor.feed("[REDACTED:secret-")
+            + redactor.feed("value]")
+            + redactor.feed("", final=True)
+        )
+
+        assert output == "[REDACTED:TOKEN]"
+        assert "secret-value" not in output
 
     def test_streaming_redactor_redacts_marker_shaped_secret(self):
         redactor = StreamingRedactor((("EVIL", "[REDACTED:TOKEN]"),))

@@ -49,7 +49,7 @@ Whenever a command is executed, `ProcessManager` schedules several async tasks:
 ## Platform-Specific Process Group Management
 
 * **POSIX**: To ensure that child processes launched by commands are fully cleaned up (and not orphaned), commands are spawned with `start_new_session=True` (`src/mcp_yieldshell/process/spawn.py`).
-  * Process signals are sent via `os.killpg(os.getpgid(pid), signal)` to terminate the entire process group.
+  * The spawned PID is retained as the process-group ID (a new session leader's PGID equals its PID), and signals are sent with `os.killpg(pgid, signal)` to terminate the entire process group without a post-spawn lookup race.
 * **Windows**: Spawning utilizes standard `asyncio.create_subprocess_shell` parameters. Process group termination is not natively supported via POSIX signals, so process termination is best-effort and acts on the primary PID.
 
 ---

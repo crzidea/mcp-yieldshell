@@ -210,7 +210,7 @@ Block execution until the process exits or the wait timeout expires. This allows
 
 * **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
 * The effective wait duration is capped at 55 seconds to stay well under typical MCP request timeouts, even if a larger `timeout_ms` is requested.
-* `wait` treats the tracked shell process exiting as completion. For normal process completion, stdout/stderr are drained before the response is returned. If descendant processes keep inherited pipes open after the tracked process exits, the server closes its drain tasks so `wait` can complete without blocking indefinitely.
+* `wait` treats the managed process group disappearing as completion. If the tracked shell exits while descendants in its process group remain alive, the record continues to report `running`. For normal process-group completion, stdout/stderr are drained before the response is returned. Final drain waits are bounded so inherited pipes cannot block a request indefinitely.
 
 ### `stop`
 Gracefully terminate or force kill a running process.
@@ -238,9 +238,9 @@ All tools that accept a `process_id` parameter return a structured error dict wh
 Prune completed, stopped, timed-out, and failed process records to free memory.
 
 * **Parameters**:
-  * `completed_older_than_ms` (integer, default: `3600000`): Prunes completed processes older than this threshold (1 hour default).
-  * `stopped_older_than_ms` (integer, default: `3600000`): Prunes stopped, timed-out, or failed processes older than this threshold (1 hour default).
-* **Returns**: `removed` — the count of process records that were pruned.
+  * `completed_older_than_ms` (non-negative integer, default: `3600000`): Prunes completed processes older than this threshold (1 hour default).
+  * `stopped_older_than_ms` (non-negative integer, default: `3600000`): Prunes stopped, timed-out, or failed processes older than this threshold (1 hour default).
+* **Returns**: `removed` — the count of process records that were pruned. Negative thresholds are rejected without removing records and include an `error` message.
 
 ---
 

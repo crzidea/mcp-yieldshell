@@ -18,11 +18,12 @@ _manager: ProcessManager | None = None
 
 @asynccontextmanager
 async def _server_lifespan(_: FastMCP) -> AsyncIterator[None]:
+    manager = _manager
     try:
         yield
     finally:
-        if _manager is not None:
-            await _manager.shutdown()
+        if manager is not None:
+            await manager.shutdown()
 
 
 mcp = FastMCP("YieldShell MCP", lifespan=_server_lifespan)
@@ -185,7 +186,7 @@ async def cleanup(
     completed_older_than_ms: int = 3600000,
     stopped_older_than_ms: int = 3600000,
 ) -> dict:
-    """Remove completed/stopped processes older than thresholds."""
+    """Remove completed/stopped processes older than non-negative thresholds."""
     return await _get_manager().cleanup(
         completed_older_than_ms=completed_older_than_ms,
         stopped_older_than_ms=stopped_older_than_ms,
@@ -193,8 +194,10 @@ async def cleanup(
 
 
 def create_server(config: Config | None = None) -> FastMCP:
-    """Create and return the MCP server with the given config."""
+    """Initialize and return the module's singleton MCP server."""
     global _manager
+    if _manager is not None and not _manager._shutdown_complete:
+        raise RuntimeError("Server is already initialized")
     if config is None:
         config = Config()
     _manager = ProcessManager(config)

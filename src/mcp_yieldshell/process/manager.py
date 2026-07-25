@@ -144,12 +144,24 @@ class ProcessManager:
     def _is_terminal(mp: ManagedProcess) -> bool:
         return mp.info.status != ProcessStatus.RUNNING
 
+    @staticmethod
+    def _mark_ended(mp: ManagedProcess) -> None:
+        mp.info.ended_at = time.time()
+        mp.info.duration_ms = (
+            time.monotonic() - mp.info.start_monotonic
+        ) * 1000
+
     def _has_live_work(self, mp: ManagedProcess) -> bool:
         return not self._is_terminal(mp) or self._process_group_exists(mp)
 
-    def _reported_status(self, mp: ManagedProcess) -> str:
+    def _reported_status(
+        self,
+        mp: ManagedProcess,
+        has_live_work: bool | None = None,
+    ) -> str:
         """Status exposed to tools; descendants keep the record logically running."""
-        if self._has_live_work(mp) and mp.info.status == ProcessStatus.COMPLETED:
+        live = self._has_live_work(mp) if has_live_work is None else has_live_work
+        if live and mp.info.status == ProcessStatus.COMPLETED:
             return ProcessStatus.RUNNING.value
         return mp.info.status.value
 
@@ -475,17 +487,18 @@ class ProcessManager:
     def _get_process_group_id(self, proc: asyncio.subprocess.Process) -> int | None:
         if sys.platform == "win32" or proc.pid is None:
             return None
-        try:
-            return os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            return None
+        # spawn_process() uses start_new_session=True on POSIX, so the spawned
+        # PID is also the new process-group ID. Deriving it directly avoids a
+        # race where a fast shell exits before getpgid() runs while descendants
+        # in its process group are still alive.
+        return proc.pid
 
     def _process_group_id(self, mp: ManagedProcess) -> int:
         if mp.process_group_id is not None:
             return mp.process_group_id
         if mp.proc.pid is None:
             raise ProcessLookupError
-        return os.getpgid(mp.proc.pid)
+        return mp.proc.pid
 
     def _process_group_exists(self, mp: ManagedProcess) -> bool:
         if mp.process_group_exited:
@@ -549,8 +562,7 @@ class ProcessManager:
                 self._cancel_drains(mp)
             mp.info.exit_code = returncode
             mp.info.signal = self._exit_signal(proc)
-            mp.info.ended_at = time.time()
-            mp.info.duration_ms = (time.monotonic() - mp.info.start_monotonic) * 1000
+            self._mark_ended(mp)
             if mp.info.status == ProcessStatus.RUNNING:
                 if mp._timeout_triggered:
                     mp.info.status = ProcessStatus.TIMED_OUT
@@ -589,6 +601,7 @@ class ProcessManager:
     async def _watch_process_group_exit(self, mp: ManagedProcess) -> None:
         while self._process_group_exists(mp):
             await asyncio.sleep(0.1)
+        self._mark_ended(mp)
         if mp._timeout_triggered:
             return
         if mp.timeout_task is not None and not mp.timeout_task.done():
@@ -724,6 +737,7 @@ class ProcessManager:
 
         if not self._process_group_exists(mp):
             await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
+            self._mark_ended(mp)
 
         mp.completion_event.set()
 
@@ -942,22 +956,17 @@ class ProcessManager:
         # draining its pipes. Settle it before reporting a completed stop.
         await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
         await self._settle_completion(mp)
+        self._mark_ended(mp)
 
         # If the process exited due to our signal, mark it as STOPPED.
         # _track_completion may have set COMPLETED, but since we initiated
         # termination, the correct terminal status is STOPPED.
         if mp.info.status in (ProcessStatus.RUNNING, ProcessStatus.COMPLETED):
             mp.info.status = ProcessStatus.STOPPED
-            mp.info.ended_at = time.time()
-            mp.info.duration_ms = (
-                time.monotonic() - mp.info.start_monotonic
-            ) * 1000
-
-        stopped = mp.info.status == ProcessStatus.STOPPED
 
         return {
             "process_id": process_id,
-            "stopped": stopped,
+            "stopped": not self._has_live_work(mp),
             "signal": signal_name,
             "error": None,
         }
@@ -968,7 +977,8 @@ class ProcessManager:
         """List managed processes."""
         processes = []
         for mp in list(self._processes.values()):
-            reported_status = self._reported_status(mp)
+            has_live_work = self._has_live_work(mp)
+            reported_status = self._reported_status(mp, has_live_work)
             if not include_completed and reported_status != ProcessStatus.RUNNING.value:
                 continue
             processes.append(
@@ -986,10 +996,10 @@ class ProcessManager:
                     "exit_code": mp.info.exit_code,
                     "signal": mp.info.signal,
                     "started_at": mp.info.started_at,
-                    "ended_at": mp.info.ended_at,
+                    "ended_at": None if has_live_work else mp.info.ended_at,
                     "duration_ms": round(
                         mp.info.duration_ms
-                        if mp.info.ended_at is not None
+                        if not has_live_work and mp.info.ended_at is not None
                         else (time.monotonic() - mp.info.start_monotonic) * 1000,
                         1,
                     ),
@@ -1007,6 +1017,12 @@ class ProcessManager:
         stopped_older_than_ms: int = 3600000,
     ) -> dict[str, Any]:
         """Remove completed/stopped processes older than thresholds."""
+        if completed_older_than_ms < 0 or stopped_older_than_ms < 0:
+            return {
+                "removed": 0,
+                "error": "Cleanup age thresholds must be non-negative",
+            }
+
         now = time.time()
         removed = 0
         to_remove: list[str] = []
@@ -1092,6 +1108,9 @@ class ProcessManager:
                 *(self._settle_completion(mp) for mp in live),
                 return_exceptions=True,
             )
+            for mp in live:
+                if not self._process_group_exists(mp):
+                    self._mark_ended(mp)
 
             for mp in live:
                 if mp.timeout_task is not None and not mp.timeout_task.done():
@@ -1108,11 +1127,6 @@ class ProcessManager:
                     ProcessStatus.COMPLETED,
                 ):
                     mp.info.status = ProcessStatus.STOPPED
-                    if mp.info.ended_at is None:
-                        mp.info.ended_at = time.time()
-                        mp.info.duration_ms = (
-                            time.monotonic() - mp.info.start_monotonic
-                        ) * 1000
                 mp.completion_event.set()
 
             tasks = [
