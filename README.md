@@ -6,11 +6,11 @@ A drop-in shell MCP server that auto-yields long-running commands into managed b
 
 Most shell tools present a frustrating choice: either block the LLM agent until the command finishes, or force the agent to decide upfront that a command should run in the background.
 
-**YieldShell MCP** solves this by keeping normal foreground semantics for fast commands, then automatically promoting long-running commands into managed background processes after a brief delay (`yield_ms`, default: 5 seconds).
+**YieldShell MCP** solves this by keeping normal foreground semantics for fast commands, then automatically promoting long-running commands into managed background processes after a delay (`yield_ms`, default: 30 seconds).
 
 ```mermaid
 graph TD
-    A[exec_command] --> B["Wait for yield_ms (default: 5s)"]
+    A[exec_command] --> B["Wait for yield_ms (default: 30s)"]
     B --> C{Is process still running?}
     C -->|Yes| D["backgrounded<br>Returns process_id"]
     C -->|No| E["completed<br>Returns full output"]
@@ -144,8 +144,8 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * `shell` (string, optional): Accepted but has no effect in v1. Commands always run via the platform's default shell.
   * `stdin` (string, optional): Initial text input written to standard input immediately after spawning.
   * `name` (string, optional): A human-readable label/name to identify this process.
-  * `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Clamped by `YIELDSHELL_MAX_YIELD_MS`. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (5000ms).
-  * `timeout_ms` (integer, optional): Total execution runtime limit in milliseconds. Process is killed if it runs longer than this. Defaults to `YIELDSHELL_DEFAULT_TIMEOUT_MS` (0 = no limit).
+  * `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Both omitted and explicit values are clamped to the lesser of `YIELDSHELL_MAX_YIELD_MS` and the transport-safe 55,000ms ceiling. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (30,000ms).
+  * `timeout_ms` (integer, optional): Total execution runtime limit in milliseconds. Process is terminated if it runs longer than this. Defaults to `YIELDSHELL_DEFAULT_TIMEOUT_MS` (3,600,000ms). Pass `0` explicitly for unlimited execution.
   * `max_output_bytes` (integer, optional): Maximum output bytes to capture in stdout/stderr ring buffers. Subject to `YIELDSHELL_MAX_OUTPUT_BYTES` cap.
 
 * **Side-Effects Guide**:
@@ -198,7 +198,7 @@ Block execution until the process exits or the wait timeout expires. This allows
 
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
-  * `timeout_ms` (integer, default: `30000`): Maximum time to wait.
+  * `timeout_ms` (integer, default: `55000`): Maximum time to wait.
   * `max_output_bytes` (integer, optional): Maximum output bytes to return in the response.
 
 * **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
@@ -211,10 +211,12 @@ Gracefully terminate or force kill a running process.
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
   * `signal` (string, default: `"SIGTERM"`): OS signal to send (e.g. `SIGTERM`, `SIGKILL`, `SIGINT`). Ignored on Windows.
-  * `force_after_ms` (integer, default: `3000`): Grace period before escalating to force kill (`SIGKILL`).
+  * `force_after_ms` (integer, default: `10000`): Grace period before escalating to force kill (`SIGKILL`). Shorter explicit values remain supported.
 
 ### `ps`
 List all managed processes.
+
+Terminal records are retained temporarily for inspection. Before each otherwise valid `exec` spawn, records older than `YIELDSHELL_PROCESS_RETENTION_MS` are removed and the remaining terminal set is reduced to `YIELDSHELL_MAX_RETAINED_PROCESSES`, oldest first. Running records are never automatically removed. If the shell exits but its process group still has live descendants, status remains `running` until descendants stop. Reaped IDs disappear from `ps` and become unknown to `read`, `wait`, `write`, and `stop`.
 
 * **Parameters**:
   * `include_completed` (boolean, default: `true`): If `false`, finished/stopped processes are excluded from the output.
@@ -226,7 +228,7 @@ List all managed processes.
 All tools that accept a `process_id` parameter return a structured error dict when the ID is unknown, e.g. `{"process_id": "proc_abc123", "error": "Unknown process_id: proc_abc123"}`. Tools that accept `process_id` always include it in the response alongside the error.
 
 ### `cleanup`
-Prune completed or stopped process records to free memory.
+Prune completed, stopped, timed-out, and failed process records to free memory.
 
 * **Parameters**:
   * `completed_older_than_ms` (integer, default: `3600000`): Prunes completed processes older than this threshold (1 hour default).
@@ -258,13 +260,15 @@ Configure the server by setting these environment variables prior to launch:
 | `YIELDSHELL_DEFAULT_CWD` | Current directory | The fallback working directory for commands. |
 | `YIELDSHELL_ALLOWED_CWDS` | *(none)* | A list of allowed directory paths separated by `os.pathsep` (e.g., `:` on UNIX, `;` on Windows). If set, all command execution paths must resolve inside one of these roots. |
 | `YIELDSHELL_MAX_OUTPUT_BYTES` | `20000` | The default and maximum capacity of the ring buffers for stdout/stderr. |
-| `YIELDSHELL_MAX_PROCESSES` | `50` | Maximum concurrent running processes. Completed, stopped, timed-out, and failed processes do not count against this limit. Spawning a new command when this limit is reached will return `failed_to_start`. |
-| `YIELDSHELL_DEFAULT_YIELD_MS` | `5000` | Fallback delay before auto-yielding. |
-| `YIELDSHELL_MAX_YIELD_MS` | `300000` | The maximum allowed value for the `yield_ms` parameter. |
-| `YIELDSHELL_DEFAULT_TIMEOUT_MS` | `0` | Default hard runtime limit (0 means no limit). |
+| `YIELDSHELL_MAX_PROCESSES` | `50` | Maximum concurrent live managed process groups, including descendants that outlive a completed shell. Spawning a new command when this limit is reached returns `failed_to_start`. |
+| `YIELDSHELL_DEFAULT_YIELD_MS` | `30000` | Fallback delay before auto-yielding. Effective yields are also capped at 55,000ms. |
+| `YIELDSHELL_MAX_YIELD_MS` | `300000` | Configured maximum for `yield_ms`; the effective maximum is the lesser of this value and 55,000ms. |
+| `YIELDSHELL_DEFAULT_TIMEOUT_MS` | `3600000` | Default hard runtime limit (1 hour). An explicit tool argument of `0` means no limit. |
+| `YIELDSHELL_PROCESS_RETENTION_MS` | `3600000` | Age after which terminal process records are reaped before a valid spawn. Zero requests immediate age-based reaping. Negative or nonnumeric values use the default. |
+| `YIELDSHELL_MAX_RETAINED_PROCESSES` | `100` | Maximum retained terminal records after age reaping; oldest records are removed first. Zero retains no prior terminal records. Negative or nonnumeric values use the default. Running records are excluded. |
 | `YIELDSHELL_DENY_COMMAND_REGEX` | *(none)* | A regular expression pattern. Commands matching this pattern are blocked before starting. |
 | `YIELDSHELL_ALLOW_COMMAND_REGEX` | *(none)* | A regular expression pattern. If set, only commands matching this pattern are permitted. |
-| `YIELDSHELL_REDACT_ENV_REGEX` | `TOKEN\|KEY\|SECRET\|PASSWORD` | Regex to identify sensitive environment variable keys. Their values are redacted in stdout/stderr outputs. |
+| `YIELDSHELL_REDACT_ENV_REGEX` | `TOKEN\|KEY\|SECRET\|PASSWORD` | Regex to identify sensitive environment variable names. Matching non-empty values of at least 8 characters are snapshotted at startup and redacted in stdout/stderr outputs. |
 | `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` | `KILLS_AGENT_PROCESS,MODIFIES_OS_SETTINGS,MODIFIES_OS_USER_SETTINGS,MODIFIES_PROTECTED_FILES,RUNS_INLINE_CODE` | Comma-separated list of `side_effects` enum names the server should reject. Names are case-sensitive. Surrounding whitespace is trimmed and empty entries are ignored. Invalid names cause startup to fail. Set to `,` (or any value that resolves to no entries) to clear the default blocklist. |
 
 ---
@@ -276,16 +280,22 @@ Configure the server by setting these environment variables prior to launch:
 * **Inline Code Execution**: The `RUNS_INLINE_CODE` default discourages agents from executing code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `ruby -e`, `perl -e`, shell heredocs piped into interpreters, or `curl ... | sh`). The safer pattern is to write the content to a reviewable workspace file and execute it in a small, inspectable step with explicit matching `side_effects`. Operators can override the default to permit the category.
 * **OS User Settings Damage**: `MODIFIES_OS_USER_SETTINGS` covers commands that change user-level configuration such as shell rc files, XDG config directories, dotfiles, or per-user application preferences. This is distinct from `MODIFIES_OS_SETTINGS`, which covers broader OS-level configuration such as systemd units, kernel parameters, `/etc` files, and package manager system config. Blocked by default; operators can override.
 * **Agent Process Termination**: `KILLS_AGENT_PROCESS` covers commands that may terminate the MCP client, agent, or related process running the agent workflow (e.g., `kill` commands targeting the agent PID, or commands that cause the agent to exit). This is distinct from `STOPS_OR_RESTARTS_SERVICES`, which covers OS-level services. Blocked by default; operators can override.
-* **Path Validation**: CWD path verification uses absolute paths (`resolve()`), preventing path-traversal attacks (`../`) outside the allowed roots.
+* **Path Validation**: CWD path verification resolves traversal and symlinks, then requires the target to be an allowed root itself or a true descendant. Lexically similar siblings and symlink escapes are rejected before spawn.
 * **Additive Environments**: The `env` argument overlays existing env parameters. It merges with the parent process environment instead of completely replacing it, protecting critical OS vars.
-* **Best-effort Redaction**: While values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are scrubbed from outputs, this is a best-effort system. Sensitive data printed through complex formats or argument lists might not be caught.
+* **Best-effort Redaction**: At startup, values of variables matching `YIELDSHELL_REDACT_ENV_REGEX` are snapshotted, ordered longest first, and values shorter than 8 characters are excluded to avoid corrupting ordinary output. Restart the server to refresh the snapshot after parent-environment changes. Secrets not selected by the regex or printed through transformed formats might not be caught.
+
+## Lifecycle and Compatibility
+
+YieldShell gives graceful termination 10 seconds before force-killing, waits up to 5 seconds for a POSIX process group to disappear, and allows up to 3 seconds for final stream draining. On stdio server shutdown, all live managed processes are terminated concurrently using the same bounded graceful/forced policy. Already-terminal records are not changed by shutdown.
+
+The tool names, response fields, status values, side-effect validation order, running-process limit, ring-buffer behavior, and manual `cleanup` contract are unchanged. Behavioral changes are the 30-second auto-yield default, one-hour runtime default, 55-second effective request-wait ceiling, 10-second stop grace, automatic terminal-record retention, startup redaction snapshot, and shutdown containment. Use explicit shorter timing values where lower latency is preferred, and pass `timeout_ms=0` to retain unlimited runtime behavior.
 
 ---
 
 ## Platform Support
 
-* **POSIX (Linux & macOS)**: Fully supported. Spawns processes in distinct sessions (`start_new_session=True`), allowing signals (`SIGTERM`/`SIGKILL`) to target the entire process group. This ensures child processes started by commands (such as npm dev tasks) are completely cleaned up.
-* **Windows**: Supported with best-effort process group controls. Windows lacks native POSIX signals, meaning `stop` and `timeout_ms` act on the primary process, and child subprocesses might persist if they do not exit cleanly.
+* **POSIX (Linux & macOS)**: Fully supported. Spawns processes in distinct sessions (`start_new_session=True`), allowing `stop`, runtime timeout, and server shutdown signals (`SIGTERM`/`SIGKILL`) to target the entire process group. This cleans up child processes started by managed commands.
+* **Windows**: Supported with best-effort process controls. Windows lacks native POSIX process-group signals, so `stop`, `timeout_ms`, and server shutdown act on the primary process; child subprocesses might persist if they do not exit cleanly.
 
 ---
 

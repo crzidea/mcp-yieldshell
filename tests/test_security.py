@@ -63,6 +63,67 @@ class TestResolveCwd:
         assert error is not None
         assert "not under allowed roots" in error
 
+    def test_descendant_and_multiple_roots_are_allowed(self, monkeypatch, tmp_path):
+        first = tmp_path / "first"
+        child = first / "child"
+        second = tmp_path / "second"
+        child.mkdir(parents=True)
+        second.mkdir()
+        monkeypatch.setenv(
+            "YIELDSHELL_ALLOWED_CWDS", os.pathsep.join((str(first), str(second)))
+        )
+        config = Config()
+
+        assert resolve_cwd(config, str(child))[1] is None
+        assert resolve_cwd(config, str(second))[1] is None
+
+    def test_similarly_prefixed_sibling_and_traversal_are_rejected(
+        self, monkeypatch, tmp_path
+    ):
+        allowed = tmp_path / "projects"
+        sibling = tmp_path / "projects-private"
+        allowed.mkdir()
+        sibling.mkdir()
+        monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", str(allowed))
+        config = Config()
+
+        assert resolve_cwd(config, str(sibling))[1] is not None
+        assert resolve_cwd(config, str(allowed / ".." / sibling.name))[1] is not None
+
+    def test_symlink_descendant_allowed_and_escape_rejected(self, monkeypatch, tmp_path):
+        allowed = tmp_path / "allowed"
+        child = allowed / "child"
+        outside = tmp_path / "outside"
+        child.mkdir(parents=True)
+        outside.mkdir()
+        inside_link = allowed / "inside-link"
+        outside_link = allowed / "outside-link"
+        inside_link.symlink_to(child, target_is_directory=True)
+        outside_link.symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", str(allowed))
+        config = Config()
+
+        path, error = resolve_cwd(config, str(inside_link))
+        assert error is None
+        assert path == str(child.resolve())
+        assert resolve_cwd(config, str(outside_link))[1] is not None
+
+    def test_invalid_allowed_root_returns_structured_error(self, monkeypatch):
+        original_resolve = Path.resolve
+
+        def resolve(self, *args, **kwargs):
+            if str(self) == "/bad/root":
+                raise OSError("simulated resolution failure")
+            return original_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", "/bad/root")
+        config = Config()
+        path, error = resolve_cwd(config, None)
+        assert error is not None
+        assert "Invalid allowed cwd root '/bad/root'" in error
+        assert path == str(Path(config.default_cwd).resolve())
+
 
 class TestBuildEnv:
     def test_overlay_merges(self):
@@ -95,6 +156,71 @@ class TestRedactText:
         config = Config()
         result = redact_text(config, "output with normalvalue inside")
         assert result == "output with normalvalue inside"
+
+    def test_only_values_of_at_least_eight_characters_are_redacted(self, monkeypatch):
+        monkeypatch.setenv("SHORT_SECRET", "1234567")
+        monkeypatch.setenv("LONG_SECRET", "12345678")
+        config = Config()
+        result = redact_text(config, "1234567 12345678")
+        assert result == "1234567 [REDACTED:LONG_SECRET]"
+
+    def test_empty_matching_value_does_not_change_output(self, monkeypatch):
+        monkeypatch.setenv("EMPTY_SECRET", "")
+        config = Config()
+        assert redact_text(config, "ordinary output") == "ordinary output"
+
+    def test_custom_regex_selects_names(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_REDACT_ENV_REGEX", "^PRIVATE_")
+        monkeypatch.setenv("PRIVATE_VALUE", "private-value")
+        monkeypatch.setenv("PUBLIC_SECRET", "public-value")
+        config = Config()
+        result = redact_text(config, "private-value public-value")
+        assert result == "[REDACTED:PRIVATE_VALUE] public-value"
+
+    def test_overlapping_values_redact_longest_first(self, monkeypatch):
+        monkeypatch.setenv("SHORT_SECRET", "abcdefgh")
+        monkeypatch.setenv("LONG_SECRET", "xxabcdefghyy")
+        config = Config()
+        assert redact_text(config, "xxabcdefghyy") == "[REDACTED:LONG_SECRET]"
+
+    def test_parent_environment_changes_do_not_change_snapshot(self, monkeypatch):
+        monkeypatch.setenv("MY_SECRET", "original-value")
+        config = Config()
+        monkeypatch.setenv("MY_SECRET", "changed-value")
+        monkeypatch.setenv("NEW_SECRET", "another-value")
+
+        result = redact_text(config, "original-value changed-value another-value")
+        assert result == "[REDACTED:MY_SECRET] changed-value another-value"
+
+    def test_marker_shaped_secret_is_redacted_before_marker_stash(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_REDACT_ENV_REGEX", "EVIL")
+        monkeypatch.setenv("EVIL", "[REDACTED:TOKEN]")
+        config = Config()
+        result = redact_text(config, "x [REDACTED:TOKEN] y")
+        assert "[REDACTED:EVIL]" in result
+        assert "[REDACTED:TOKEN]" not in result
+    def test_unrelated_substrings_matching_secret_fragments_are_not_redacted(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MY_SECRET", "abcdefghijklmnop")
+        config = Config()
+        leaked = "ijklmnop"
+        result = redact_text(config, f"prefix {leaked}")
+        assert leaked in result
+        assert "[REDACTED:MY_SECRET]" not in result
+    def test_existing_redaction_markers_are_not_rewritten(self, monkeypatch):
+        monkeypatch.setenv("MY_SECRET", "secretvalue123")
+        config = Config()
+        marker = "[REDACTED:MY_SECRET]"
+        result = redact_text(config, f"keep {marker} intact")
+        assert result == f"keep {marker} intact"
+
+    def test_placeholder_shaped_output_is_not_corrupted(self, monkeypatch):
+        monkeypatch.setenv("MY_SECRET", "secretvalue123")
+        config = Config()
+        decoy = "\x1eredact-placeholder-0\x1e"
+        result = redact_text(config, f"prefix {decoy} suffix")
+        assert result == f"prefix {decoy} suffix"
 
     def test_default_regex_matches_token(self):
         config = Config()

@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config
+from .policy import GRACEFUL_STOP_MS, MAX_EFFECTIVE_WAIT_MS
 from .process.manager import ProcessManager
 from .types import SideEffect
 
-mcp = FastMCP("YieldShell MCP")
-
 # Module-level manager, initialized once at startup
 _manager: ProcessManager | None = None
+
+
+@asynccontextmanager
+async def _server_lifespan(_: FastMCP) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        if _manager is not None:
+            await _manager.shutdown()
+
+
+mcp = FastMCP("YieldShell MCP", lifespan=_server_lifespan)
 
 
 def _get_manager() -> ProcessManager:
@@ -120,7 +134,7 @@ async def write(process_id: str, input: str, newline: bool = False) -> dict:
 @mcp.tool()
 async def wait(
     process_id: str,
-    timeout_ms: int = 30000,
+    timeout_ms: int = MAX_EFFECTIVE_WAIT_MS,
     max_output_bytes: int | None = None,
 ) -> dict:
     """Wait for a process to exit without killing it."""
@@ -135,7 +149,7 @@ async def wait(
 async def stop(
     process_id: str,
     signal: str = "SIGTERM",
-    force_after_ms: int = 3000,
+    force_after_ms: int = GRACEFUL_STOP_MS,
 ) -> dict:
     """Stop a running process with graceful termination then force kill."""
     return await _get_manager().stop_process(

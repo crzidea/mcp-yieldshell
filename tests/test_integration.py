@@ -8,8 +8,9 @@ import sys
 import pytest
 
 from mcp_yieldshell.config import Config
+from mcp_yieldshell.policy import MAX_EFFECTIVE_WAIT_MS
 from mcp_yieldshell.process.manager import ProcessManager
-from mcp_yieldshell.types import SideEffect
+from mcp_yieldshell.types import ProcessStatus, SideEffect
 
 NONE = [SideEffect.NONE]
 
@@ -69,6 +70,12 @@ class TestQuickCommand:
 
 class TestLongCommand:
     @pytest.mark.asyncio
+    async def test_six_second_command_completes_inline_with_default_yield(self, manager):
+        result = await manager.exec_command("sleep 6 && echo inline", side_effects=NONE)
+        assert result["status"] == "completed"
+        assert "inline" in result["stdout"]
+
+    @pytest.mark.asyncio
     async def test_backgrounded_status(self, short_yield_manager):
         result = await short_yield_manager.exec_command(
             "sleep 10", yield_ms=100, side_effects=NONE
@@ -124,7 +131,8 @@ class TestLongCommand:
         try:
             wait_result = await manager.wait_process(pid, timeout_ms=5000)
 
-            assert wait_result["status"] == "completed"
+            assert mp.info.status == ProcessStatus.COMPLETED
+            assert wait_result["status"] == "running"
             assert wait_result["exit_code"] == 0
         finally:
             if pgid is not None:
@@ -134,9 +142,13 @@ class TestLongCommand:
                     pass
 
     @pytest.mark.asyncio
-    async def test_timeout_force_kills_process_group_after_sigterm_is_ignored(self, manager):
+    async def test_timeout_force_kills_process_group_after_sigterm_is_ignored(
+        self, manager, monkeypatch
+    ):
         if sys.platform == "win32":
             pytest.skip("POSIX process groups only")
+        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 500)
 
         result = await manager.exec_command(
             "python -c \"import signal,time; "
@@ -324,6 +336,19 @@ class TestTimeout:
         elif result["status"] == "timed_out":
             assert "process_id" in result
 
+    @pytest.mark.asyncio
+    async def test_default_timeout_task_and_explicit_unlimited_override(self, manager):
+        default = await manager.exec_command("sleep 30", yield_ms=0, side_effects=NONE)
+        unlimited = await manager.exec_command(
+            "sleep 30", yield_ms=0, timeout_ms=0, side_effects=NONE
+        )
+        default_mp = manager.get_process(default["process_id"])
+        unlimited_mp = manager.get_process(unlimited["process_id"])
+        assert default_mp is not None and default_mp.timeout_task is not None
+        assert unlimited_mp is not None and unlimited_mp.timeout_task is None
+        await manager.stop_process(default["process_id"], force_after_ms=100)
+        await manager.stop_process(unlimited["process_id"], force_after_ms=100)
+
 
 class TestBoundedOutput:
     @pytest.mark.asyncio
@@ -343,6 +368,34 @@ class TestBoundedOutput:
         assert result["status"] == "completed"
         assert result["truncated"] is False
 
+    @pytest.mark.asyncio
+    async def test_large_final_output_burst_preserves_tail(self, manager):
+        marker = "FINAL-TAIL-MARKER"
+        result = await manager.exec_command(
+            f"{sys.executable} -c \"import sys; "
+            f"sys.stdout.write('A' * 15000 + '{marker}'); sys.stdout.flush()\"",
+            side_effects=NONE,
+        )
+        assert result["status"] == "completed"
+        assert result["truncated"] is False
+        assert result["stdout"].endswith(marker)
+
+    @pytest.mark.asyncio
+    async def test_large_final_burst_after_primary_exit_via_wait(self, manager):
+        marker = "FINAL-WAIT-TAIL-MARKER"
+        started = await manager.exec_command(
+            f"{sys.executable} -c \"import sys,time; "
+            f"time.sleep(0.05); sys.stdout.write('B' * 15000 + '{marker}'); "
+            "sys.stdout.flush()\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        wait_result = await manager.wait_process(
+            started["process_id"], timeout_ms=10_000
+        )
+        assert wait_result["status"] == "completed"
+        assert wait_result["truncated"] is False
+        assert wait_result["stdout"].endswith(marker)
 
 class TestSecurityConfig:
     @pytest.mark.asyncio
@@ -393,6 +446,27 @@ class TestRedaction:
         assert result["status"] == "completed"
         assert "supersecret123" not in result["stdout"]
         assert "[REDACTED:" in result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_background_read_and_wait_use_config_snapshot(self, monkeypatch):
+        monkeypatch.setenv("MY_SECRET_KEY", "snapshot-secret")
+        config = Config()
+        manager = ProcessManager(config)
+        monkeypatch.setenv("MY_SECRET_KEY", "changed-secret")
+        command = (
+            f"{sys.executable} -c \"import os,time; "
+            "print(os.environ['MY_SECRET_KEY'], flush=True); time.sleep(0.2)\""
+        )
+        result = await manager.exec_command(command, yield_ms=0, side_effects=NONE)
+        process_id = result["process_id"]
+        await asyncio.sleep(0.1)
+
+        read_result = await manager.read_output(process_id)
+        wait_result = await manager.wait_process(process_id, timeout_ms=1000)
+
+        assert "changed-secret" in read_result["stdout"]
+        assert "changed-secret" in wait_result["stdout"]
+        assert "snapshot-secret" not in read_result["stdout"]
 
 
 
@@ -577,6 +651,24 @@ class TestWaitCapBehavior:
         assert wait_result["status"] == "completed"
         assert "hello" in wait_result.get("stdout", "")
 
+    def test_yield_clamp_boundaries(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_DEFAULT_YIELD_MS", "120000")
+        monkeypatch.setenv("YIELDSHELL_MAX_YIELD_MS", "120000")
+        manager = ProcessManager(Config())
+        assert manager._clamp_yield_ms(None) == MAX_EFFECTIVE_WAIT_MS
+        assert manager._clamp_yield_ms(120000) == MAX_EFFECTIVE_WAIT_MS
+        assert manager._clamp_yield_ms(-1) == 0
+
+        monkeypatch.setenv("YIELDSHELL_MAX_YIELD_MS", "1234")
+        manager = ProcessManager(Config())
+        assert manager._clamp_yield_ms(None) == 1234
+        assert manager._clamp_yield_ms(5000) == 1234
+
+    def test_runtime_default_and_explicit_zero_selection(self, manager):
+        assert manager._clamp_timeout_ms(None) == 3600000
+        assert manager._clamp_timeout_ms(0) == 0
+        assert manager._clamp_timeout_ms(250) == 250
+
 
 class TestTimedOutStatus:
     @pytest.mark.asyncio
@@ -690,4 +782,3 @@ class TestDefectFixes:
         assert mp is not None
         assert mp.timeout_task is not None
         assert mp.timeout_task.cancelled() or mp.timeout_task.done()
-

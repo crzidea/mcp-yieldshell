@@ -5,6 +5,12 @@ from __future__ import annotations
 import os
 import re
 
+from .policy import (
+    DEFAULT_MAX_RETAINED_PROCESSES,
+    DEFAULT_PROCESS_RETENTION_MS,
+    DEFAULT_TIMEOUT_MS,
+    DEFAULT_YIELD_MS,
+)
 from .types import DEFAULT_BLOCKED_SIDE_EFFECTS, SideEffect
 
 
@@ -21,13 +27,21 @@ class Config:
             os.environ.get("YIELDSHELL_MAX_PROCESSES", ""), 50
         )
         self.default_yield_ms: int = _parse_int(
-            os.environ.get("YIELDSHELL_DEFAULT_YIELD_MS", ""), 5000
+            os.environ.get("YIELDSHELL_DEFAULT_YIELD_MS", ""), DEFAULT_YIELD_MS
         )
         self.max_yield_ms: int = _parse_int(
             os.environ.get("YIELDSHELL_MAX_YIELD_MS", ""), 300000
         )
         self.default_timeout_ms: int = _parse_int(
-            os.environ.get("YIELDSHELL_DEFAULT_TIMEOUT_MS", ""), 0
+            os.environ.get("YIELDSHELL_DEFAULT_TIMEOUT_MS", ""), DEFAULT_TIMEOUT_MS
+        )
+        self.process_retention_ms: int = _parse_nonnegative_int(
+            os.environ.get("YIELDSHELL_PROCESS_RETENTION_MS", ""),
+            DEFAULT_PROCESS_RETENTION_MS,
+        )
+        self.max_retained_processes: int = _parse_nonnegative_int(
+            os.environ.get("YIELDSHELL_MAX_RETAINED_PROCESSES", ""),
+            DEFAULT_MAX_RETAINED_PROCESSES,
         )
         self.deny_command_regex: re.Pattern[str] | None = _parse_regex(
             os.environ.get("YIELDSHELL_DENY_COMMAND_REGEX", "")
@@ -38,6 +52,16 @@ class Config:
         self.redact_env_regex: re.Pattern[str] = _parse_regex_required(
             os.environ.get("YIELDSHELL_REDACT_ENV_REGEX", ""),
             r"TOKEN|KEY|SECRET|PASSWORD",
+        )
+        self.sensitive_env: tuple[tuple[str, str], ...] = tuple(
+            sorted(
+                (
+                    (name, value)
+                    for name, value in os.environ.items()
+                    if self.redact_env_regex.search(name) and len(value) >= 8
+                ),
+                key=lambda item: (-len(item[1]), item[0], item[1]),
+            )
         )
         self.blocked_side_effects: frozenset[SideEffect] = _parse_blocked_side_effects(
             os.environ.get("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "")
@@ -57,6 +81,11 @@ def _parse_int(value: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _parse_nonnegative_int(value: str, default: int) -> int:
+    parsed = _parse_int(value, default)
+    return parsed if parsed >= 0 else default
 
 
 def _parse_regex(value: str) -> re.Pattern[str] | None:

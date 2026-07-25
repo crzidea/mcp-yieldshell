@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
+import secrets
 from pathlib import Path
 
 from .config import Config
+
+_REDACTED_MARKER_RE = re.compile(r"\[REDACTED:[^\]]+\]")
+_PLACEHOLDER_PREFIX = "\x1eredact-placeholder-"
 
 
 def validate_command(config: Config, command: str) -> str | None:
@@ -21,11 +26,21 @@ def resolve_cwd(config: Config, requested_cwd: str | None) -> tuple[str, str | N
     """Resolve and validate cwd. Returns (resolved_path, error_or_None)."""
     target = requested_cwd or config.default_cwd
     try:
-        resolved = str(Path(target).resolve())
+        resolved_path = Path(target).resolve()
     except Exception as exc:
         return target, f"Invalid cwd: {exc}"
+    resolved = str(resolved_path)
     if config.allowed_cwd_roots:
-        if not any(resolved.startswith(str(Path(r).resolve())) for r in config.allowed_cwd_roots):
+        allowed_roots: list[Path] = []
+        for value in config.allowed_cwd_roots:
+            try:
+                allowed_roots.append(Path(value).resolve())
+            except Exception as exc:
+                return resolved, f"Invalid allowed cwd root {value!r}: {exc}"
+        if not any(
+            resolved_path == root or resolved_path.is_relative_to(root)
+            for root in allowed_roots
+        ):
             return resolved, f"Cwd not under allowed roots: {resolved}"
     return resolved, None
 
@@ -40,8 +55,22 @@ def build_env(config: Config, overlay: dict[str, str] | None) -> dict[str, str]:
 
 def redact_text(config: Config, text: str) -> str:
     """Best-effort redaction of sensitive environment values from text."""
-    env = os.environ
-    for name, value in env.items():
-        if config.redact_env_regex.search(name) and value:
+    # Marker-shaped secrets must be replaced before stashing markers; otherwise
+    # the marker regex treats the secret as an existing marker and restores it.
+    for name, value in config.sensitive_env:
+        if _REDACTED_MARKER_RE.fullmatch(value):
             text = text.replace(value, f"[REDACTED:{name}]")
+
+    placeholders: dict[str, str] = {}
+
+    def _stash_marker(match: re.Match[str]) -> str:
+        token = secrets.token_hex(16)
+        placeholders[token] = match.group(0)
+        return f"{_PLACEHOLDER_PREFIX}{token}\x1e"
+
+    text = _REDACTED_MARKER_RE.sub(_stash_marker, text)
+    for name, value in config.sensitive_env:
+        text = text.replace(value, f"[REDACTED:{name}]")
+    for token, marker in placeholders.items():
+        text = text.replace(f"{_PLACEHOLDER_PREFIX}{token}\x1e", marker)
     return text

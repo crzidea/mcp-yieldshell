@@ -41,6 +41,7 @@ Whenever a command is executed, `ProcessManager` schedules several async tasks:
 1. **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks and write directly to the corresponding `RingBuffer`. They must complete draining before a process is marked as fully completed.
 2. **Completion Tracker** (`completion-<id>`): Waits for the process to exit using `await proc.wait()`, waits for outstanding drain tasks to finish, and sets the final exit code, signal info, and state transitions.
 3. **Timeout Handler** (`timeout-<id>`): Scheduled if `timeout_ms` is set. After sleeping, if the process is still running, it escalates from `SIGTERM` (graceful) to `SIGKILL` (forced) to clean up hung tasks. To prevent resource leaks, this task is cancelled immediately once the process exits naturally or is stopped.
+4. **Server Shutdown Path**: `ProcessManager.shutdown()` is invoked from the FastMCP lifespan finally block (`src/mcp_yieldshell/server.py`) and is responsible for idempotently terminating all live process groups with a bounded graceful phase, force-killing survivors, draining final output, and settling completion tasks.
 
 ---
 
@@ -56,11 +57,12 @@ Whenever a command is executed, `ProcessManager` schedules several async tasks:
 
 This is a Python 3.11 package using a `src/` layout:
 * `src/mcp_yieldshell/server.py` and `__main__.py` contain the MCP server wiring and CLI entry points.
+* `src/mcp_yieldshell/policy.py` centralizes timing policy defaults and caps (`MAX_EFFECTIVE_WAIT_MS`, `GRACEFUL_STOP_MS`, etc.).
 * `src/mcp_yieldshell/config.py` handles environment-based configuration parsing, including the `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` blocklist.
 * `src/mcp_yieldshell/types.py` defines the `SideEffect` enum, default blocked set, and process status types.
 * `src/mcp_yieldshell/security.py` controls allowed path roots, command regex rules, and environment overlays/redactions.
 * `src/mcp_yieldshell/process/` contains execution, buffer, and lifecycle management.
-* `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`, `test_side_effects.py`).
+* `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`, `test_side_effects.py`, `test_lifecycle_hardening.py`).
 * `scripts/release.py` automates version bumps, lock refresh, staging, commit, tag, and push.
 
 ---

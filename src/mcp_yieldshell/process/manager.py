@@ -10,13 +10,19 @@ import uuid
 from typing import Any, Iterable
 
 from ..config import Config
+from ..policy import (
+    FINAL_DRAIN_MS,
+    GRACEFUL_STOP_MS,
+    MAX_EFFECTIVE_WAIT_MS,
+    PENDING_SPAWN_SHUTDOWN_MS,
+    PROCESS_GROUP_EXIT_MS,
+)
 from ..security import redact_text
 from ..types import ProcessInfo, ProcessStatus, SideEffect
 from .ring_buffer import RingBuffer
 from .spawn import kill_process, spawn_process, terminate_process
 
-MAX_EFFECTIVE_WAIT_MS = 55000
-
+_SHUTDOWN_REJECT_ERROR = "Server is shutting down"
 
 _BLOCKED_CATEGORY_GUIDANCE: dict[SideEffect, str] = {
     SideEffect.MODIFIES_PROTECTED_FILES: (
@@ -83,7 +89,9 @@ class ManagedProcess:
         "completion_event",
         "completion_task",
         "timeout_task",
+        "group_watch_task",
         "process_group_id",
+        "process_group_exited",
         "_seq_source",
         "_timeout_triggered",
     )
@@ -98,6 +106,7 @@ class ManagedProcess:
         self.info = info
         self.proc = proc
         self.process_group_id = process_group_id
+        self.process_group_exited = False
         self._seq_source: list[int] = [1]
         self.stdout_buf = RingBuffer(max_output_bytes, seq_source=self._seq_source)
         self.stderr_buf = RingBuffer(max_output_bytes, seq_source=self._seq_source)
@@ -106,6 +115,7 @@ class ManagedProcess:
         self.completion_event: asyncio.Event = asyncio.Event()
         self.completion_task: asyncio.Task[None] | None = None
         self.timeout_task: asyncio.Task[None] | None = None
+        self.group_watch_task: asyncio.Task[None] | None = None
         self._timeout_triggered = False
 
 
@@ -115,6 +125,34 @@ class ProcessManager:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._processes: dict[str, ManagedProcess] = {}
+        self._pending_spawns = 0
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
+
+    async def _wait_for_no_pending_spawns(self) -> None:
+        deadline = time.monotonic() + PENDING_SPAWN_SHUTDOWN_MS / 1000.0
+        while time.monotonic() < deadline:
+            async with self._shutdown_lock:
+                if self._pending_spawns == 0:
+                    return
+            await asyncio.sleep(0.01)
+
+    async def _reject_spawned_process(
+        self,
+        proc: asyncio.subprocess.Process,
+        process_group_id: int | None,
+        drain_tasks: list[asyncio.Task[None]],
+    ) -> None:
+        for task in drain_tasks:
+            if not task.done():
+                task.cancel()
+        if drain_tasks:
+            await asyncio.gather(*drain_tasks, return_exceptions=True)
+        await kill_process(proc, process_group_id)
+
+    def _shutdown_reject_response(self) -> dict[str, Any]:
+        return {"status": "failed_to_start", "error": _SHUTDOWN_REJECT_ERROR}
 
     def _new_id(self) -> str:
         return f"proc_{uuid.uuid4().hex[:12]}"
@@ -126,14 +164,66 @@ class ProcessManager:
         return min(requested, cap)
 
     def _clamp_yield_ms(self, requested: int | None) -> int:
-        if requested is None:
-            return self._config.default_yield_ms
-        return max(0, min(requested, self._config.max_yield_ms))
+        selected = self._config.default_yield_ms if requested is None else requested
+        return max(0, min(selected, self._config.max_yield_ms, MAX_EFFECTIVE_WAIT_MS))
 
     def _clamp_timeout_ms(self, requested: int | None) -> int:
         if requested is None:
             return self._config.default_timeout_ms
         return max(0, requested)
+
+    @staticmethod
+    def _is_terminal(mp: ManagedProcess) -> bool:
+        return mp.info.status != ProcessStatus.RUNNING
+
+    def _has_live_work(self, mp: ManagedProcess) -> bool:
+        return not self._is_terminal(mp) or self._process_group_exists(mp)
+
+    def _reported_status(self, mp: ManagedProcess) -> str:
+        """Status exposed to tools; descendants keep the record logically running."""
+        if self._has_live_work(mp) and mp.info.status == ProcessStatus.COMPLETED:
+            return ProcessStatus.RUNNING.value
+        return mp.info.status.value
+
+    def _reap_terminal_processes(self) -> int:
+        """Apply configured age and count retention to terminal records."""
+        now = time.time()
+        retention_ms = self._config.process_retention_ms
+        expired = [
+            process_id
+            for process_id, mp in self._processes.items()
+            if self._is_terminal(mp)
+            and not self._has_live_work(mp)
+            and (now - (mp.info.ended_at or mp.info.started_at)) * 1000 > retention_ms
+        ]
+        for process_id in expired:
+            self._remove_process(process_id)
+
+        terminal = sorted(
+            (
+                (process_id, mp)
+                for process_id, mp in self._processes.items()
+                if self._is_terminal(mp) and not self._has_live_work(mp)
+            ),
+            key=lambda item: (
+                item[1].info.ended_at or item[1].info.started_at,
+                item[1].info.started_at,
+                item[0],
+            ),
+        )
+        overflow = len(terminal) - self._config.max_retained_processes
+        for process_id, _ in terminal[: max(0, overflow)]:
+            self._remove_process(process_id)
+        return len(expired) + max(0, overflow)
+
+    def _remove_process(self, process_id: str) -> None:
+        mp = self._processes.pop(process_id, None)
+        if mp is None:
+            return
+        current = asyncio.current_task()
+        for task in (mp.timeout_task, mp.group_watch_task):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
 
     def _normalize_side_effects(
         self, side_effects: Iterable[Any] | None
@@ -233,10 +323,16 @@ class ProcessManager:
         if cwd_error:
             return {"status": "failed_to_start", "error": cwd_error}
 
+        async with self._shutdown_lock:
+            if self._shutdown_complete or self._shutdown_requested:
+                return self._shutdown_reject_response()
+
+        self._reap_terminal_processes()
+
         # Check process count limit
         running_count = sum(
-            1 for p in self._processes.values() if p.info.status == ProcessStatus.RUNNING
-        )
+            1 for p in self._processes.values() if self._has_live_work(p)
+        ) + self._pending_spawns
         if running_count >= self._config.max_processes:
             return {
                 "status": "failed_to_start",
@@ -250,10 +346,19 @@ class ProcessManager:
         effective_max_output = self._max_output(max_output_bytes)
 
         # Spawn process
+        async with self._shutdown_lock:
+            if self._shutdown_complete or self._shutdown_requested:
+                return self._shutdown_reject_response()
+            self._pending_spawns += 1
         try:
             proc = await spawn_process(command, cwd=resolved_cwd, env=env)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return {"status": "failed_to_start", "error": str(exc)}
+        finally:
+            async with self._shutdown_lock:
+                self._pending_spawns -= 1
 
         process_group_id = self._get_process_group_id(proc)
         process_id = self._new_id()
@@ -274,12 +379,34 @@ class ProcessManager:
         mp = ManagedProcess(info, proc, effective_max_output, process_group_id)
 
         # Start drain tasks immediately after spawn to prevent blocking on full pipe buffers
-        mp.drain_stdout = asyncio.create_task(
-            self._drain_stream(proc.stdout, mp.stdout_buf), name=f"drain-stdout-{process_id}"
+        drain_tasks = [
+            asyncio.create_task(
+                self._drain_stream(proc.stdout, mp.stdout_buf),
+                name=f"drain-stdout-{process_id}",
+            ),
+            asyncio.create_task(
+                self._drain_stream(proc.stderr, mp.stderr_buf),
+                name=f"drain-stderr-{process_id}",
+            ),
+        ]
+        mp.drain_stdout, mp.drain_stderr = drain_tasks
+
+        async with self._shutdown_lock:
+            if self._shutdown_complete or self._shutdown_requested:
+                await self._reject_spawned_process(proc, process_group_id, drain_tasks)
+                return self._shutdown_reject_response()
+            # Register before any post-spawn await so shutdown can always find the process.
+            self._processes[process_id] = mp
+
+        mp.completion_task = asyncio.create_task(
+            self._track_completion(proc, mp), name=f"completion-{process_id}"
         )
-        mp.drain_stderr = asyncio.create_task(
-            self._drain_stream(proc.stderr, mp.stderr_buf), name=f"drain-stderr-{process_id}"
-        )
+
+        if effective_timeout > 0:
+            mp.timeout_task = asyncio.create_task(
+                self._handle_timeout(mp, effective_timeout / 1000.0),
+                name=f"timeout-{process_id}",
+            )
 
         # Write initial stdin if provided; keep pipe open for follow-up writes
         if stdin is not None:
@@ -290,21 +417,6 @@ class ProcessManager:
             except Exception:
                 pass
 
-        # Start completion tracking
-        mp.completion_task = asyncio.create_task(
-            self._track_completion(proc, mp), name=f"completion-{process_id}"
-        )
-
-        # Register process
-        self._processes[process_id] = mp
-
-        # Start timeout task if requested
-        if effective_timeout > 0:
-            mp.timeout_task = asyncio.create_task(
-                self._handle_timeout(mp, effective_timeout / 1000.0),
-                name=f"timeout-{process_id}",
-            )
-
         # Wait up to yield_ms for completion
         try:
             await asyncio.wait_for(
@@ -312,6 +424,8 @@ class ProcessManager:
             )
         except asyncio.TimeoutError:
             pass
+
+        self._reap_terminal_processes()
 
         duration_ms = (time.monotonic() - start_time) * 1000
 
@@ -322,7 +436,10 @@ class ProcessManager:
         stdout_text = redact_text(self._config, stdout_data["text"])
         stderr_text = redact_text(self._config, stderr_data["text"])
 
-        if mp.info.status == ProcessStatus.COMPLETED:
+        if (
+            mp.info.status == ProcessStatus.COMPLETED
+            and not self._has_live_work(mp)
+        ):
             return {
                 "status": "completed",
                 "exit_code": mp.info.exit_code,
@@ -397,11 +514,17 @@ class ProcessManager:
         return os.getpgid(mp.proc.pid)
 
     def _process_group_exists(self, mp: ManagedProcess) -> bool:
+        if mp.process_group_exited:
+            return False
         if sys.platform == "win32":
-            return mp.proc.returncode is None
+            exists = mp.proc.returncode is None
+            if not exists:
+                mp.process_group_exited = True
+            return exists
         try:
             os.killpg(self._process_group_id(mp), 0)
         except ProcessLookupError:
+            mp.process_group_exited = True
             return False
         except PermissionError:
             return True
@@ -430,8 +553,10 @@ class ProcessManager:
         try:
             returncode, wait_completed = await self._wait_for_returncode(proc)
             if wait_completed:
-                await self._wait_for_process_group_exit(mp, timeout_sec=2.0)
-                await self._drain_with_timeout(mp, timeout_sec=1.0)
+                await self._wait_for_process_group_exit(
+                    mp, timeout_sec=PROCESS_GROUP_EXIT_MS / 1000.0
+                )
+                await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
             else:
                 self._cancel_drains(mp)
             mp.info.exit_code = returncode
@@ -451,7 +576,7 @@ class ProcessManager:
                 mp.completion_event.set()
         finally:
             if mp.timeout_task is not None and not mp.timeout_task.done():
-                if not mp._timeout_triggered:
+                if not mp._timeout_triggered and not self._process_group_exists(mp):
                     mp.timeout_task.cancel()
             pg_alive = self._process_group_exists(mp)
             if mp._timeout_triggered and pg_alive:
@@ -460,6 +585,11 @@ class ProcessManager:
                 pass
             else:
                 mp.completion_event.set()
+            if pg_alive and mp.group_watch_task is None:
+                mp.group_watch_task = asyncio.create_task(
+                    self._watch_process_group_exit(mp),
+                    name=f"group-watch-{mp.info.process_id}",
+                )
 
     async def _wait_for_process_group_exit(
         self, mp: ManagedProcess, timeout_sec: float
@@ -467,6 +597,15 @@ class ProcessManager:
         deadline = time.monotonic() + timeout_sec
         while self._process_group_exists(mp) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
+
+    async def _watch_process_group_exit(self, mp: ManagedProcess) -> None:
+        while self._process_group_exists(mp):
+            await asyncio.sleep(0.1)
+        if mp._timeout_triggered:
+            return
+        if mp.timeout_task is not None and not mp.timeout_task.done():
+            mp.timeout_task.cancel()
+        mp.completion_event.set()
 
     async def _wait_for_returncode(
         self, proc: asyncio.subprocess.Process
@@ -544,24 +683,23 @@ class ProcessManager:
         except asyncio.CancelledError:
             return
         mp._timeout_triggered = True
-        if mp.info.status != ProcessStatus.RUNNING:
+        if not self._has_live_work(mp):
             return
         # Graceful termination
         await terminate_process(mp.proc, mp.process_group_id)
-        grace_period = 3.0
-        try:
-            await asyncio.wait_for(mp.completion_event.wait(), timeout=grace_period)
-        except asyncio.TimeoutError:
-            pass
+        grace_period = GRACEFUL_STOP_MS / 1000.0
+        await self._wait_for_process_group_exit(mp, timeout_sec=grace_period)
 
         if self._process_group_exists(mp):
             # Force kill any children that survived graceful termination, even if
             # the shell process already exited.
             await kill_process(mp.proc, mp.process_group_id)
-            await self._wait_for_process_group_exit(mp, timeout_sec=2.0)
+            await self._wait_for_process_group_exit(
+                mp, timeout_sec=PROCESS_GROUP_EXIT_MS / 1000.0
+            )
 
         if not self._process_group_exists(mp):
-            await self._drain_with_timeout(mp, timeout_sec=1.0)
+            await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
 
         mp.completion_event.set()
         if mp.info.status == ProcessStatus.COMPLETED:
@@ -603,7 +741,7 @@ class ProcessManager:
 
         result: dict[str, Any] = {
             "process_id": process_id,
-            "status": mp.info.status.value,
+            "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
             "next_seq": next_seq,
@@ -653,7 +791,7 @@ class ProcessManager:
     async def wait_process(
         self,
         process_id: str,
-        timeout_ms: int = 30000,
+        timeout_ms: int = MAX_EFFECTIVE_WAIT_MS,
         max_output_bytes: int | None = None,
     ) -> dict[str, Any]:
         """Wait for a process to exit without killing it."""
@@ -662,16 +800,16 @@ class ProcessManager:
             return {"process_id": process_id, "error": f"Unknown process_id: {process_id}"}
 
         # Cap effective wait below typical MCP request timeout thresholds
-        effective_wait_ms = min(timeout_ms, MAX_EFFECTIVE_WAIT_MS)
+        effective_wait_ms = max(0, min(timeout_ms, MAX_EFFECTIVE_WAIT_MS))
 
-        if mp.info.status != ProcessStatus.RUNNING:
+        if not self._has_live_work(mp):
             effective_max = self._max_output(max_output_bytes)
             stdout_data = mp.stdout_buf.read(max_bytes=effective_max)
             stderr_data = mp.stderr_buf.read(max_bytes=effective_max)
             truncated = stdout_data["truncated"] or stderr_data["truncated"]
             return {
                 "process_id": process_id,
-                "status": mp.info.status.value,
+                "status": self._reported_status(mp),
                 "exit_code": mp.info.exit_code,
                 "signal": mp.info.signal,
                 "stdout": redact_text(self._config, stdout_data["text"]),
@@ -694,7 +832,7 @@ class ProcessManager:
 
         return {
             "process_id": process_id,
-            "status": mp.info.status.value,
+            "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
             "stdout": redact_text(self._config, stdout_data["text"]),
@@ -707,7 +845,7 @@ class ProcessManager:
         self,
         process_id: str,
         signal_name: str = "SIGTERM",
-        force_after_ms: int = 3000,
+        force_after_ms: int = GRACEFUL_STOP_MS,
     ) -> dict[str, Any]:
         """Stop a running process with graceful termination then force kill."""
         from .spawn import get_signal
@@ -719,7 +857,7 @@ class ProcessManager:
                 "error": f"Unknown process_id: {process_id}",
             }
 
-        if mp.info.status != ProcessStatus.RUNNING:
+        if not self._has_live_work(mp):
             return {
                 "process_id": process_id,
                 "stopped": False,
@@ -740,17 +878,15 @@ class ProcessManager:
             await terminate_process(mp.proc)
 
         # Wait for grace period
-        try:
-            await asyncio.wait_for(
-                mp.completion_event.wait(), timeout=force_after_ms / 1000.0
-            )
-        except asyncio.TimeoutError:
-            # Force kill
+        await self._wait_for_process_group_exit(mp, timeout_sec=force_after_ms / 1000.0)
+
+        if self._process_group_exists(mp):
+            # The primary shell may exit before a resistant descendant.
             await kill_process(mp.proc, mp.process_group_id)
-            try:
-                await asyncio.wait_for(mp.completion_event.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
+            await self._wait_for_process_group_exit(
+                mp, timeout_sec=PROCESS_GROUP_EXIT_MS / 1000.0
+            )
+            await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
 
         # If the process exited due to our signal, mark it as STOPPED.
         # _track_completion may have set COMPLETED, but since we initiated
@@ -791,7 +927,7 @@ class ProcessManager:
                     "name": mp.info.name,
                     "command": mp.info.command,
                     "cwd": mp.info.cwd,
-                    "status": mp.info.status.value,
+                    "status": self._reported_status(mp),
                     "exit_code": mp.info.exit_code,
                     "signal": mp.info.signal,
                     "started_at": mp.info.started_at,
@@ -820,7 +956,7 @@ class ProcessManager:
         to_remove: list[str] = []
 
         for pid, mp in self._processes.items():
-            if mp.info.status == ProcessStatus.RUNNING:
+            if self._has_live_work(mp):
                 continue
 
             age_ms = (now - (mp.info.ended_at or mp.info.started_at)) * 1000
@@ -835,10 +971,98 @@ class ProcessManager:
                     to_remove.append(pid)
 
         for pid in to_remove:
-            del self._processes[pid]
+            self._remove_process(pid)
             removed += 1
 
         return {"removed": removed}
+
+    async def shutdown(self) -> None:
+        """Stop all live managed process groups and settle their tracking tasks."""
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutdown_requested = True
+
+        await self._wait_for_no_pending_spawns()
+
+        while True:
+            live = [
+                mp
+                for mp in self._processes.values()
+                if self._has_live_work(mp)
+            ]
+            if not live:
+                async with self._shutdown_lock:
+                    if self._pending_spawns == 0:
+                        self._shutdown_complete = True
+                return
+
+            running_at_start = {id(mp) for mp in live if not self._is_terminal(mp)}
+
+            await asyncio.gather(
+                *(terminate_process(mp.proc, mp.process_group_id) for mp in live),
+                return_exceptions=True,
+            )
+
+            deadline = time.monotonic() + GRACEFUL_STOP_MS / 1000.0
+            while any(self._process_group_exists(mp) for mp in live):
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.05)
+
+            survivors = [mp for mp in live if self._process_group_exists(mp)]
+            await asyncio.gather(
+                *(kill_process(mp.proc, mp.process_group_id) for mp in survivors),
+                return_exceptions=True,
+            )
+            await asyncio.gather(
+                *(
+                    self._wait_for_process_group_exit(
+                        mp, timeout_sec=PROCESS_GROUP_EXIT_MS / 1000.0
+                    )
+                    for mp in survivors
+                ),
+                return_exceptions=True,
+            )
+            await asyncio.gather(
+                *(
+                    self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
+                    for mp in live
+                ),
+                return_exceptions=True,
+            )
+
+            for mp in live:
+                if mp.timeout_task is not None and not mp.timeout_task.done():
+                    mp.timeout_task.cancel()
+                if mp.completion_task is not None and not mp.completion_task.done():
+                    mp.completion_task.cancel()
+                if mp.group_watch_task is not None and not mp.group_watch_task.done():
+                    mp.group_watch_task.cancel()
+                if id(mp) in running_at_start and mp.info.status in (
+                    ProcessStatus.RUNNING,
+                    ProcessStatus.COMPLETED,
+                ):
+                    mp.info.status = ProcessStatus.STOPPED
+                    if mp.info.ended_at is None:
+                        mp.info.ended_at = time.time()
+                        mp.info.duration_ms = (
+                            time.monotonic() - mp.info.start_monotonic
+                        ) * 1000
+                mp.completion_event.set()
+
+            tasks = [
+                task
+                for mp in live
+                for task in (mp.timeout_task, mp.completion_task, mp.group_watch_task)
+                if task is not None
+            ]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            async with self._shutdown_lock:
+                self._shutdown_complete = True
+            return
 
     def get_process(self, process_id: str) -> ManagedProcess | None:
         return self._processes.get(process_id)

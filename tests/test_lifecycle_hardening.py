@@ -1,0 +1,615 @@
+"""Retention, shared timing, and server shutdown regression tests."""
+
+import asyncio
+import os
+import signal
+import sys
+import time
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from mcp_yieldshell.config import Config
+from mcp_yieldshell.policy import (
+    FINAL_DRAIN_MS,
+    GRACEFUL_STOP_MS,
+    MAX_EFFECTIVE_WAIT_MS,
+    PROCESS_GROUP_EXIT_MS,
+)
+from mcp_yieldshell.process.manager import ProcessManager
+from mcp_yieldshell.process.spawn import kill_process, terminate_process
+from mcp_yieldshell.server import _server_lifespan, mcp
+from mcp_yieldshell.types import ProcessStatus, SideEffect
+
+NONE = [SideEffect.NONE]
+
+
+class TestSharedPolicy:
+    def test_defaults_are_shared_policy_values(self):
+        config = Config()
+        assert config.default_yield_ms == 30_000
+        assert config.default_timeout_ms == 3_600_000
+        assert MAX_EFFECTIVE_WAIT_MS == 55_000
+        assert GRACEFUL_STOP_MS == 10_000
+        assert PROCESS_GROUP_EXIT_MS == 5_000
+        assert FINAL_DRAIN_MS == 3_000
+
+    def test_public_tool_defaults_use_shared_policy(self):
+        from inspect import signature
+
+        from mcp_yieldshell.server import stop, wait
+
+        assert signature(wait).parameters["timeout_ms"].default == MAX_EFFECTIVE_WAIT_MS
+        assert signature(stop).parameters["force_after_ms"].default == GRACEFUL_STOP_MS
+
+
+class TestAutomaticRetention:
+    @pytest.mark.asyncio
+    async def test_zero_cap_is_enforced_after_completion(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_MAX_RETAINED_PROCESSES", "0")
+        manager = ProcessManager(Config())
+
+        result = await manager.exec_command("echo returned", side_effects=NONE)
+
+        assert result["status"] == "completed"
+        assert "returned" in result["stdout"]
+        assert manager.list_processes()["processes"] == []
+
+    @pytest.mark.asyncio
+    async def test_reaps_every_terminal_state_and_ids_become_unknown(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_PROCESS_RETENTION_MS", "1000")
+        manager = ProcessManager(Config())
+        process_ids = []
+        for index, status in enumerate(
+            (
+                ProcessStatus.COMPLETED,
+                ProcessStatus.STOPPED,
+                ProcessStatus.TIMED_OUT,
+                ProcessStatus.FAILED,
+            )
+        ):
+            await manager.exec_command(f"echo {index}", side_effects=NONE)
+            process_id = manager.list_processes(limit=1)["processes"][0]["process_id"]
+            mp = manager.get_process(process_id)
+            assert mp is not None
+            mp.info.status = status
+            mp.info.ended_at = time.time() - 2
+            process_ids.append(process_id)
+
+        await manager.exec_command("echo trigger", side_effects=NONE)
+        listed = {item["process_id"] for item in manager.list_processes()["processes"]}
+        assert not listed.intersection(process_ids)
+        for process_id in process_ids:
+            assert "error" in await manager.read_output(process_id)
+            assert "error" in await manager.wait_process(process_id)
+            assert "error" in await manager.write_input(process_id, "x")
+            assert "error" in await manager.stop_process(process_id)
+
+    @pytest.mark.asyncio
+    async def test_age_boundary_is_strict_and_reaping_is_repeatable(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_PROCESS_RETENTION_MS", "1000")
+        manager = ProcessManager(Config())
+        await manager.exec_command("echo retained", side_effects=NONE)
+        process_id = manager.list_processes(limit=1)["processes"][0]["process_id"]
+        mp = manager.get_process(process_id)
+        assert mp is not None
+        now = time.time()
+        mp.info.ended_at = now - 1
+
+        monkeypatch.setattr(time, "time", lambda: now)
+        assert manager._reap_terminal_processes() == 0
+        assert manager.get_process(process_id) is not None
+        monkeypatch.setattr(time, "time", lambda: now + 0.001)
+        assert manager._reap_terminal_processes() == 1
+        assert manager._reap_terminal_processes() == 0
+
+    @pytest.mark.asyncio
+    async def test_cap_removes_oldest_and_never_running(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_MAX_RETAINED_PROCESSES", "2")
+        manager = ProcessManager(Config())
+        completed = []
+        for index in range(4):
+            await manager.exec_command(f"echo {index}", side_effects=NONE)
+            completed.append(manager.list_processes(limit=1)["processes"][0]["process_id"])
+
+        running = await manager.exec_command("sleep 30", yield_ms=0, side_effects=NONE)
+        running_id = running["process_id"]
+        listed = {item["process_id"] for item in manager.list_processes()["processes"]}
+        assert running_id in listed
+        assert completed[-2:] == [item for item in completed if item in listed]
+        await manager.exec_command("echo trigger", side_effects=NONE)
+        assert manager.get_process(running_id) is not None
+        await manager.stop_process(running_id, force_after_ms=100)
+
+    @pytest.mark.asyncio
+    async def test_manual_cleanup_contract_is_preserved(self):
+        manager = ProcessManager(Config())
+        await manager.exec_command("echo done", side_effects=NONE)
+        result = await manager.cleanup(completed_older_than_ms=0)
+        assert result["removed"] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups only")
+    async def test_live_descendant_counts_toward_limit_and_survives_cleanup(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "1")
+        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 100)
+        manager = ProcessManager(Config())
+        first = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess; subprocess.Popen(['sleep','30'])\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        await manager.wait_process(first["process_id"], timeout_ms=1000)
+
+        cleanup = await manager.cleanup(completed_older_than_ms=0)
+        second = await manager.exec_command("echo rejected", side_effects=NONE)
+
+        assert cleanup["removed"] == 0
+        assert second["status"] == "failed_to_start"
+        assert "limit" in second["error"].lower()
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_completed_primary_with_live_descendant_reports_running(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 100)
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess; subprocess.Popen(['sleep','30'])\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = result["process_id"]
+        await manager.wait_process(process_id, timeout_ms=2000)
+
+        listed = manager.list_processes()["processes"][0]
+        read_result = await manager.read_output(process_id)
+
+        assert listed["status"] == "running"
+        assert read_result["status"] == "running"
+        assert manager.get_process(process_id).info.status == ProcessStatus.COMPLETED
+        await manager.stop_process(process_id, force_after_ms=100)
+
+    @pytest.mark.asyncio
+    async def test_observed_group_exit_is_monotonic(self, monkeypatch):
+        manager = ProcessManager(Config())
+        await manager.exec_command("echo done", side_effects=NONE)
+        process_id = manager.list_processes(limit=1)["processes"][0]["process_id"]
+        mp = manager.get_process(process_id)
+        assert mp is not None
+        assert manager._process_group_exists(mp) is False
+        monkeypatch.setattr(os, "killpg", lambda *_: None)
+        assert manager._process_group_exists(mp) is False
+
+    @pytest.mark.asyncio
+    async def test_concurrent_spawn_reservation_enforces_process_limit(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "1")
+        manager = ProcessManager(Config())
+
+        first, second = await asyncio.gather(
+            manager.exec_command("sleep 30", yield_ms=0, side_effects=NONE),
+            manager.exec_command("sleep 30", yield_ms=0, side_effects=NONE),
+        )
+
+        results = (first, second)
+        assert sum(result["status"] == "backgrounded" for result in results) == 1
+        assert sum(result["status"] == "failed_to_start" for result in results) == 1
+        running = next(result for result in results if result["status"] == "backgrounded")
+        await manager.stop_process(running["process_id"], force_after_ms=100)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups only")
+class TestManagerShutdown:
+    @pytest.fixture(autouse=True)
+    def short_lifecycle_policy(self, monkeypatch):
+        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 500)
+        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 500)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_with_no_live_processes_is_idempotent(self):
+        manager = ProcessManager(Config())
+        await manager.shutdown()
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_multiple_live_groups_and_descendant(self):
+        manager = ProcessManager(Config())
+        first = await manager.exec_command("sleep 30", yield_ms=0, side_effects=NONE)
+        second = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess,time; "
+            "subprocess.Popen(['sleep','30']); time.sleep(30)\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        groups = []
+        for result in (first, second):
+            mp = manager.get_process(result["process_id"])
+            assert mp is not None and mp.process_group_id is not None
+            groups.append(mp.process_group_id)
+
+        await manager.shutdown()
+        await manager.shutdown()
+
+        for result, group in zip((first, second), groups, strict=True):
+            assert manager.get_process(result["process_id"]).info.status == ProcessStatus.STOPPED
+            with pytest.raises(ProcessLookupError):
+                os.killpg(group, 0)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_force_kills_group_ignoring_termination(self):
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"exec {sys.executable} -c \"import signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None and mp.process_group_id is not None
+        group = mp.process_group_id
+        await asyncio.sleep(0.05)
+
+        started = time.monotonic()
+        await manager.shutdown()
+        assert time.monotonic() - started < 2
+        with pytest.raises(ProcessLookupError):
+            os.killpg(group, signal.SIGCONT)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cleans_descendant_after_primary_is_terminal(self):
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess; "
+            "subprocess.Popen(['sleep','30'])\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None and mp.process_group_id is not None
+        group = mp.process_group_id
+        wait_result = await manager.wait_process(result["process_id"], timeout_ms=2000)
+        assert mp.info.status == ProcessStatus.COMPLETED
+        assert wait_result["status"] == "running"
+
+        await manager.shutdown()
+
+        assert mp.info.status == ProcessStatus.COMPLETED
+        with pytest.raises(ProcessLookupError):
+            os.killpg(group, 0)
+
+    @pytest.mark.asyncio
+    async def test_stop_force_kills_descendant_after_primary_exits(self):
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"exec {sys.executable} -c \"import subprocess,time; "
+            f"subprocess.Popen(['{sys.executable}','-c',"
+            "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(30)']); time.sleep(30)\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None and mp.process_group_id is not None
+        group = mp.process_group_id
+        await asyncio.sleep(0.1)
+
+        stopped = await manager.stop_process(result["process_id"])
+
+        assert stopped["stopped"] is True
+        with pytest.raises(ProcessLookupError):
+            os.killpg(group, 0)
+
+    @pytest.mark.asyncio
+    async def test_terminal_parent_with_live_descendant_can_be_stopped(self):
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess; subprocess.Popen(['sleep','30'])\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None and mp.process_group_id is not None
+        group = mp.process_group_id
+        waited = await manager.wait_process(result["process_id"], timeout_ms=2000)
+        assert mp.info.status == ProcessStatus.COMPLETED
+        assert waited["status"] == "running"
+
+        stopped = await manager.stop_process(result["process_id"])
+
+        assert stopped["stopped"] is True
+        with pytest.raises(ProcessLookupError):
+            os.killpg(group, 0)
+
+    @pytest.mark.asyncio
+    async def test_runtime_timeout_remains_active_for_live_descendant(self):
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess; subprocess.Popen(['sleep','30'])\"",
+            yield_ms=0,
+            timeout_ms=300,
+            side_effects=NONE,
+        )
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None and mp.process_group_id is not None
+        group = mp.process_group_id
+
+        await asyncio.sleep(1)
+
+        assert mp.info.status == ProcessStatus.TIMED_OUT
+        with pytest.raises(ProcessLookupError):
+            os.killpg(group, 0)
+
+    @pytest.mark.asyncio
+    async def test_terminal_descendant_receives_full_grace(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 500)
+        marker = tmp_path / "graceful"
+        child = tmp_path / "child.py"
+        child.write_text(
+            "import signal, time\n"
+            "from pathlib import Path\n"
+            f"marker = Path({str(marker)!r})\n"
+            "def stop(*_):\n"
+            "    time.sleep(0.2)\n"
+            "    marker.write_text('done')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess; "
+            f"subprocess.Popen(['{sys.executable}', {str(child)!r}])\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        await manager.wait_process(result["process_id"], timeout_ms=2000)
+
+        stopped = await manager.stop_process(result["process_id"])
+
+        assert stopped["stopped"] is True
+        assert marker.read_text(encoding="utf-8") == "done"
+
+    @pytest.mark.asyncio
+    async def test_natural_descendant_exit_cancels_timeout_retention(self):
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"{sys.executable} -c \"import subprocess; subprocess.Popen("
+            f"['{sys.executable}','-c','import time; time.sleep(2)'])\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None and mp.timeout_task is not None
+        await manager.wait_process(result["process_id"], timeout_ms=2000)
+
+        await asyncio.sleep(2)
+
+        assert mp.timeout_task.cancelled() or mp.timeout_task.done()
+        assert mp.group_watch_task is not None and mp.group_watch_task.done()
+
+    @pytest.mark.asyncio
+    async def test_stop_allows_natural_graceful_exit(self, monkeypatch):
+        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 1000)
+        manager = ProcessManager(Config())
+        result = await manager.exec_command(
+            f"exec {sys.executable} -c \"import signal,time,sys; "
+            "signal.signal(signal.SIGTERM, lambda *_: (time.sleep(0.1), sys.exit(0))); "
+            "time.sleep(30)\"",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        await asyncio.sleep(0.05)
+
+        stopped = await manager.stop_process(result["process_id"])
+
+        assert stopped["stopped"] is True
+        assert manager.get_process(result["process_id"]).info.status == ProcessStatus.STOPPED
+
+
+class TestWindowsFallback:
+    @pytest.mark.asyncio
+    async def test_termination_targets_primary_process(self, monkeypatch):
+        process = MagicMock()
+        process.pid = 123
+        monkeypatch.setattr("mcp_yieldshell.process.spawn.sys.platform", "win32")
+
+        await terminate_process(process, process_group_id=456)
+        await kill_process(process, process_group_id=456)
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+
+
+class TestServerLifespan:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [None, KeyboardInterrupt(), RuntimeError("server failed")])
+    async def test_shutdown_runs_for_all_server_exit_paths(self, monkeypatch, error):
+        manager = AsyncMock()
+        monkeypatch.setattr("mcp_yieldshell.server._manager", manager)
+
+        if error is None:
+            async with _server_lifespan(mcp):
+                pass
+        else:
+            with pytest.raises(type(error)):
+                async with _server_lifespan(mcp):
+                    raise error
+
+        manager.shutdown.assert_awaited_once_with()
+
+
+class TestSpawnRegistration:
+    @pytest.mark.asyncio
+    async def test_process_is_registered_before_initial_stdin_await(self, monkeypatch):
+        entered_drain = asyncio.Event()
+        release_drain = asyncio.Event()
+
+        class BlockingStdin:
+            def write(self, _: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                entered_drain.set()
+                await release_drain.wait()
+
+        class FakeProcess:
+            pid = 987_654_321
+            stdout = None
+            stderr = None
+            stdin = BlockingStdin()
+            returncode = None
+
+            async def wait(self):
+                await asyncio.Event().wait()
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.spawn_process", AsyncMock(return_value=FakeProcess())
+        )
+        manager = ProcessManager(Config())
+        task = asyncio.create_task(
+            manager.exec_command("blocked stdin", stdin="data", side_effects=NONE)
+        )
+        await entered_drain.wait()
+
+        assert len(manager.list_processes()["processes"]) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await manager.shutdown()
+
+
+class TestShutdownSpawnRace:
+    @pytest.mark.asyncio
+    async def test_concurrent_shutdown_and_exec_leave_no_live_managed_work(self):
+        for _ in range(25):
+            manager = ProcessManager(Config())
+            exec_task = asyncio.create_task(
+                manager.exec_command("sleep 0.2", yield_ms=0, side_effects=NONE)
+            )
+            await asyncio.sleep(0)
+            await manager.shutdown()
+            exec_task.cancel()
+            try:
+                await exec_task
+            except asyncio.CancelledError:
+                pass
+            assert not any(
+                manager._has_live_work(mp) for mp in manager._processes.values()
+            )
+
+    @pytest.mark.asyncio
+    async def test_exec_rejected_after_shutdown_starts(self):
+        manager = ProcessManager(Config())
+        await manager.shutdown()
+        result = await manager.exec_command("echo late", side_effects=NONE)
+        assert result["status"] == "failed_to_start"
+        assert "shutting down" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_waits_for_pending_spawn_and_rejects_late_registration(
+        self, monkeypatch
+    ):
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+
+        class FakeProcess:
+            pid = 42
+            stdout = None
+            stderr = None
+            stdin = None
+            returncode = None
+
+            async def wait(self):
+                await asyncio.Event().wait()
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        async def slow_spawn(*_args, **_kwargs):
+            spawn_started.set()
+            await release_spawn.wait()
+            return FakeProcess()
+
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.spawn_process", slow_spawn
+        )
+        manager = ProcessManager(Config())
+        exec_task = asyncio.create_task(
+            manager.exec_command("sleep 30", yield_ms=0, side_effects=NONE)
+        )
+        await spawn_started.wait()
+        shutdown_task = asyncio.create_task(manager.shutdown())
+        await asyncio.sleep(0.05)
+        release_spawn.set()
+
+        await shutdown_task
+        result = await exec_task
+        assert result["status"] == "failed_to_start"
+        assert "shutting down" in result["error"].lower()
+        assert manager.list_processes()["processes"] == []
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_wait_indefinitely_for_pending_spawn(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.PENDING_SPAWN_SHUTDOWN_MS", 100
+        )
+        spawn_started = asyncio.Event()
+
+        async def stuck_spawn(*_args, **_kwargs):
+            spawn_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.spawn_process", stuck_spawn
+        )
+        manager = ProcessManager(Config())
+        exec_task = asyncio.create_task(
+            manager.exec_command("sleep 30", yield_ms=0, side_effects=NONE)
+        )
+        await spawn_started.wait()
+        started = time.monotonic()
+        await manager.shutdown()
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0
+        exec_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exec_task
+
+
+class TestRedactionAcrossTools:
+    @pytest.mark.asyncio
+    async def test_read_and_wait_do_not_redact_unrelated_truncated_suffixes(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MY_SECRET", "abcdefghijklmnop")
+        manager = ProcessManager(Config())
+        secret = "abcdefghijklmnop"
+        command = (
+            f"{sys.executable} -c \"import sys; sys.stdout.write('{'x' * 40}{secret}'); "
+            "sys.stdout.flush()\""
+        )
+        started = await manager.exec_command(command, yield_ms=0, side_effects=NONE)
+        process_id = started["process_id"]
+        await manager.wait_process(process_id, timeout_ms=5000)
+        read_result = await manager.read_output(
+            process_id, max_output_bytes=48, streams="stdout"
+        )
+        assert "[REDACTED:MY_SECRET]" not in read_result["stdout"]
+        assert "abcdefghijklmnop" not in read_result["stdout"]

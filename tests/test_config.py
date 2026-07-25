@@ -23,7 +23,7 @@ class TestConfigDefaults:
 
     def test_default_yield_ms(self):
         config = Config()
-        assert config.default_yield_ms == 5000
+        assert config.default_yield_ms == 30000
 
     def test_default_max_yield_ms(self):
         config = Config()
@@ -31,7 +31,12 @@ class TestConfigDefaults:
 
     def test_default_timeout_ms(self):
         config = Config()
-        assert config.default_timeout_ms == 0
+        assert config.default_timeout_ms == 3600000
+
+    def test_default_process_retention(self):
+        config = Config()
+        assert config.process_retention_ms == 3600000
+        assert config.max_retained_processes == 100
 
     def test_empty_allowed_cwds(self):
         config = Config()
@@ -69,6 +74,43 @@ class TestConfigFromEnv:
         monkeypatch.setenv("YIELDSHELL_DEFAULT_YIELD_MS", "2000")
         config = Config()
         assert config.default_yield_ms == 2000
+
+    def test_timing_and_retention_overrides(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_MAX_YIELD_MS", "45000")
+        monkeypatch.setenv("YIELDSHELL_DEFAULT_TIMEOUT_MS", "0")
+        monkeypatch.setenv("YIELDSHELL_PROCESS_RETENTION_MS", "250")
+        monkeypatch.setenv("YIELDSHELL_MAX_RETAINED_PROCESSES", "0")
+        config = Config()
+        assert config.max_yield_ms == 45000
+        assert config.default_timeout_ms == 0
+        assert config.process_retention_ms == 250
+        assert config.max_retained_processes == 0
+
+    @pytest.mark.parametrize("value", ["invalid", "-1"])
+    def test_invalid_retention_values_use_defaults(self, monkeypatch, value):
+        monkeypatch.setenv("YIELDSHELL_PROCESS_RETENTION_MS", value)
+        monkeypatch.setenv("YIELDSHELL_MAX_RETAINED_PROCESSES", value)
+        config = Config()
+        assert config.process_retention_ms == 3600000
+        assert config.max_retained_processes == 100
+
+    def test_sensitive_environment_is_snapshotted_and_ordered(self, monkeypatch):
+        monkeypatch.setenv("SHORT_SECRET", "1234567")
+        monkeypatch.setenv("INNER_SECRET", "abcdefgh")
+        monkeypatch.setenv("OUTER_SECRET", "xxabcdefghyy")
+        monkeypatch.setenv("NORMAL_VALUE", "not-sensitive")
+        config = Config()
+
+        selected = tuple(item for item in config.sensitive_env if item[0].endswith("_SECRET"))
+        assert selected == (
+            ("OUTER_SECRET", "xxabcdefghyy"),
+            ("INNER_SECRET", "abcdefgh"),
+        )
+        assert all(name != "SHORT_SECRET" for name, _ in config.sensitive_env)
+        assert all(name != "NORMAL_VALUE" for name, _ in config.sensitive_env)
+
+        monkeypatch.setenv("LATER_SECRET", "later-value")
+        assert all(name != "LATER_SECRET" for name, _ in config.sensitive_env)
 
     def test_deny_command_regex(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_DENY_COMMAND_REGEX", r"rm\s+-rf")
