@@ -583,6 +583,133 @@ class TestSpawnRegistration:
         await manager.shutdown()
 
 
+class TestInitialStdinLifecycle:
+    class FakeProcess:
+        pid = 987_654_322
+        stdout = None
+        stderr = None
+        returncode = None
+
+        def __init__(self, stdin):
+            self.stdin = stdin
+            self._exited = asyncio.Event()
+
+        async def wait(self):
+            await self._exited.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -signal.SIGTERM
+            self._exited.set()
+
+        def kill(self):
+            self.returncode = -signal.SIGKILL
+            self._exited.set()
+
+    @staticmethod
+    def configure_fake_process_checks(manager, monkeypatch):
+        monkeypatch.setattr(manager, "_get_process_group_id", lambda _proc: None)
+        monkeypatch.setattr(
+            manager,
+            "_process_group_exists",
+            lambda mp: mp.proc.returncode is None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_initial_stdin_backpressure_does_not_delay_auto_yield(
+        self, monkeypatch
+    ):
+        entered_drain = asyncio.Event()
+        release_drain = asyncio.Event()
+
+        class BlockingStdin:
+            def __init__(self):
+                self.closed = False
+
+            def write(self, _: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                entered_drain.set()
+                await release_drain.wait()
+
+            def is_closing(self) -> bool:
+                return self.closed
+
+            def close(self) -> None:
+                self.closed = True
+
+        proc = self.FakeProcess(BlockingStdin())
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.spawn_process",
+            AsyncMock(return_value=proc),
+        )
+        manager = ProcessManager(Config())
+        self.configure_fake_process_checks(manager, monkeypatch)
+
+        started = time.monotonic()
+        result = await manager.exec_command(
+            "blocked stdin",
+            stdin="data",
+            yield_ms=20,
+            timeout_ms=0,
+            side_effects=NONE,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result["status"] == "backgrounded"
+        assert elapsed < 0.5
+        assert entered_drain.is_set()
+        mp = manager.get_process(result["process_id"])
+        assert mp is not None
+        assert mp.stdin_task is not None and not mp.stdin_task.done()
+
+        write_result = await manager.write_input(result["process_id"], "later")
+        assert write_result["ok"] is False
+        assert "still in progress" in write_result["error"]
+
+        release_drain.set()
+        await mp.stdin_task
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_initial_stdin_failure_is_reported(self, monkeypatch):
+        class BrokenStdin:
+            def write(self, _: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                raise BrokenPipeError("stdin delivery failed")
+
+            def is_closing(self) -> bool:
+                return False
+
+            def close(self) -> None:
+                pass
+
+        proc = self.FakeProcess(BrokenStdin())
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.spawn_process",
+            AsyncMock(return_value=proc),
+        )
+        manager = ProcessManager(Config())
+        self.configure_fake_process_checks(manager, monkeypatch)
+
+        result = await manager.exec_command(
+            "broken stdin",
+            stdin="data",
+            yield_ms=20,
+            timeout_ms=0,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "backgrounded"
+        assert result["stdin_error"] == "stdin delivery failed"
+        read_result = await manager.read_output(result["process_id"])
+        assert read_result["stdin_error"] == "stdin delivery failed"
+        await manager.shutdown()
+
+
 class TestShutdownSpawnRace:
     @pytest.mark.asyncio
     async def test_concurrent_shutdown_and_exec_leave_no_live_managed_work(self):
@@ -681,9 +808,11 @@ class TestShutdownSpawnRace:
         await manager.shutdown()
         elapsed = time.monotonic() - started
         assert elapsed < 1.0
-        exec_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await exec_task
+        assert manager._pending_spawns == 0
+        assert manager._pending_spawn_tasks == set()
+        assert manager._shutdown_complete is True
 
 
 class TestRedactionAcrossTools:

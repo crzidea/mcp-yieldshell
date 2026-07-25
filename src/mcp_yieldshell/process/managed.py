@@ -21,6 +21,8 @@ class ManagedProcess:
         "completion_task",
         "timeout_task",
         "group_watch_task",
+        "stdin_task",
+        "stdin_error",
         "process_group_id",
         "process_group_exited",
         "_seq_source",
@@ -49,5 +51,7 @@ class ManagedProcess:
         self.completion_task: asyncio.Task[None] | None = None
         self.timeout_task: asyncio.Task[None] | None = None
         self.group_watch_task: asyncio.Task[None] | None = None
+        self.stdin_task: asyncio.Task[None] | None = None
+        self.stdin_error: str | None = None
         self._timeout_triggered = False
         self.sensitive_env = sensitive_env

@@ -100,6 +100,13 @@ def get_next_version(current_version, bump_type):
     return None
 
 
+def push_release(branch, tag):
+    """Atomically push the release branch and tag."""
+    print(f"Pushing to origin {branch}...")
+    run_cmd(f"git push --atomic origin {shlex.quote(branch)} {tag}")
+    print("Push complete. GitHub Action should trigger shortly!")
+
+
 def main():
     # Ensure we are in git repository root
     if not os.path.exists(".git"):
@@ -184,10 +191,6 @@ def main():
         confirm = input("Proceed with this version name? (y/N): ").strip().lower()
         if confirm != 'y':
             sys.exit(1)
-    if new_version == current_version:
-        print(f"Error: Version is already {current_version}.")
-        sys.exit(1)
-
     branch_res = run_cmd("git branch --show-current")
     branch = branch_res.stdout.strip()
     if not branch:
@@ -195,7 +198,31 @@ def main():
         sys.exit(1)
 
     tag = f"v{new_version}"
-    if run_cmd(f"git rev-parse -q --verify refs/tags/{tag}", check=False).returncode == 0:
+    tag_exists = (
+        run_cmd(f"git rev-parse -q --verify refs/tags/{tag}", check=False).returncode
+        == 0
+    )
+    if new_version == current_version:
+        expected_subject = f"chore: bump version to v{new_version}"
+        tag_commit = run_cmd(
+            f"git rev-parse -q --verify refs/tags/{tag}^{{commit}}",
+            check=False,
+        )
+        head_commit = run_cmd("git rev-parse HEAD")
+        head_subject = run_cmd("git log -1 --format=%s")
+        if (
+            tag_exists
+            and tag_commit.returncode == 0
+            and tag_commit.stdout.strip() == head_commit.stdout.strip()
+            and head_subject.stdout.strip() == expected_subject
+        ):
+            print(f"Resuming push for existing local release {tag}.")
+            push_release(branch, tag)
+            return
+        print(f"Error: Version is already {current_version}.")
+        sys.exit(1)
+
+    if tag_exists:
         print(f"Error: Tag {tag} already exists.")
         sys.exit(1)
 
@@ -224,9 +251,7 @@ def main():
     print(f"Committed and tagged with v{new_version}")
 
     # 6. Push branch and tag atomically.
-    print(f"Pushing to origin {branch}...")
-    run_cmd(f"git push --atomic origin {shlex.quote(branch)} {tag}")
-    print("Push complete. GitHub Action should trigger shortly!")
+    push_release(branch, tag)
 
 if __name__ == "__main__":
     main()

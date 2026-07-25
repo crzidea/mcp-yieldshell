@@ -138,7 +138,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * `command` (string, **required**): The command string to execute in the shell.
   * `side_effects` (array of string, **required**): The side-effect categories this command may plausibly have. Must contain at least one entry drawn from the enum below. Use `["NONE"]` for commands with no meaningful side effects. `NONE` is exclusive and must not be combined with any other category. The server rejects the call with `failed_to_start` if any declared category is configured as blocked.
     * Allowed values: `CHANGES_NETWORK_CONFIGURATION`, `CHANGES_PACKAGES_OR_DEPENDENCIES`, `CONSUMES_SIGNIFICANT_RESOURCES`, `DELETES_FILES`, `EXPOSES_SECRETS`, `KILLS_AGENT_PROCESS`, `MAKES_NETWORK_REQUESTS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_OUTSIDE_WORKSPACE`, `MODIFIES_PRODUCTION_SERVICES`, `MODIFIES_PROTECTED_FILES`, `MODIFIES_SECURITY_CONTROLS`, `MODIFIES_WORKSPACE_FILES`, `NONE`, `OTHER`, `RUNS_INLINE_CODE`, `RUNS_PRIVILEGED_COMMANDS`, `STOPS_OR_RESTARTS_SERVICES`, `UNKNOWN`, `USES_DESTRUCTIVE_GIT_OPERATION`.
-    * `RUNS_INLINE_CODE` is in the default blocklist. It covers commands that execute code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `curl ... | sh`). It does not cover simply creating a script or executable file unless the same command also executes inline code. The safer next action is to write the content to a reviewable workspace file and execute it in a small, inspectable step. Operators can unblock the category via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
+    * `RUNS_INLINE_CODE` is in the default blocklist. It covers commands that execute code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `curl ... | sh`). It does not cover simply creating a script or executable file unless the same command also executes inline code. The safer next action is to write the content to a reviewable workspace file and execute it in a small, inspectable step. Operators can clear the blocklist via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=,`.
   * `cwd` (string, optional): Working directory for the command. Must be under allowed roots if `YIELDSHELL_ALLOWED_CWDS` is set. Defaults to `YIELDSHELL_DEFAULT_CWD`.
   * `env` (object of string to string, optional): Additive environment variable overlay. Merged into the parent environment.
   * `shell` (string, optional): Shell executable used to run the command. Defaults to the platform shell. Explicit shells are checked by the same allow/deny command policy.
@@ -164,7 +164,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * Destructive file operations: `side_effects=["DELETES_FILES"]`
   * Privileged command: `side_effects=["RUNS_PRIVILEGED_COMMANDS"]`
   * Protected-file changes: `side_effects=["MODIFIES_PROTECTED_FILES"]`
-  * Inline code execution: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["RUNS_INLINE_CODE"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
+  * Inline code execution: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["RUNS_INLINE_CODE"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=,`.
 
 * **Output Statuses**:
   * `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr. If the response is truncated and terminal-process retention is enabled, it also returns `process_id` so retained output can be inspected with `read`.
@@ -173,6 +173,9 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * `stopped`: Process was explicitly terminated.
   * `failed_to_start`: Command could not be spawned (e.g., bad directory or policy violation).
   * `failed`: An internal execution error occurred.
+  * If initial `stdin` delivery fails, responses for the retained process include
+    `stdin_error` with the transport error. Initial delivery runs as tracked
+    background work so pipe backpressure does not delay auto-yielding.
 
 ### `read`
 Read stdout and/or stderr output from a running or completed background process.
@@ -184,7 +187,7 @@ Read stdout and/or stderr output from a running or completed background process.
   * `streams` (string, default: `"both"`): The streams to read. Options: `"both"`, `"stdout"`, or `"stderr"`.
 
 * **Returns**:
-  * `process_id`, `status`, `exit_code`, `signal`, `next_seq` (byte-position cursor to use in subsequent `since_seq` reads), `truncated` flag. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
+  * `process_id`, `status`, `exit_code`, `signal`, `next_seq` (byte-position cursor to use in subsequent `since_seq` reads), `truncated` flag, and `stdin_error` when initial input delivery failed. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
 
 ### `write`
 Write text input to the standard input (`stdin`) of a running process.
@@ -194,6 +197,8 @@ Write text input to the standard input (`stdin`) of a running process.
   * `input` (string, **required**): Text input to write.
   * `newline` (boolean, default: `false`): If `true`, appends `\n` to the input.
   * `close_stdin` (boolean, default: `false`): Close standard input after this write, delivering EOF to the process.
+* Writes that remain backpressured are capped at the transport-safe 55-second
+  request ceiling and return `ok: false` with an error.
 
 ### `wait`
 Block execution until the process exits or the wait timeout expires. This allows the LLM to pause and await completion without spawning a new execution loop.
@@ -223,7 +228,7 @@ Terminal records are retained temporarily for inspection. Before each otherwise 
 * **Parameters**:
   * `include_completed` (boolean, default: `true`): If `false`, finished/stopped processes are excluded from the output.
   * `limit` (integer, default: `50`): Maximum number of entries.
-* **Returns**: `processes` — a list of process summary objects, each containing: `process_id`, `pid`, `name`, `command`, `cwd`, `status`, `exit_code`, `signal`, `started_at`, `ended_at`, `duration_ms`, `stdout_bytes`, `stderr_bytes`.
+* **Returns**: `processes` — a list of process summary objects, each containing: `process_id`, `pid`, `name`, `command`, `cwd`, `status`, `exit_code`, `signal`, `started_at`, `ended_at`, `duration_ms`, `stdout_bytes`, `stderr_bytes`, and `stdin_error` (`null` unless initial input delivery failed).
 
 ### Error Responses
 

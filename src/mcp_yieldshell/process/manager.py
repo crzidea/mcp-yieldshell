@@ -38,6 +38,7 @@ class ProcessManager:
         self._config = config
         self._processes: dict[str, ManagedProcess] = {}
         self._pending_spawns = 0
+        self._pending_spawn_tasks: set[asyncio.Task[Any]] = set()
         self._shutdown_lock = asyncio.Lock()
         self._shutdown_requested = False
         self._shutdown_complete = False
@@ -49,6 +50,29 @@ class ProcessManager:
                 if self._pending_spawns == 0:
                     return
             await asyncio.sleep(0.01)
+
+    async def _cancel_pending_spawns(self) -> None:
+        """Cancel and settle spawn calls that exceeded the shutdown wait."""
+        current = asyncio.current_task()
+        async with self._shutdown_lock:
+            tasks = [
+                task
+                for task in self._pending_spawn_tasks
+                if task is not current and not task.done()
+            ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _release_spawn_reservation(
+        self, spawn_owner: asyncio.Task[Any] | None
+    ) -> None:
+        """Release capacity without introducing a cancellation point."""
+        if spawn_owner is None or spawn_owner not in self._pending_spawn_tasks:
+            return
+        self._pending_spawns -= 1
+        self._pending_spawn_tasks.discard(spawn_owner)
 
     async def _reject_spawned_process(
         self,
@@ -165,9 +189,17 @@ class ProcessManager:
         if mp is None:
             return
         current = asyncio.current_task()
-        for task in (mp.timeout_task, mp.group_watch_task):
+        for task in (mp.timeout_task, mp.group_watch_task, mp.stdin_task):
             if task is not None and task is not current and not task.done():
                 task.cancel()
+
+    @staticmethod
+    def _with_stdin_error(
+        mp: ManagedProcess, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        if mp.stdin_error is not None:
+            result["stdin_error"] = mp.stdin_error
+        return result
 
     async def exec_command(
         self,
@@ -239,6 +271,9 @@ class ProcessManager:
                     ),
                 }
             self._pending_spawns += 1
+            spawn_owner = asyncio.current_task()
+            if spawn_owner is not None:
+                self._pending_spawn_tasks.add(spawn_owner)
 
         try:
             env = build_env(self._config, env_overlay)
@@ -249,12 +284,11 @@ class ProcessManager:
                 command, cwd=resolved_cwd, env=env, shell=shell
             )
         except asyncio.CancelledError:
+            self._release_spawn_reservation(spawn_owner)
             raise
         except Exception as exc:
+            self._release_spawn_reservation(spawn_owner)
             return {"status": "failed_to_start", "error": str(exc)}
-        finally:
-            async with self._shutdown_lock:
-                self._pending_spawns -= 1
 
         process_group_id = self._get_process_group_id(proc)
         process_id = self._new_id()
@@ -293,12 +327,26 @@ class ProcessManager:
         ]
         mp.drain_stdout, mp.drain_stderr = drain_tasks
 
-        async with self._shutdown_lock:
-            if self._shutdown_complete or self._shutdown_requested:
-                await self._reject_spawned_process(proc, process_group_id, drain_tasks)
-                return self._shutdown_reject_response()
-            # Register before any post-spawn await so shutdown can always find the process.
-            self._processes[process_id] = mp
+        try:
+            async with self._shutdown_lock:
+                reject_for_shutdown = (
+                    self._shutdown_complete or self._shutdown_requested
+                )
+                if not reject_for_shutdown:
+                    # Register before releasing the pending-spawn reservation so
+                    # shutdown can find every subprocess throughout the handoff.
+                    self._processes[process_id] = mp
+                self._release_spawn_reservation(spawn_owner)
+        except asyncio.CancelledError:
+            self._release_spawn_reservation(spawn_owner)
+            await asyncio.shield(
+                self._reject_spawned_process(proc, process_group_id, drain_tasks)
+            )
+            raise
+
+        if reject_for_shutdown:
+            await self._reject_spawned_process(proc, process_group_id, drain_tasks)
+            return self._shutdown_reject_response()
 
         mp.completion_task = asyncio.create_task(
             self._track_completion(proc, mp), name=f"completion-{process_id}"
@@ -310,17 +358,18 @@ class ProcessManager:
                 name=f"timeout-{process_id}",
             )
 
-        # Write initial input, then close by default so EOF-driven commands finish.
-        try:
-            if stdin is not None:
-                if proc.stdin is not None:
-                    proc.stdin.write(stdin.encode("utf-8"))
-                    await proc.stdin.drain()
-        except Exception:
-            pass
-        finally:
-            if close_stdin:
-                self._close_stdin(mp)
+        # Initial input is tracked independently so pipe backpressure cannot
+        # prevent exec from honoring its auto-yield deadline.
+        if stdin is not None:
+            mp.stdin_task = asyncio.create_task(
+                self._write_initial_input(mp, stdin, close_stdin),
+                name=f"stdin-{process_id}",
+            )
+            # Let immediately successful writes and failures settle before the
+            # response path without waiting for a backpressured pipe.
+            await asyncio.sleep(0)
+        elif close_stdin:
+            self._close_stdin(mp)
 
         # Wait up to yield_ms for completion
         try:
@@ -355,10 +404,10 @@ class ProcessManager:
             }
             if truncated and self._processes.get(process_id) is mp:
                 result["process_id"] = process_id
-            return result
+            return self._with_stdin_error(mp, result)
 
         if mp.info.status == ProcessStatus.TIMED_OUT:
-            return {
+            return self._with_stdin_error(mp, {
                 "status": "timed_out",
                 "process_id": process_id,
                 "exit_code": mp.info.exit_code,
@@ -367,10 +416,10 @@ class ProcessManager:
                 "stdout": stdout_text,
                 "stderr": stderr_text,
                 "truncated": truncated,
-            }
+            })
 
         if mp.info.status == ProcessStatus.STOPPED:
-            return {
+            return self._with_stdin_error(mp, {
                 "status": "stopped",
                 "process_id": process_id,
                 "exit_code": mp.info.exit_code,
@@ -379,10 +428,10 @@ class ProcessManager:
                 "stdout": stdout_text,
                 "stderr": stderr_text,
                 "truncated": truncated,
-            }
+            })
 
         if mp.info.status == ProcessStatus.FAILED:
-            return {
+            return self._with_stdin_error(mp, {
                 "status": "failed",
                 "process_id": process_id,
                 "exit_code": mp.info.exit_code,
@@ -391,10 +440,10 @@ class ProcessManager:
                 "stdout": stdout_text,
                 "stderr": stderr_text,
                 "truncated": truncated,
-            }
+            })
 
         # Still running — background it
-        return {
+        return self._with_stdin_error(mp, {
             "status": "backgrounded",
             "process_id": process_id,
             "pid": mp.info.pid,
@@ -403,7 +452,25 @@ class ProcessManager:
             "stderr": stderr_text,
             "truncated": truncated,
             "message": "Process is running in the background. Use read/wait/stop with process_id.",
-        }
+        })
+
+    async def _write_initial_input(
+        self, mp: ManagedProcess, input_data: str, close_stdin: bool
+    ) -> None:
+        stdin = mp.proc.stdin
+        try:
+            if stdin is None:
+                mp.stdin_error = "Process stdin is unavailable"
+                return
+            stdin.write(input_data.encode("utf-8"))
+            await stdin.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            mp.stdin_error = str(exc)
+        finally:
+            if close_stdin:
+                self._close_stdin(mp)
 
     def _get_process_group_id(self, proc: asyncio.subprocess.Process) -> int | None:
         if sys.platform == "win32" or proc.pid is None:
@@ -694,7 +761,7 @@ class ProcessManager:
         }
         for stream, text in data["texts"].items():
             result[stream] = self._redact(mp, text)
-        return result
+        return self._with_stdin_error(mp, result)
 
     async def write_input(
         self,
@@ -724,14 +791,32 @@ class ProcessManager:
                 "ok": False,
                 "error": "Process stdin is closed",
             }
+        if mp.stdin_task is not None and not mp.stdin_task.done():
+            return {
+                "process_id": process_id,
+                "ok": False,
+                "error": "Initial stdin write is still in progress",
+            }
 
         try:
             data = input_data.encode("utf-8")
             if newline:
                 data += b"\n"
             mp.proc.stdin.write(data)
-            await mp.proc.stdin.drain()
+            await asyncio.wait_for(
+                mp.proc.stdin.drain(),
+                timeout=MAX_EFFECTIVE_WAIT_MS / 1000.0,
+            )
             return {"process_id": process_id, "ok": True}
+        except asyncio.TimeoutError:
+            return {
+                "process_id": process_id,
+                "ok": False,
+                "error": (
+                    "Timed out waiting for process stdin to accept input "
+                    f"after {MAX_EFFECTIVE_WAIT_MS}ms"
+                ),
+            }
         except Exception as exc:
             return {"process_id": process_id, "ok": False, "error": str(exc)}
         finally:
@@ -775,7 +860,7 @@ class ProcessManager:
         effective_max = self._max_output(max_output_bytes)
         snapshot = self._read_snapshot(mp, effective_max)
 
-        return {
+        return self._with_stdin_error(mp, {
             "process_id": process_id,
             "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
@@ -784,7 +869,7 @@ class ProcessManager:
             "stderr": snapshot["stderr"],
             "next_seq": snapshot["next_seq"],
             "truncated": snapshot["truncated"],
-        }
+        })
 
     async def stop_process(
         self,
@@ -910,6 +995,7 @@ class ProcessManager:
                     ),
                     "stdout_bytes": mp.stdout_buf.byte_count,
                     "stderr_bytes": mp.stderr_buf.byte_count,
+                    "stdin_error": mp.stdin_error,
                 }
             )
         processes.reverse()  # Most recent first
@@ -954,6 +1040,7 @@ class ProcessManager:
             self._shutdown_requested = True
 
         await self._wait_for_no_pending_spawns()
+        await self._cancel_pending_spawns()
 
         while True:
             live = [
@@ -1013,6 +1100,8 @@ class ProcessManager:
                     mp.completion_task.cancel()
                 if mp.group_watch_task is not None and not mp.group_watch_task.done():
                     mp.group_watch_task.cancel()
+                if mp.stdin_task is not None and not mp.stdin_task.done():
+                    mp.stdin_task.cancel()
                 self._close_output_pipes(mp)
                 if id(mp) in running_at_start and mp.info.status in (
                     ProcessStatus.RUNNING,
@@ -1029,7 +1118,12 @@ class ProcessManager:
             tasks = [
                 task
                 for mp in live
-                for task in (mp.timeout_task, mp.completion_task, mp.group_watch_task)
+                for task in (
+                    mp.timeout_task,
+                    mp.completion_task,
+                    mp.group_watch_task,
+                    mp.stdin_task,
+                )
                 if task is not None
             ]
             if tasks:
