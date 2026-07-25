@@ -50,13 +50,10 @@ class TestConfigDefaults:
         config = Config()
         assert config.allow_command_regex is None
 
-    def test_default_redact_regex(self):
+    def test_redact_regex_is_disabled_by_default(self):
         config = Config()
-        assert config.redact_env_regex is not None
-        assert config.redact_env_regex.search("MY_TOKEN")
-        assert config.redact_env_regex.search("API_KEY")
-        assert config.redact_env_regex.search("MY_SECRET")
-        assert config.redact_env_regex.search("DB_PASSWORD")
+        assert config.redact_env_regex is None
+        assert config.sensitive_env == ()
 
 
 class TestConfigFromEnv:
@@ -95,6 +92,9 @@ class TestConfigFromEnv:
         assert config.max_retained_processes == 100
 
     def test_sensitive_environment_is_snapshotted_and_ordered(self, monkeypatch):
+        monkeypatch.setenv(
+            "YIELDSHELL_REDACT_ENV_REGEX", r"TOKEN|KEY|SECRET|PASSWORD"
+        )
         monkeypatch.setenv("SHORT_SECRET", "1234567")
         monkeypatch.setenv("INNER_SECRET", "abcdefgh")
         monkeypatch.setenv("OUTER_SECRET", "xxabcdefghyy")

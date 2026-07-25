@@ -39,7 +39,7 @@ graph TD
 
 Whenever a command is executed, `ProcessManager` schedules several async tasks:
 
-1. **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks, decode UTF-8 incrementally, redact configured secrets across chunk boundaries, and write sanitized bytes to the corresponding `RingBuffer`. They must complete draining before a process is marked as fully completed.
+1. **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks, decode UTF-8 incrementally, optionally redact secrets selected by `YIELDSHELL_REDACT_ENV_REGEX` across chunk boundaries, and write the resulting bytes to the corresponding `RingBuffer`. Redaction is disabled by default. The tasks must complete draining before a process is marked as fully completed.
 2. **Completion Tracker** (`completion-<id>`): Waits for the process to exit using `await proc.wait()`, waits for outstanding drain tasks to finish, and sets the final exit code, signal info, and state transitions.
 3. **Timeout Handler** (`timeout-<id>`): Scheduled if `timeout_ms` is set. After sleeping, if the process is still running, it escalates from `SIGTERM` (graceful) to `SIGKILL` (forced) to clean up hung tasks. To prevent resource leaks, this task is cancelled immediately once the process exits naturally or is stopped.
 4. **Server Shutdown Path**: `ProcessManager.shutdown()` is invoked from the FastMCP lifespan finally block (`src/mcp_yieldshell/server.py`) and is responsible for idempotently terminating all live process groups with a bounded graceful phase, force-killing survivors, draining final output, and settling completion tasks.

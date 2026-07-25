@@ -49,16 +49,17 @@ class Config:
         self.allow_command_regex: re.Pattern[str] | None = _parse_regex(
             os.environ.get("YIELDSHELL_ALLOW_COMMAND_REGEX", "")
         )
-        self.redact_env_regex: re.Pattern[str] = _parse_regex_required(
-            os.environ.get("YIELDSHELL_REDACT_ENV_REGEX", ""),
-            r"TOKEN|KEY|SECRET|PASSWORD",
+        self.redact_env_regex: re.Pattern[str] | None = _parse_regex(
+            os.environ.get("YIELDSHELL_REDACT_ENV_REGEX", "")
         )
         self.sensitive_env: tuple[tuple[str, str], ...] = tuple(
             sorted(
                 (
                     (name, value)
                     for name, value in os.environ.items()
-                    if self.redact_env_regex.search(name) and len(value) >= 8
+                    if self.redact_env_regex is not None
+                    and self.redact_env_regex.search(name)
+                    and len(value) >= 8
                 ),
                 key=lambda item: (-len(item[1]), item[0], item[1]),
             )
@@ -96,12 +97,6 @@ def _parse_positive_int(value: str, default: int) -> int:
 def _parse_regex(value: str) -> re.Pattern[str] | None:
     if not value:
         return None
-    return re.compile(value)
-
-
-def _parse_regex_required(value: str, default: str) -> re.Pattern[str]:
-    if not value:
-        return re.compile(default)
     return re.compile(value)
 
 

@@ -495,6 +495,12 @@ class TestSecurityConfig:
 
 
 class TestRedaction:
+    @pytest.fixture(autouse=True)
+    def _enable_redaction(self, monkeypatch):
+        monkeypatch.setenv(
+            "YIELDSHELL_REDACT_ENV_REGEX", r"TOKEN|KEY|SECRET|PASSWORD"
+        )
+
     @pytest.mark.asyncio
     async def test_env_value_redacted(self, monkeypatch):
         monkeypatch.setenv("MY_SECRET_KEY", "supersecret123")
@@ -562,6 +568,21 @@ class TestRedaction:
         assert "[REDACTED:API_TOKEN]" in read_result["stdout"]
         assert "[REDACTED:API_TOKEN]" in wait_result["stdout"]
         assert listed["name"] == "[REDACTED:API_TOKEN]"
+
+
+@pytest.mark.asyncio
+async def test_environment_output_is_not_redacted_by_default(monkeypatch):
+    monkeypatch.setenv("MY_SECRET_KEY", "supersecret123")
+    manager = ProcessManager(Config())
+    command = (
+        f"{sys.executable} -c "
+        "\"import os; print(os.environ.get('MY_SECRET_KEY', ''))\""
+    )
+
+    result = await manager.exec_command(command, side_effects=NONE)
+
+    assert result["status"] == "completed"
+    assert "supersecret123" in result["stdout"]
 
 
 

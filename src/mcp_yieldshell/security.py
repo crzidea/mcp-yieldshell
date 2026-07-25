@@ -118,7 +118,7 @@ def collect_sensitive_env(
 ) -> SensitiveEnv:
     """Return startup secrets plus sensitive values supplied in an overlay."""
     selected = list(config.sensitive_env)
-    if overlay:
+    if overlay and config.redact_env_regex is not None:
         selected.extend(
             (name, value)
             for name, value in overlay.items()

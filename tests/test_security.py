@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 from mcp_yieldshell.config import Config
 from mcp_yieldshell.security import (
     StreamingRedactor,
@@ -150,7 +152,22 @@ class TestBuildEnv:
         assert "PATH" in env
 
 
+def test_redaction_is_disabled_by_default(monkeypatch):
+    monkeypatch.setenv("MY_SECRET", "secretvalue123")
+    config = Config()
+
+    assert redact_text(config, "output with secretvalue123 inside") == (
+        "output with secretvalue123 inside"
+    )
+
+
 class TestRedactText:
+    @pytest.fixture(autouse=True)
+    def _enable_redaction(self, monkeypatch):
+        monkeypatch.setenv(
+            "YIELDSHELL_REDACT_ENV_REGEX", r"TOKEN|KEY|SECRET|PASSWORD"
+        )
+
     def test_redacts_matching_env_values(self, monkeypatch):
         monkeypatch.setenv("MY_SECRET", "secretvalue123")
         config = Config()
@@ -229,8 +246,9 @@ class TestRedactText:
         result = redact_text(config, f"prefix {decoy} suffix")
         assert result == f"prefix {decoy} suffix"
 
-    def test_default_regex_matches_token(self):
+    def test_configured_regex_matches_token(self):
         config = Config()
+        assert config.redact_env_regex is not None
         assert config.redact_env_regex.search("API_TOKEN")
         assert config.redact_env_regex.search("PRIVATE_KEY")
 

@@ -634,6 +634,10 @@ class TestShutdownSpawnRace:
 
 
 class TestRedactionAcrossTools:
+    @pytest.fixture(autouse=True)
+    def _enable_redaction(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_REDACT_ENV_REGEX", "SECRET")
+
     @pytest.mark.asyncio
     async def test_read_and_wait_do_not_redact_unrelated_truncated_suffixes(
         self, monkeypatch
