@@ -166,9 +166,13 @@ def read_buffers(
             capped = True
             break
 
-    global_next = next(iter(buffers.values())).next_seq if buffers else 1
     if not capped:
-        next_seq = global_next
+        cursor = 1 if since_seq is None else since_seq
+        covered_ends = [start + len(data) for start, _, data in segments]
+        covered_ends.extend(
+            buffer._evicted_until_seq or cursor for buffer in buffers.values()
+        )
+        next_seq = max(covered_ends, default=cursor)
     elif next_seq is None:
         next_seq = 1 if since_seq is None else since_seq
 

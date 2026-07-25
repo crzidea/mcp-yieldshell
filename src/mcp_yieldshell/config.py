@@ -44,13 +44,16 @@ class Config:
             DEFAULT_MAX_RETAINED_PROCESSES,
         )
         self.deny_command_regex: re.Pattern[str] | None = _parse_regex(
-            os.environ.get("YIELDSHELL_DENY_COMMAND_REGEX", "")
+            "YIELDSHELL_DENY_COMMAND_REGEX",
+            os.environ.get("YIELDSHELL_DENY_COMMAND_REGEX", ""),
         )
         self.allow_command_regex: re.Pattern[str] | None = _parse_regex(
-            os.environ.get("YIELDSHELL_ALLOW_COMMAND_REGEX", "")
+            "YIELDSHELL_ALLOW_COMMAND_REGEX",
+            os.environ.get("YIELDSHELL_ALLOW_COMMAND_REGEX", ""),
         )
         self.redact_env_regex: re.Pattern[str] | None = _parse_regex(
-            os.environ.get("YIELDSHELL_REDACT_ENV_REGEX", "")
+            "YIELDSHELL_REDACT_ENV_REGEX",
+            os.environ.get("YIELDSHELL_REDACT_ENV_REGEX", ""),
         )
         self.sensitive_env: tuple[tuple[str, str], ...] = tuple(
             sorted(
@@ -94,10 +97,15 @@ def _parse_positive_int(value: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _parse_regex(value: str) -> re.Pattern[str] | None:
+def _parse_regex(variable: str, value: str) -> re.Pattern[str] | None:
     if not value:
         return None
-    return re.compile(value)
+    try:
+        return re.compile(value)
+    except re.error as exc:
+        raise ValueError(
+            f"{variable} contains invalid regular expression {value!r}: {exc}"
+        ) from exc
 
 
 def _parse_blocked_side_effects(value: str) -> frozenset[SideEffect]:

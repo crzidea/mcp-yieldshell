@@ -161,6 +161,14 @@ def test_redaction_is_disabled_by_default(monkeypatch):
     )
 
 
+def test_streaming_redactor_empty_secret_fast_path_does_not_buffer_markers():
+    redactor = StreamingRedactor(())
+    text = "x" * 1_000_000 + "[REDACTED:UNFINISHED"
+
+    assert redactor.feed(text) is text
+    assert redactor.feed("", final=True) == ""
+
+
 class TestRedactText:
     @pytest.fixture(autouse=True)
     def _enable_redaction(self, monkeypatch):
@@ -279,3 +287,16 @@ class TestRedactText:
         )
 
         assert output == "[REDACTED:MY_SECRET]"
+
+    def test_streaming_redactor_redacts_marker_shaped_secret(self):
+        redactor = StreamingRedactor((("EVIL", "[REDACTED:TOKEN]"),))
+
+        assert redactor.feed("[REDACTED:TOKEN]") == "[REDACTED:EVIL]"
+        assert redactor.feed("", final=True) == ""
+
+    def test_streaming_redactor_handles_large_unrelated_chunks(self):
+        redactor = StreamingRedactor((("API_TOKEN", "secret-value"),))
+        text = "ordinary output " * 50_000
+
+        assert redactor.feed(text) == text
+        assert redactor.feed("", final=True) == ""

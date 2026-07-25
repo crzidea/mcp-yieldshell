@@ -78,6 +78,42 @@ class TestTerminalStateAccuracy:
         assert managed.info.status == ProcessStatus.RUNNING
 
 
+class TestDrainLifecycle:
+    @pytest.mark.asyncio
+    async def test_timed_out_drains_close_abandoned_pipe_transports(self):
+        manager = ProcessManager(Config())
+        process = MagicMock()
+        process.pid = None
+        process.returncode = 0
+        process.stdin = None
+        process.stdout = MagicMock()
+        process.stderr = MagicMock()
+        info = ProcessInfo(
+            process_id="proc_pipes",
+            pid=None,
+            command="child",
+            cwd=os.getcwd(),
+            name=None,
+            status=ProcessStatus.COMPLETED,
+            started_at=time.time(),
+            start_monotonic=time.monotonic(),
+        )
+        managed = ManagedProcess(info, process, 100)
+
+        async def blocked_drain():
+            await asyncio.Event().wait()
+
+        managed.drain_stdout = asyncio.create_task(blocked_drain())
+        managed.drain_stderr = asyncio.create_task(blocked_drain())
+
+        await manager._drain_with_timeout(managed, timeout_sec=0.01)
+
+        assert managed.drain_stdout.cancelled()
+        assert managed.drain_stderr.cancelled()
+        process.stdout._transport.close.assert_called_once_with()
+        process.stderr._transport.close.assert_called_once_with()
+
+
 class TestAutomaticRetention:
     @pytest.mark.asyncio
     async def test_zero_cap_is_enforced_after_completion(self, monkeypatch):
@@ -89,6 +125,23 @@ class TestAutomaticRetention:
         assert result["status"] == "completed"
         assert "returned" in result["stdout"]
         assert manager.list_processes()["processes"] == []
+
+    @pytest.mark.asyncio
+    async def test_zero_cap_does_not_return_dangling_truncated_process_id(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("YIELDSHELL_MAX_RETAINED_PROCESSES", "0")
+        manager = ProcessManager(Config())
+
+        result = await manager.exec_command(
+            "seq 1 20000",
+            max_output_bytes=100,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "completed"
+        assert result["truncated"] is True
+        assert "process_id" not in result
 
     @pytest.mark.asyncio
     async def test_reaps_every_terminal_state_and_ids_become_unknown(self, monkeypatch):

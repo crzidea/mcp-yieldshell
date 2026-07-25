@@ -62,6 +62,11 @@ class ProcessManager:
         if drain_tasks:
             await asyncio.gather(*drain_tasks, return_exceptions=True)
         await kill_process(proc, process_group_id)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        self._close_process_pipes(proc)
 
     def _shutdown_reject_response(self) -> dict[str, Any]:
         return {"status": "failed_to_start", "error": _SHUTDOWN_REJECT_ERROR}
@@ -104,6 +109,12 @@ class ProcessManager:
         if requested is None:
             return self._config.default_timeout_ms
         return max(0, requested)
+
+    @staticmethod
+    def _clamp_stop_grace_ms(requested: int) -> int:
+        reserved_ms = PROCESS_GROUP_EXIT_MS + FINAL_DRAIN_MS + 1_000
+        max_grace_ms = max(0, MAX_EFFECTIVE_WAIT_MS - reserved_ms)
+        return max(0, min(requested, max_grace_ms))
 
     @staticmethod
     def _is_terminal(mp: ManagedProcess) -> bool:
@@ -333,7 +344,7 @@ class ProcessManager:
             mp.info.status == ProcessStatus.COMPLETED
             and not self._has_live_work(mp)
         ):
-            return {
+            result: dict[str, Any] = {
                 "status": "completed",
                 "exit_code": mp.info.exit_code,
                 "signal": mp.info.signal,
@@ -342,6 +353,9 @@ class ProcessManager:
                 "stderr": stderr_text,
                 "truncated": truncated,
             }
+            if truncated and self._processes.get(process_id) is mp:
+                result["process_id"] = process_id
+            return result
 
         if mp.info.status == ProcessStatus.TIMED_OUT:
             return {
@@ -559,11 +573,42 @@ class ProcessManager:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self._close_output_pipes(mp)
+
+    async def _settle_completion(self, mp: ManagedProcess) -> None:
+        """Give the completion tracker time to reap an exited subprocess."""
+        task = mp.completion_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=1.0,
+            )
+        except asyncio.TimeoutError:
+            # The process group is checked by the caller. Keep the tracker alive
+            # so a delayed platform transport can still be reaped later.
+            pass
 
     def _cancel_drains(self, mp: ManagedProcess) -> None:
         for task in (mp.drain_stdout, mp.drain_stderr):
             if task is not None and not task.done():
                 task.cancel()
+        self._close_output_pipes(mp)
+
+    @staticmethod
+    def _close_output_pipes(mp: ManagedProcess) -> None:
+        """Close subprocess read transports after bounded capture is abandoned."""
+        ProcessManager._close_process_pipes(mp.proc)
+
+    @staticmethod
+    def _close_process_pipes(proc: asyncio.subprocess.Process) -> None:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is None:
+                continue
+            transport = getattr(stream, "_transport", None)
+            if transport is not None:
+                transport.close()
 
     def _exit_signal(self, proc: asyncio.subprocess.Process) -> str | None:
         """Determine signal name from process returncode on POSIX."""
@@ -784,7 +829,9 @@ class ProcessManager:
             await terminate_process(mp.proc)
 
         # Wait for grace period
-        effective_force_ms = max(0, min(force_after_ms, MAX_EFFECTIVE_WAIT_MS))
+        # Reserve time for force-kill observation, final drain, and subprocess
+        # reaping so the complete stop request stays transport-safe.
+        effective_force_ms = self._clamp_stop_grace_ms(force_after_ms)
         await self._wait_for_process_group_exit(
             mp, timeout_sec=effective_force_ms / 1000.0
         )
@@ -804,6 +851,12 @@ class ProcessManager:
                 "signal": signal_name,
                 "error": "Process group did not stop after force kill",
             }
+
+        # A fast graceful exit can make the process group disappear before the
+        # completion tracker has reaped the subprocess transport or finished
+        # draining its pipes. Settle it before reporting a completed stop.
+        await self._drain_with_timeout(mp, timeout_sec=FINAL_DRAIN_MS / 1000.0)
+        await self._settle_completion(mp)
 
         # If the process exited due to our signal, mark it as STOPPED.
         # _track_completion may have set COMPLETED, but since we initiated
@@ -948,6 +1001,10 @@ class ProcessManager:
                 ),
                 return_exceptions=True,
             )
+            await asyncio.gather(
+                *(self._settle_completion(mp) for mp in live),
+                return_exceptions=True,
+            )
 
             for mp in live:
                 if mp.timeout_task is not None and not mp.timeout_task.done():
@@ -956,6 +1013,7 @@ class ProcessManager:
                     mp.completion_task.cancel()
                 if mp.group_watch_task is not None and not mp.group_watch_task.done():
                     mp.group_watch_task.cancel()
+                self._close_output_pipes(mp)
                 if id(mp) in running_at_start and mp.info.status in (
                     ProcessStatus.RUNNING,
                     ProcessStatus.COMPLETED,

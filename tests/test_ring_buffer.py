@@ -205,6 +205,7 @@ class TestRingBufferUTF8:
         result = buf.read()
 
         assert result["text"] == ""
+        assert result["next_seq"] == 4
         assert result["truncated"] is True
 
     def test_utf8_split_across_append_chunks_remains_lossless(self):
@@ -294,3 +295,25 @@ class TestRingBufferSharedSeq:
             9,
             10,
         ]
+
+    def test_uncapped_single_stream_cursor_does_not_skip_trailing_other_stream(self):
+        seq_source = [1]
+        stdout_buf = RingBuffer(100, seq_source=seq_source)
+        stderr_buf = RingBuffer(100, seq_source=seq_source)
+        stdout_buf.append(b"OUT1\nOUT2\n")
+        stderr_buf.append(b"ERR1\nERR2\n")
+
+        stdout_only = read_buffers(
+            {"stdout": stdout_buf},
+            since_seq=None,
+            max_bytes=100,
+        )
+        remainder = read_buffers(
+            {"stdout": stdout_buf, "stderr": stderr_buf},
+            since_seq=stdout_only["next_seq"],
+            max_bytes=100,
+        )
+
+        assert stdout_only["next_seq"] == 11
+        assert remainder["texts"] == {"stdout": "", "stderr": "ERR1\nERR2\n"}
+        assert remainder["truncated"] is False

@@ -167,7 +167,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * Inline code execution: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["RUNS_INLINE_CODE"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=`.
 
 * **Output Statuses**:
-  * `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr.
+  * `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr. If the response is truncated and terminal-process retention is enabled, it also returns `process_id` so retained output can be inspected with `read`.
   * `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, a snapshot of initial stdout/stderr, `duration_ms`, `truncated`, and a `message` string describing that the process is running in the background.
   * `timed_out`: Process exceeded `timeout_ms` and was terminated.
   * `stopped`: Process was explicitly terminated.
@@ -213,7 +213,7 @@ Gracefully terminate or force kill a running process.
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
   * `signal` (string, default: `"SIGTERM"`): OS signal to send (e.g. `SIGTERM`, `SIGKILL`, `SIGINT`). Invalid names are rejected without stopping the process. Valid names are ignored on Windows.
-  * `force_after_ms` (integer, default: `10000`): Grace period before escalating to force kill (`SIGKILL`), capped at the transport-safe 55-second ceiling.
+  * `force_after_ms` (integer, default: `10000`): Grace period before escalating to force kill (`SIGKILL`). It is clamped below the transport-safe 55-second request ceiling so force-kill observation, final output drain, and subprocess reaping still fit within the request.
 
 ### `ps`
 List all managed processes.
@@ -244,8 +244,8 @@ Prune completed, stopped, timed-out, and failed process records to free memory.
 To avoid sending duplicate data over the MCP protocol (which can consume context window space), the server implements a byte-position polling protocol:
 
 1. Every stdout/stderr byte receives a unique position in a cursor shared by both streams.
-2. `read` returns `next_seq`, the position immediately after the bytes actually returned. A response cap can therefore end safely inside a drain chunk.
-3. To retrieve the next output without gaps, call `read` with `since_seq` set to the previously returned `next_seq`.
+2. `read` returns `next_seq`, the position immediately after the selected-stream range covered by the response. A response cap can therefore end safely inside a drain chunk.
+3. To retrieve the next output without gaps, call `read` with `since_seq` set to the previously returned `next_seq` and keep the same `streams` selection.
 4. Omitting `since_seq` returns the entire contents currently stored in the buffer (clamped by `max_output_bytes`).
 5. If output exceeds the ring buffer's capacity between reads, older data is evicted and `since_seq` may no longer be available. In that case, `truncated` is set to `true` and the read returns data from the earliest retained position onward. Later reads report truncation only when their requested range overlaps evicted data.
 
@@ -272,9 +272,9 @@ Configure the server by setting these environment variables prior to launch:
 | `YIELDSHELL_DEFAULT_TIMEOUT_MS` | `3600000` | Default hard runtime limit (1 hour). An explicit tool argument of `0` means no limit. |
 | `YIELDSHELL_PROCESS_RETENTION_MS` | `3600000` | Age after which terminal process records are reaped before a valid spawn. Zero requests immediate age-based reaping. Negative or nonnumeric values use the default. |
 | `YIELDSHELL_MAX_RETAINED_PROCESSES` | `100` | Maximum retained terminal records after age reaping; oldest records are removed first. Zero retains no prior terminal records. Negative or nonnumeric values use the default. Running records are excluded. |
-| `YIELDSHELL_DENY_COMMAND_REGEX` | *(none)* | A regular expression pattern. Commands matching this pattern are blocked before starting. |
-| `YIELDSHELL_ALLOW_COMMAND_REGEX` | *(none)* | A regular expression pattern. If set, only commands matching this pattern are permitted. |
-| `YIELDSHELL_REDACT_ENV_REGEX` | *(none)* | Optional regex identifying sensitive environment variable names. When configured, matching non-empty values of at least 8 characters are snapshotted at startup and redacted in stdout/stderr outputs. |
+| `YIELDSHELL_DENY_COMMAND_REGEX` | *(none)* | A regular expression pattern. Commands matching this pattern are blocked before starting. Invalid patterns cause startup to fail with a configuration error naming this variable. |
+| `YIELDSHELL_ALLOW_COMMAND_REGEX` | *(none)* | A regular expression pattern. If set, only commands matching this pattern are permitted. Invalid patterns cause startup to fail with a configuration error naming this variable. |
+| `YIELDSHELL_REDACT_ENV_REGEX` | *(none)* | Optional regex identifying sensitive environment variable names. When configured, matching non-empty values of at least 8 characters are snapshotted at startup and redacted in stdout/stderr outputs. Invalid patterns cause startup to fail with a configuration error naming this variable. |
 | `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS` | `KILLS_AGENT_PROCESS,MODIFIES_OS_SETTINGS,MODIFIES_OS_USER_SETTINGS,MODIFIES_PROTECTED_FILES,RUNS_INLINE_CODE` | Comma-separated list of `side_effects` enum names the server should reject. Names are case-sensitive. Surrounding whitespace is trimmed and empty entries are ignored. Invalid names cause startup to fail. Set to `,` (or any value that resolves to no entries) to clear the default blocklist. |
 
 ---

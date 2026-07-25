@@ -126,6 +126,20 @@ class TestConfigFromEnv:
         assert config.allow_command_regex.search("git status")
         assert not config.allow_command_regex.search("ls -la")
 
+    @pytest.mark.parametrize(
+        "variable",
+        [
+            "YIELDSHELL_DENY_COMMAND_REGEX",
+            "YIELDSHELL_ALLOW_COMMAND_REGEX",
+            "YIELDSHELL_REDACT_ENV_REGEX",
+        ],
+    )
+    def test_invalid_regex_names_variable(self, monkeypatch, variable):
+        monkeypatch.setenv(variable, "[")
+
+        with pytest.raises(ValueError, match=variable):
+            Config()
+
     def test_allowed_cwds(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_ALLOWED_CWDS", "/tmp:/home")
         config = Config()

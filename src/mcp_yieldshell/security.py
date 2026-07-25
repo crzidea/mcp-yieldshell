@@ -23,54 +23,71 @@ class StreamingRedactor:
     def __init__(self, sensitive_env: SensitiveEnv) -> None:
         self._sensitive_env = sensitive_env
         self._pending = ""
+        self._secret_names: dict[str, str] = {}
+        values: list[str] = []
+        for name, value in sensitive_env:
+            if value not in self._secret_names:
+                self._secret_names[value] = name
+                values.append(value)
+        if values:
+            secrets_pattern = "|".join(re.escape(value) for value in values)
+            self._scan_re: re.Pattern[str] | None = re.compile(
+                rf"(?P<secret>{secrets_pattern})|"
+                rf"(?P<marker>{_REDACTED_MARKER_RE.pattern})"
+            )
+        else:
+            self._scan_re = None
 
     def feed(self, text: str, *, final: bool = False) -> str:
+        if not self._sensitive_env:
+            # Marker handling only protects markers emitted by redaction. With no
+            # secrets selected there is nothing to redact or carry across chunks.
+            return text
+
         self._pending += text
-        output: list[str] = []
-        position = 0
-        while position < len(self._pending):
-            secret = next(
-                (
-                    (name, value)
-                    for name, value in self._sensitive_env
-                    if self._pending.startswith(value, position)
-                ),
-                None,
-            )
-            if secret is not None:
-                name, value = secret
-                output.append(f"[REDACTED:{name}]")
-                position += len(value)
-                continue
+        retained = 0 if final else self._incomplete_suffix_length()
+        ready_end = len(self._pending) - retained
+        ready = self._pending[:ready_end]
+        self._pending = self._pending[ready_end:]
+        if not ready:
+            return ""
 
-            marker = _REDACTED_MARKER_RE.match(self._pending, position)
-            if marker is not None:
-                output.append(marker.group(0))
-                position = marker.end()
-                continue
+        assert self._scan_re is not None
 
-            suffix = self._pending[position:]
-            incomplete_marker = (
-                _MARKER_PREFIX.startswith(suffix)
-                or (
-                    suffix.startswith(_MARKER_PREFIX)
-                    and "]" not in suffix
-                    and len(suffix) <= _MAX_PENDING_MARKER
-                )
-            )
-            if not final and (
-                incomplete_marker
-                or any(
-                    value.startswith(suffix) for _, value in self._sensitive_env
-                )
+        def replace(match: re.Match[str]) -> str:
+            if match.lastgroup == "marker":
+                return match.group(0)
+            value = match.group(0)
+            return f"[REDACTED:{self._secret_names[value]}]"
+
+        return self._scan_re.sub(replace, ready)
+
+    def _incomplete_suffix_length(self) -> int:
+        """Return the longest suffix that may complete a secret or marker."""
+        pending = self._pending
+        retained = 0
+        for _, value in self._sensitive_env:
+            limit = min(len(value) - 1, len(pending))
+            for length in range(limit, retained, -1):
+                if pending.endswith(value[:length]):
+                    retained = length
+                    break
+
+        marker_start = pending.rfind(_MARKER_PREFIX)
+        if marker_start >= 0:
+            marker_suffix = pending[marker_start:]
+            if (
+                "]" not in marker_suffix
+                and len(marker_suffix) <= _MAX_PENDING_MARKER
             ):
+                retained = max(retained, len(marker_suffix))
+
+        limit = min(len(_MARKER_PREFIX) - 1, len(pending))
+        for length in range(limit, retained, -1):
+            if pending.endswith(_MARKER_PREFIX[:length]):
+                retained = length
                 break
-
-            output.append(self._pending[position])
-            position += 1
-
-        self._pending = self._pending[position:]
-        return "".join(output)
+        return retained
 
 
 def validate_command(config: Config, command: str) -> str | None:
@@ -139,6 +156,8 @@ def redact_text(
 ) -> str:
     """Best-effort redaction of sensitive environment values from text."""
     selected = config.sensitive_env if sensitive_env is None else sensitive_env
+    if not selected:
+        return text
     # Marker-shaped secrets must be replaced before stashing markers; otherwise
     # the marker regex treats the secret as an existing marker and restores it.
     for name, value in selected:

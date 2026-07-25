@@ -22,8 +22,12 @@ def config():
 
 
 @pytest.fixture
-def manager(config):
-    return ProcessManager(config)
+async def manager(config):
+    instance = ProcessManager(config)
+    try:
+        yield instance
+    finally:
+        await instance.shutdown()
 
 
 @pytest.fixture
@@ -38,8 +42,12 @@ def short_yield_config():
 
 
 @pytest.fixture
-def short_yield_manager(short_yield_config):
-    return ProcessManager(short_yield_config)
+async def short_yield_manager(short_yield_config):
+    instance = ProcessManager(short_yield_config)
+    try:
+        yield instance
+    finally:
+        await instance.shutdown()
 
 
 class TestQuickCommand:
@@ -410,6 +418,12 @@ class TestTimeout:
         assert unlimited_mp is not None and unlimited_mp.timeout_task is None
         await manager.stop_process(default["process_id"], force_after_ms=100)
         await manager.stop_process(unlimited["process_id"], force_after_ms=100)
+        assert default_mp.completion_task is not None
+        assert default_mp.completion_task.done()
+        assert unlimited_mp.completion_task is not None
+        assert unlimited_mp.completion_task.done()
+        assert default_mp.proc.returncode is not None
+        assert unlimited_mp.proc.returncode is not None
 
 
 class TestBoundedOutput:
@@ -772,6 +786,20 @@ class TestWaitCapBehavior:
         assert wait_result["status"] == "completed"
         assert "hello" in wait_result.get("stdout", "")
 
+    @pytest.mark.asyncio
+    async def test_completed_truncated_exec_returns_process_id(self, manager):
+        result = await manager.exec_command(
+            "seq 1 20000",
+            max_output_bytes=100,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "completed"
+        assert result["truncated"] is True
+        assert result["process_id"].startswith("proc_")
+        retained = await manager.read_output(result["process_id"])
+        assert retained["status"] == "completed"
+
     def test_yield_clamp_boundaries(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_DEFAULT_YIELD_MS", "120000")
         monkeypatch.setenv("YIELDSHELL_MAX_YIELD_MS", "120000")
@@ -784,6 +812,14 @@ class TestWaitCapBehavior:
         manager = ProcessManager(Config())
         assert manager._clamp_yield_ms(None) == 1234
         assert manager._clamp_yield_ms(5000) == 1234
+
+    def test_stop_grace_reserves_time_for_cleanup(self, manager):
+        reserved = (
+            MAX_EFFECTIVE_WAIT_MS - manager._clamp_stop_grace_ms(MAX_EFFECTIVE_WAIT_MS)
+        )
+
+        assert reserved > 0
+        assert manager._clamp_stop_grace_ms(-1) == 0
 
     def test_runtime_default_and_explicit_zero_selection(self, manager):
         assert manager._clamp_timeout_ms(None) == 3600000
