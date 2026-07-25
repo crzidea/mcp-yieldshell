@@ -247,7 +247,7 @@ stages:
       - .cybervisor/artifacts/verify.md
       - .cybervisor/artifacts/challenge-log.md
     max_retries: 5
-    max_iterations: 10
+    max_iterations: 5
     max_iterations_next_stage: Review Docs
 
   - name: Review Docs
@@ -307,7 +307,7 @@ stages:
       - "src/**"
       - "tests/**"
     max_retries: 5
-    max_iterations: 5
+    max_iterations: 2
     max_iterations_next_stage: Verify
 
   - name: Verify
@@ -363,6 +363,10 @@ stages:
       - .cybervisor/artifacts/challenge-log.md
       - .cybervisor/artifacts/verification-report.md
     max_retries: 5
+    max_iterations: 2
+    reset_iterations:
+      - Review Code
+      - Review Docs
 
 disabled_skills:
   # superpowers skill set

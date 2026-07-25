@@ -82,8 +82,8 @@ This is a Python 3.11 package using a `src/` layout:
 ## Coding Style & Naming Conventions
 
 * Use **4-space indentation** and standard Python naming conventions (`snake_case` for variables/functions, `PascalCase` for classes, uppercase for constants).
-* Lines are capped at **99 characters** (configured in `tool.ruff`).
 * Keep modules focused around their distinct responsibilities; avoid creating generic "utility" files.
+* Files exceeding 1000 lines or 8k tokens should be refactored into multiple modules.
 
 ---
 
