@@ -26,6 +26,7 @@ class ManagedProcess:
         "process_group_id",
         "process_group_exited",
         "last_output_at",
+        "read_cursor",
         "_seq_source",
         "_timeout_triggered",
         "sensitive_env",
@@ -44,6 +45,9 @@ class ManagedProcess:
         self.process_group_id = process_group_id
         self.process_group_exited = False
         self.last_output_at: float | None = None
+        # Server-side resume point for reads that pass no explicit cursor, so
+        # a caller can poll without tracking next_seq itself.
+        self.read_cursor: int = 1
         self._seq_source: list[int] = [1]
         self.stdout_buf = RingBuffer(max_buffer_bytes, seq_source=self._seq_source)
         self.stderr_buf = RingBuffer(max_buffer_bytes, seq_source=self._seq_source)

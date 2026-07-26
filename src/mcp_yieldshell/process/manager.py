@@ -116,7 +116,9 @@ class ProcessManager:
         tail_lines: int | None = None,
     ) -> dict[str, Any]:
         buffers = {"stdout": mp.stdout_buf, "stderr": mp.stderr_buf}
-        data = self._read_selected(buffers, max_output_bytes, since_seq, tail_lines)
+        data = self._read_for_response(
+            mp, buffers, max_output_bytes, since_seq, tail_lines
+        )
         snapshot = {
             "stdout": self._redact(mp, data["texts"]["stdout"]),
             "stderr": self._redact(mp, data["texts"]["stderr"]),
@@ -125,18 +127,38 @@ class ProcessManager:
         return snapshot
 
     @staticmethod
-    def _read_selected(
+    def _read_for_response(
+        mp: ManagedProcess,
         buffers: dict[str, RingBuffer],
         max_output_bytes: int,
         since_seq: int | None,
         tail_lines: int | None,
+        resumable: bool = True,
     ) -> dict[str, Any]:
-        """Resolve a tail request to a cursor, then read forward from it."""
-        if tail_lines is not None:
+        """Read buffers, resuming from the process cursor when none is given.
+
+        A request with no ``since_seq`` and no ``tail_lines`` continues from
+        where the last such read stopped and then advances that cursor, so a
+        caller can poll repeatedly without tracking ``next_seq`` itself.
+
+        Requests that name an explicit ``since_seq``, ask for ``tail_lines``,
+        or narrow ``streams`` are treated as out-of-band inspections: they
+        neither consult nor move the cursor. That keeps a peek at the tail
+        from silently skipping output the polling stream has not seen, and
+        keeps a narrowed read from advancing the shared cursor past bytes on
+        the stream it excluded.
+        """
+        resume = resumable and since_seq is None and tail_lines is None
+        if resume:
+            since_seq = mp.read_cursor
+        elif tail_lines is not None:
             since_seq = tail_start_seq(buffers, tail_lines, max_output_bytes)
-        return read_buffers(
+        data = read_buffers(
             buffers, since_seq=since_seq, max_bytes=max_output_bytes
         )
+        if resume:
+            mp.read_cursor = data["next_seq"]
+        return data
 
     @staticmethod
     def _cursor_fields(process_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -151,8 +173,9 @@ class ProcessManager:
         hints = []
         if data["capped"]:
             hints.append(
-                "More output is available; call "
-                f"read(process_id={process_id!r}, since_seq={data['next_seq']})."
+                "More output is available; read again to continue, or pass "
+                f"since_seq={data['next_seq']} explicitly "
+                f"(process_id={process_id!r})."
             )
         if data["evicted"]:
             hints.append(
@@ -823,8 +846,15 @@ class ProcessManager:
             selected["stdout"] = mp.stdout_buf
         if streams in ("both", "stderr"):
             selected["stderr"] = mp.stderr_buf
-        data = self._read_selected(
-            selected, effective_max, since_seq, tail_lines
+        data = self._read_for_response(
+            mp,
+            selected,
+            effective_max,
+            since_seq,
+            tail_lines,
+            # A narrowed selection must not advance the cursor shared with the
+            # stream it left out.
+            resumable=streams == "both",
         )
 
         result: dict[str, Any] = {

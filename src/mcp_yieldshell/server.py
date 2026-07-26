@@ -127,11 +127,21 @@ async def read(
     a snapshot of the newest N lines, which is the cheaper way to monitor a
     noisy build or test run. The two are mutually exclusive.
 
+    With neither, the read **resumes** from where the last cursorless read
+    or ``exec`` snapshot stopped and then advances that server-side cursor,
+    so repeated calls never return the same bytes twice and no cursor
+    bookkeeping is needed. Because such a read consumes, inspecting output
+    that was already delivered needs an explicit ``since_seq=1``.
+
+    Requests that pass ``since_seq``, ``tail_lines``, or a narrowed
+    ``streams`` are out-of-band: they neither consult nor move that cursor,
+    so a peek cannot skip output the polling stream has not seen.
+
     Responses report withheld output with two distinct flags: ``capped``
-    means more output exists and a follow-up ``read(since_seq=next_seq)``
-    will return it, while ``evicted`` means output was dropped from the
-    buffer before it could be read and is gone. ``latest_seq`` shows how far
-    output has advanced beyond this response.
+    means more output is available and reading again continues from
+    ``next_seq``, while ``evicted`` means output was dropped from the buffer
+    before it could be read and is gone. ``latest_seq`` shows how far output
+    has advanced overall.
     """
     return await _get_manager().read_output(
         process_id=process_id,
@@ -176,9 +186,11 @@ async def wait(
     separate execution limit that does terminate a process is
     ``exec(timeout_ms=...)``.
 
-    Pass ``since_seq`` from the previous response to receive only new output
-    instead of replaying the whole buffer on every poll, or ``tail_lines``
-    for a snapshot of the newest N lines.
+    Output follows the same rules as ``read``: with no ``since_seq`` and no
+    ``tail_lines`` the response resumes from where the last cursorless read
+    stopped and advances that cursor, so polling in a loop never returns the
+    same bytes twice. Pass ``since_seq`` to drive the cursor yourself, or
+    ``tail_lines`` for an out-of-band snapshot of the newest N lines.
     """
     return await _get_manager().wait_process(
         process_id=process_id,

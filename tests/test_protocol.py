@@ -80,8 +80,9 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
             )
             assert started["status"] == "backgrounded"
 
+            # No since_seq anywhere: the server-side cursor is what keeps
+            # these responses from repeating output.
             collected = started["stdout"]
-            cursor = started["next_seq"]
             pages = 0
             for _ in range(20):
                 page = _payload(
@@ -90,13 +91,11 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
                         {
                             "process_id": started["process_id"],
                             "timeout_ms": 400,
-                            "since_seq": cursor,
                         },
                     )
                 )
                 pages += 1
                 collected += page["stdout"]
-                cursor = page["next_seq"]
                 assert page["wait_result"] in ("exited", "deadline_reached")
                 assert page["max_wait_ms"] == 400
                 if page["wait_result"] == "exited":

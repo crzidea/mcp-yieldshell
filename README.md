@@ -167,7 +167,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * Inline code execution: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["RUNS_INLINE_CODE"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=,`.
 
 * **Output Statuses**:
-  * Every status returns the cursor fields described under [Byte Cursors & Incremental Reads](#byte-cursors--incremental-reads): `start_seq`, `next_seq`, `latest_seq`, `capped`, and `evicted`. Pass `next_seq` back as `since_seq` to continue reading without replaying output.
+  * Every status returns the cursor fields described under [Byte Cursors & Incremental Reads](#byte-cursors--incremental-reads): `start_seq`, `next_seq`, `latest_seq`, `capped`, and `evicted`. The inline snapshot advances the process's server-side read cursor, so a following `read` or `wait` continues after it rather than repeating it.
   * `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr. If output was withheld and terminal-process retention is enabled, it also returns `process_id` so the remainder can be inspected with `read`.
   * `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, a snapshot of initial stdout/stderr, `duration_ms`, the cursor fields, and a `message` string describing that the process is running in the background.
   * `timed_out`: Process exceeded `timeout_ms` and was terminated.
@@ -183,7 +183,7 @@ Read stdout and/or stderr output from a running or completed background process.
 
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
-  * `since_seq` (integer, optional): Byte-position cursor returned as `next_seq` by the previous read. Enables lossless incremental log polling.
+  * `since_seq` (integer, optional): Byte-position cursor returned as `next_seq` by the previous read. Enables lossless incremental log polling. When omitted, the read resumes from the server-side cursor instead (see [Byte Cursors & Incremental Reads](#byte-cursors--incremental-reads)); pass `since_seq=1` to re-read from the beginning.
   * `max_output_bytes` (integer, optional): Clamps total output returned across the selected streams. Defaults to the server cap.
   * `streams` (string, default: `"both"`): The streams to read. Options: `"both"`, `"stdout"`, or `"stderr"`.
   * `tail_lines` (integer, optional): Return only the newest N lines instead of reading forward. Useful for monitoring a noisy build or test run without paging through it. Mutually exclusive with `since_seq`; must be positive. If the requested tail exceeds `max_output_bytes`, the newest bytes are kept rather than the oldest.
@@ -191,7 +191,7 @@ Read stdout and/or stderr output from a running or completed background process.
 * **Returns**:
   * `process_id`, `status`, `exit_code`, `signal`, and `stdin_error` when initial input delivery failed. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
   * Cursor fields: `start_seq` (position of the first byte returned), `next_seq` (cursor to use in the next `since_seq` read), and `latest_seq` (how far output has advanced overall — when it exceeds `next_seq`, more is waiting).
-  * Withheld-output flags: `capped` means the response cap stopped it short and the rest is still readable; `evicted` means output fell out of the ring buffer before it was read and cannot be recovered. When either is set, a `hint` field names the concrete follow-up call.
+  * Withheld-output flags: `capped` means more output is available and reading again continues from `next_seq`; `evicted` means output fell out of the ring buffer before it was read and cannot be recovered. When either is set, a `hint` field names the concrete follow-up call.
 
 ### `write`
 Write text input to the standard input (`stdin`) of a running process.
@@ -211,7 +211,7 @@ Block execution until the process exits or the wait timeout expires. This allows
   * `process_id` (string, **required**): Unique identifier of the process.
   * `timeout_ms` (integer, default: `55000`): Maximum time to wait. Never terminates the process.
   * `max_output_bytes` (integer, optional): Maximum total output bytes to return across stdout and stderr.
-  * `since_seq` (integer, optional): Byte-position cursor from a previous response. **Recommended when polling**: without it, every `wait` replays the buffer from the beginning and re-sends output the caller already has.
+  * `since_seq` (integer, optional): Byte-position cursor from a previous response. When omitted, `wait` resumes from the server-side cursor, so polling in a loop returns each byte exactly once without any cursor bookkeeping.
   * `tail_lines` (integer, optional): Return only the newest N lines. Mutually exclusive with `since_seq`.
 
 * **Returns**: the same cursor and withheld-output fields as `read`, plus:
@@ -275,17 +275,21 @@ Prune completed, stopped, timed-out, and failed process records to free memory.
 
 To avoid sending duplicate data over the MCP protocol (which can consume context window space), the server implements a byte-position polling protocol:
 
-1. Every stdout/stderr byte receives a unique position in a cursor shared by both streams.
+1. Every stdout/stderr byte receives a unique position in a cursor shared by both streams. Positions start at 1 and only ever increase.
 2. `read`, `wait`, and `exec` all return `next_seq`, the position immediately after the range covered by the response. A response cap can therefore end safely inside a drain chunk.
-3. To retrieve the next output without gaps, pass that `next_seq` back as `since_seq` and keep the same `streams` selection. **This applies to `wait` as much as to `read`**: a `wait` without `since_seq` replays the buffer from the start on every poll.
-4. Omitting `since_seq` returns the entire contents currently stored in the buffer (clamped by `max_output_bytes`).
-5. Two distinct flags report output the response did not carry, and they call for different responses:
-   * `capped` — the response cap stopped the read short. The remainder is still buffered; call `read(since_seq=next_seq)` to get it.
+3. **You do not have to track cursors.** A `read` or `wait` with no `since_seq` and no `tail_lines` resumes from where the last such call stopped, then advances a server-side cursor held per process. Polling in a loop therefore returns each byte exactly once. `exec`'s inline snapshot advances the same cursor, so a following `wait` continues after it.
+4. To drive the cursor yourself instead, pass the previous `next_seq` back as `since_seq` and keep the same `streams` selection.
+5. **A cursorless read consumes.** Once output has been delivered, a later cursorless read will not return it again. To inspect output that was already delivered, pass `since_seq=1` to re-read from the beginning, or use `tail_lines`.
+6. Requests that pass `since_seq`, pass `tail_lines`, or narrow `streams` are treated as **out-of-band**: they neither consult nor advance the server-side cursor. This means a peek at the tail or at stderr cannot silently skip output the polling stream has not seen yet.
+7. Two distinct flags report output the response did not carry, and they call for different responses:
+   * `capped` — the response cap stopped the read short. The remainder is still buffered; read again to continue, or pass the returned `next_seq` as `since_seq`. The `hint` field spells out the call.
    * `evicted` — output exceeded the ring buffer's capacity before it was read and is permanently gone. Retrying cannot recover it; poll more often or raise `YIELDSHELL_MAX_BUFFER_BYTES`. Reads report eviction only when their requested range overlaps evicted data.
-6. `latest_seq` reports how far output has advanced overall. `latest_seq > next_seq` means more is already waiting; `latest_seq == next_seq` means the caller is fully caught up.
-7. Because retention (`YIELDSHELL_MAX_BUFFER_BYTES`, 256 KB per stream) is much larger than the per-response cap (`YIELDSHELL_MAX_OUTPUT_BYTES`, 20 KB), a cursor normally stays resolvable across polling gaps.
+8. `latest_seq` reports how far output has advanced overall. `latest_seq > next_seq` means more is already waiting; `latest_seq == next_seq` means the caller is fully caught up.
+9. Because retention (`YIELDSHELL_MAX_BUFFER_BYTES`, 256 KB per stream) is much larger than the per-response cap (`YIELDSHELL_MAX_OUTPUT_BYTES`, 20 KB), a cursor normally stays resolvable across polling gaps.
 
 Cursor boundaries preserve valid UTF-8 characters. If a single character is larger than a very small requested page, that page may exceed `max_output_bytes` by at most three bytes so the cursor can make progress without corrupting the character.
+
+Positions are never reused and never reset. Eviction does not rewind them: it advances the oldest retained position while `next_seq` keeps climbing, so a cursor is safe to hold indefinitely. A cursor pointing at data that has since been evicted is not an error — the read returns data from the earliest retained position onward and sets `evicted` to `true`, and `start_seq` shows where the returned range actually begins. Positions are scoped to one process; a cursor from one `process_id` is meaningless for another.
 
 Incremental cursors are scoped to the selected `streams` value. Keep the same stream selection while advancing a cursor; switching from `stdout`-only or `stderr`-only polling to another selection can intentionally skip bytes from the previously unselected stream.
 

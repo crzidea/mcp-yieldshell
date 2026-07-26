@@ -103,10 +103,13 @@ class TestLongCommand:
         )
         assert result["status"] == "backgrounded"
         pid = result["process_id"]
-        # Wait for it to complete
+        # Wait for it to complete. Cursorless reads resume, so exec's snapshot
+        # and this response together carry the output exactly once.
         wait_result = await manager.wait_process(pid, timeout_ms=5000)
         assert wait_result["status"] in ("completed", "stopped")
-        assert "hello" in wait_result.get("stdout", "")
+        combined = result.get("stdout", "") + wait_result.get("stdout", "")
+        assert "hello" in combined
+        assert combined.count("hello") == 1
 
     @pytest.mark.asyncio
     async def test_wait_includes_output_emitted_before_normal_exit(self, manager):
@@ -724,7 +727,10 @@ class TestRedaction:
         await asyncio.sleep(0.1)
 
         read_result = await manager.read_output(process_id)
-        wait_result = await manager.wait_process(process_id, timeout_ms=1000)
+        # since_seq=1 re-reads the same range rather than resuming past it.
+        wait_result = await manager.wait_process(
+            process_id, timeout_ms=1000, since_seq=1
+        )
 
         assert "changed-secret" in read_result["stdout"]
         assert "changed-secret" in wait_result["stdout"]
@@ -749,7 +755,11 @@ class TestRedaction:
         await asyncio.sleep(0.1)
 
         read_result = await manager.read_output(process_id)
-        wait_result = await manager.wait_process(process_id, timeout_ms=1_000)
+        # since_seq=1 re-reads the same range; a cursorless wait would resume
+        # past what the read above already consumed.
+        wait_result = await manager.wait_process(
+            process_id, timeout_ms=1_000, since_seq=1
+        )
         listed = manager.list_processes()["processes"][0]
 
         for value in (
@@ -984,7 +994,8 @@ class TestWaitCapBehavior:
         assert result["status"] == "completed"
         ps_result = manager.list_processes(limit=1)
         pid = ps_result["processes"][0]["process_id"]
-        wait_result = await manager.wait_process(pid, timeout_ms=5000)
+        # exec already consumed the output; since_seq=1 inspects it again.
+        wait_result = await manager.wait_process(pid, timeout_ms=5000, since_seq=1)
         assert wait_result["status"] == "completed"
         assert "hello" in wait_result.get("stdout", "")
 
@@ -1071,7 +1082,9 @@ class TestIncrementalReadSinceSeq:
         pid = result["process_id"]
         await asyncio.sleep(1.0)
 
-        first_read = await manager.read_output(pid)
+        # exec's inline snapshot already consumed the first line, so read from
+        # the head explicitly to see it again.
+        first_read = await manager.read_output(pid, since_seq=1)
         assert "first" in first_read.get("stdout", "")
         next_seq = first_read["next_seq"]
 
@@ -1169,8 +1182,10 @@ class TestDefectFixes:
         )
         process_id = result["process_id"]
 
+        # Anchored at the head so the assertion does not depend on whether
+        # exec's inline snapshot already consumed the output.
         waited = await manager.wait_process(
-            process_id, timeout_ms=2_000, max_output_bytes=4
+            process_id, timeout_ms=2_000, max_output_bytes=4, since_seq=1
         )
         remainder = await manager.read_output(
             process_id,
@@ -1179,7 +1194,62 @@ class TestDefectFixes:
             streams="stdout",
         )
 
+        assert waited["stdout"] == "0123"
         assert waited["stdout"] + remainder["stdout"] == "0123456789"
+
+    @pytest.mark.asyncio
+    async def test_cursorless_reads_resume_where_the_last_one_stopped(self, manager):
+        result = await manager.exec_command(
+            "printf 0123456789abcdefghij",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = result["process_id"]
+        mp = manager.get_process(process_id)
+        assert mp is not None
+        # since_seq=1 is out-of-band, so waiting for exit leaves the resume
+        # cursor alone. Pin it so the assertions do not depend on whether
+        # exec's inline snapshot already consumed part of the output.
+        await manager.wait_process(process_id, timeout_ms=2_000, since_seq=1)
+        mp.read_cursor = 1
+
+        pages = []
+        for _ in range(6):
+            page = await manager.read_output(process_id, max_output_bytes=4)
+            if not page["stdout"]:
+                break
+            pages.append(page["stdout"])
+
+        assert pages == ["0123", "4567", "89ab", "cdef", "ghij"]
+
+    @pytest.mark.asyncio
+    async def test_out_of_band_reads_do_not_move_the_resume_cursor(self, manager):
+        result = await manager.exec_command(
+            "printf 0123456789",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = result["process_id"]
+        mp = manager.get_process(process_id)
+        assert mp is not None
+        # since_seq=1 is out-of-band, so waiting for exit leaves the resume
+        # cursor alone. Pin it so the polling below starts from a known point.
+        await manager.wait_process(process_id, timeout_ms=2_000, since_seq=1)
+        mp.read_cursor = 1
+
+        first = await manager.read_output(process_id, max_output_bytes=4)
+        cursor_after_poll = mp.read_cursor
+
+        # None of these are part of the polling stream.
+        await manager.read_output(process_id, since_seq=1)
+        await manager.read_output(process_id, tail_lines=1)
+        await manager.read_output(process_id, streams="stdout")
+        assert mp.read_cursor == cursor_after_poll
+
+        resumed = await manager.read_output(process_id, max_output_bytes=4)
+
+        assert first["stdout"] == "0123"
+        assert resumed["stdout"] == "4567"
 
     @pytest.mark.asyncio
     async def test_capped_incremental_read_returns_all_output(self, manager):
