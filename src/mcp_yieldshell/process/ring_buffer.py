@@ -223,7 +223,6 @@ def tail_start_seq(
         return max((buffer.next_seq for buffer in buffers.values()), default=1)
 
     earliest = segments[0][0]
-    latest = segments[-1][0] + len(segments[-1][1])
     start = earliest
 
     if tail_lines > 0:
@@ -250,8 +249,32 @@ def tail_start_seq(
             if end < 0:
                 break
 
-    if max_bytes > 0 and latest - start > max_bytes:
-        start = _advance_past_continuation(segments, latest - max_bytes)
+    if max_bytes > 0:
+        start = _clamp_tail_start(segments, start, max_bytes)
+    return start
+
+
+def _clamp_tail_start(
+    segments: list[tuple[int, bytes]], start: int, max_bytes: int
+) -> int:
+    """Clamp a tail window by retained bytes rather than global cursor distance.
+
+    Shared cursors can contain gaps when only one stream is selected or older
+    bytes were evicted. Those gaps must not consume the response byte budget.
+    """
+    remaining = max_bytes
+    for segment_start, data in reversed(segments):
+        lower = max(0, start - segment_start)
+        if lower >= len(data):
+            continue
+        available = len(data) - lower
+        if available <= remaining:
+            remaining -= available
+            continue
+        return _advance_past_continuation(
+            [(segment_start, data)],
+            segment_start + len(data) - remaining,
+        )
     return start
 
 

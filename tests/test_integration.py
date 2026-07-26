@@ -428,6 +428,30 @@ class TestTimeout:
 
 class TestBoundedOutput:
     @pytest.mark.asyncio
+    async def test_configured_buffer_cap_is_independent_of_response_cap(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("YIELDSHELL_MAX_OUTPUT_BYTES", "100")
+        monkeypatch.setenv("YIELDSHELL_MAX_BUFFER_BYTES", "10")
+        mgr = ProcessManager(Config())
+        try:
+            result = await mgr.exec_command(
+                "printf 12345678901234567890",
+                side_effects=NONE,
+            )
+            process_id = mgr.list_processes(limit=1)["processes"][0]["process_id"]
+            mp = mgr.get_process(process_id)
+
+            assert result["status"] == "completed"
+            assert result["stdout"] == "1234567890"
+            assert result["evicted"] is True
+            assert mp is not None
+            assert mp.stdout_buf.max_bytes == 10
+            assert mp.stdout_buf._retained_bytes == 10
+        finally:
+            await mgr.shutdown()
+
+    @pytest.mark.asyncio
     async def test_output_above_cap(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_MAX_OUTPUT_BYTES", "100")
         config = Config()

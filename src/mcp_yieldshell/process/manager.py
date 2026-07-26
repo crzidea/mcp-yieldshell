@@ -42,6 +42,7 @@ class ProcessManager:
         self._shutdown_lock = asyncio.Lock()
         self._shutdown_requested = False
         self._shutdown_complete = False
+        self._shutdown_task: asyncio.Task[None] | None = None
 
     async def _wait_for_no_pending_spawns(self) -> None:
         deadline = time.monotonic() + PENDING_SPAWN_SHUTDOWN_MS / 1000.0
@@ -362,9 +363,7 @@ class ProcessManager:
         mp = ManagedProcess(
             info,
             proc,
-            # Retention is deliberately larger than any one response so a
-            # cursor stays resolvable across polling gaps.
-            max(self._config.max_buffer_bytes, self._config.max_output_bytes),
+            self._config.max_buffer_bytes,
             process_group_id,
             collect_sensitive_env(self._config, env_overlay),
         )
@@ -1141,12 +1140,22 @@ class ProcessManager:
         return {"removed": removed}
 
     async def shutdown(self) -> None:
-        """Stop all live managed process groups and settle their tracking tasks."""
+        """Stop all live process groups through one shared teardown task."""
         async with self._shutdown_lock:
             if self._shutdown_complete:
                 return
-            self._shutdown_requested = True
+            task = self._shutdown_task
+            if task is None:
+                self._shutdown_requested = True
+                task = asyncio.create_task(
+                    self._run_shutdown(),
+                    name="yieldshell-shutdown",
+                )
+                self._shutdown_task = task
+        await asyncio.shield(task)
 
+    async def _run_shutdown(self) -> None:
+        """Perform the shutdown sequence once, independently of caller cancellation."""
         await self._wait_for_no_pending_spawns()
         await self._cancel_pending_spawns()
 

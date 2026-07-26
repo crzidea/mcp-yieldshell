@@ -114,6 +114,54 @@ class TestDrainLifecycle:
         process.stderr._transport.close.assert_called_once_with()
 
 
+class TestConcurrentShutdown:
+    @pytest.mark.asyncio
+    async def test_concurrent_callers_share_one_termination_sequence(
+        self, monkeypatch
+    ):
+        manager = ProcessManager(Config())
+        process = MagicMock()
+        process.pid = None
+        process.returncode = None
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+        info = ProcessInfo(
+            process_id="proc_shutdown",
+            pid=None,
+            command="long-running",
+            cwd=os.getcwd(),
+            name=None,
+            status=ProcessStatus.RUNNING,
+            started_at=time.time(),
+            start_monotonic=time.monotonic(),
+        )
+        managed = ManagedProcess(info, process, 100)
+        manager._processes[info.process_id] = managed
+        terminate_calls = 0
+
+        def process_group_exists(mp):
+            return not mp.process_group_exited
+
+        async def terminate_once(_proc, _process_group_id):
+            nonlocal terminate_calls
+            terminate_calls += 1
+            await asyncio.sleep(0.02)
+            managed.process_group_exited = True
+
+        monkeypatch.setattr(manager, "_process_group_exists", process_group_exists)
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.terminate_process",
+            terminate_once,
+        )
+
+        await asyncio.gather(manager.shutdown(), manager.shutdown())
+
+        assert terminate_calls == 1
+        assert manager._shutdown_complete is True
+        assert managed.info.status == ProcessStatus.STOPPED
+
+
 class TestAutomaticRetention:
     @pytest.mark.asyncio
     async def test_zero_cap_is_enforced_after_completion(self, monkeypatch):

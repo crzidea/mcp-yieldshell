@@ -428,3 +428,21 @@ class TestRingBufferSharedSeq:
         assert remainder["texts"] == {"stdout": "", "stderr": "ERR1\nERR2\n"}
         assert remainder["capped"] is False
         assert remainder["evicted"] is False
+
+    def test_single_stream_tail_byte_cap_ignores_other_stream_cursor_gap(self):
+        seq_source = [1]
+        stdout_buf = RingBuffer(100, seq_source=seq_source)
+        stderr_buf = RingBuffer(100, seq_source=seq_source)
+        stdout_buf.append(b"first\n")
+        stderr_buf.append(b"x" * 100)
+        stdout_buf.append(b"second\n")
+
+        start = tail_start_seq({"stdout": stdout_buf}, tail_lines=2, max_bytes=13)
+        result = read_buffers(
+            {"stdout": stdout_buf},
+            since_seq=start,
+            max_bytes=13,
+        )
+
+        assert result["texts"]["stdout"] == "first\nsecond\n"
+        assert result["capped"] is False
