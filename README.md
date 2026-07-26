@@ -233,7 +233,7 @@ Three separate timers control different things. Only one of them ever terminates
 | `exec(timeout_ms)` | Total execution limit. On expiry the process group is sent `SIGTERM`, then `SIGKILL`, and the status becomes `timed_out`. | **Yes** | 3,600,000ms | None (`0` means unlimited) |
 | `wait(timeout_ms)` | Maximum time a single `wait` call blocks. On expiry it returns `wait_result: "deadline_reached"` and the process keeps running. | No | 55,000ms | 55,000ms |
 
-If `wait` returns sooner than expected with `status: "running"`, check `wait_result`: `"exited"` means the tracked shell finished while descendants in its process group are still alive, which keeps the record reported as `running`.
+If `wait` returns with `status: "running"`, check `wait_result`: `"deadline_reached"` means the wait budget expired while the tracked shell or one of its descendants was still alive. The process keeps running and can be polled again.
 
 ### `stop`
 Gracefully terminate or force kill a running process.
