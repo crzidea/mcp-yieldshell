@@ -26,7 +26,7 @@ from ..security import (
 from ..side_effects import validate_side_effects
 from ..types import ProcessInfo, ProcessStatus, SideEffect
 from .managed import ManagedProcess
-from .ring_buffer import RingBuffer, read_buffers
+from .ring_buffer import RingBuffer, read_buffers, tail_start_seq
 from .spawn import kill_process, spawn_process, terminate_process
 
 _SHUTDOWN_REJECT_ERROR = "Server is shutting down"
@@ -108,19 +108,60 @@ class ProcessManager:
         return min(requested, cap)
 
     def _read_snapshot(
-        self, mp: ManagedProcess, max_output_bytes: int
+        self,
+        mp: ManagedProcess,
+        max_output_bytes: int,
+        since_seq: int | None = None,
+        tail_lines: int | None = None,
     ) -> dict[str, Any]:
-        data = read_buffers(
-            {"stdout": mp.stdout_buf, "stderr": mp.stderr_buf},
-            since_seq=None,
-            max_bytes=max_output_bytes,
-        )
-        return {
+        buffers = {"stdout": mp.stdout_buf, "stderr": mp.stderr_buf}
+        data = self._read_selected(buffers, max_output_bytes, since_seq, tail_lines)
+        snapshot = {
             "stdout": self._redact(mp, data["texts"]["stdout"]),
             "stderr": self._redact(mp, data["texts"]["stderr"]),
-            "next_seq": data["next_seq"],
-            "truncated": data["truncated"],
         }
+        snapshot.update(self._cursor_fields(mp.info.process_id, data))
+        return snapshot
+
+    @staticmethod
+    def _read_selected(
+        buffers: dict[str, RingBuffer],
+        max_output_bytes: int,
+        since_seq: int | None,
+        tail_lines: int | None,
+    ) -> dict[str, Any]:
+        """Resolve a tail request to a cursor, then read forward from it."""
+        if tail_lines is not None:
+            since_seq = tail_start_seq(buffers, tail_lines, max_output_bytes)
+        return read_buffers(
+            buffers, since_seq=since_seq, max_bytes=max_output_bytes
+        )
+
+    @staticmethod
+    def _cursor_fields(process_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Cursor and withheld-output fields shared by exec, read, and wait."""
+        fields: dict[str, Any] = {
+            "start_seq": data["start_seq"],
+            "next_seq": data["next_seq"],
+            "latest_seq": data["latest_seq"],
+            "capped": data["capped"],
+            "evicted": data["evicted"],
+        }
+        hints = []
+        if data["capped"]:
+            hints.append(
+                "More output is available; call "
+                f"read(process_id={process_id!r}, since_seq={data['next_seq']})."
+            )
+        if data["evicted"]:
+            hints.append(
+                "Older output was dropped from the buffer before this read and "
+                "cannot be recovered; poll more often or raise "
+                "YIELDSHELL_MAX_BUFFER_BYTES."
+            )
+        if hints:
+            fields["hint"] = " ".join(hints)
+        return fields
 
     def _redact(self, mp: ManagedProcess, text: str) -> str:
         return redact_text(self._config, text, mp.sensitive_env)
@@ -321,7 +362,9 @@ class ProcessManager:
         mp = ManagedProcess(
             info,
             proc,
-            effective_max_output,
+            # Retention is deliberately larger than any one response so a
+            # cursor stays resolvable across polling gaps.
+            max(self._config.max_buffer_bytes, self._config.max_output_bytes),
             process_group_id,
             collect_sensitive_env(self._config, env_overlay),
         )
@@ -329,11 +372,11 @@ class ProcessManager:
         # Start drain tasks immediately after spawn to prevent blocking on full pipe buffers
         drain_tasks = [
             asyncio.create_task(
-                self._drain_stream(proc.stdout, mp.stdout_buf, mp.sensitive_env),
+                self._drain_stream(proc.stdout, mp.stdout_buf, mp),
                 name=f"drain-stdout-{process_id}",
             ),
             asyncio.create_task(
-                self._drain_stream(proc.stderr, mp.stderr_buf, mp.sensitive_env),
+                self._drain_stream(proc.stderr, mp.stderr_buf, mp),
                 name=f"drain-stderr-{process_id}",
             ),
         ]
@@ -397,24 +440,21 @@ class ProcessManager:
 
         # Prepare output for response
         snapshot = self._read_snapshot(mp, effective_max_output)
-        truncated = snapshot["truncated"]
-        stdout_text = snapshot["stdout"]
-        stderr_text = snapshot["stderr"]
+        withheld = snapshot["capped"] or snapshot["evicted"]
+        # Every branch carries the cursor so a caller can keep reading without
+        # replaying output it already received.
+        common = {"duration_ms": round(duration_ms, 1), **snapshot}
+        exited = {
+            "exit_code": mp.info.exit_code,
+            "signal": mp.info.signal,
+        }
 
         if (
             mp.info.status == ProcessStatus.COMPLETED
             and not self._has_live_work(mp)
         ):
-            result: dict[str, Any] = {
-                "status": "completed",
-                "exit_code": mp.info.exit_code,
-                "signal": mp.info.signal,
-                "duration_ms": round(duration_ms, 1),
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "truncated": truncated,
-            }
-            if truncated and self._processes.get(process_id) is mp:
+            result: dict[str, Any] = {"status": "completed", **exited, **common}
+            if withheld and self._processes.get(process_id) is mp:
                 result["process_id"] = process_id
             return self._with_stdin_error(mp, result)
 
@@ -422,36 +462,24 @@ class ProcessManager:
             return self._with_stdin_error(mp, {
                 "status": "timed_out",
                 "process_id": process_id,
-                "exit_code": mp.info.exit_code,
-                "signal": mp.info.signal,
-                "duration_ms": round(duration_ms, 1),
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "truncated": truncated,
+                **exited,
+                **common,
             })
 
         if mp.info.status == ProcessStatus.STOPPED:
             return self._with_stdin_error(mp, {
                 "status": "stopped",
                 "process_id": process_id,
-                "exit_code": mp.info.exit_code,
-                "signal": mp.info.signal,
-                "duration_ms": round(duration_ms, 1),
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "truncated": truncated,
+                **exited,
+                **common,
             })
 
         if mp.info.status == ProcessStatus.FAILED:
             return self._with_stdin_error(mp, {
                 "status": "failed",
                 "process_id": process_id,
-                "exit_code": mp.info.exit_code,
-                "signal": mp.info.signal,
-                "duration_ms": round(duration_ms, 1),
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "truncated": truncated,
+                **exited,
+                **common,
             })
 
         # Still running — background it
@@ -459,10 +487,7 @@ class ProcessManager:
             "status": "backgrounded",
             "process_id": process_id,
             "pid": mp.info.pid,
-            "duration_ms": round(duration_ms, 1),
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "truncated": truncated,
+            **common,
             "message": "Process is running in the background. Use read/wait/stop with process_id.",
         })
 
@@ -521,13 +546,13 @@ class ProcessManager:
         self,
         stream: asyncio.StreamReader | None,
         buf: RingBuffer,
-        sensitive_env: tuple[tuple[str, str], ...] = (),
+        mp: ManagedProcess | None = None,
     ) -> None:
         """Read from a subprocess stream into a ring buffer."""
         if stream is None:
             return
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        redactor = StreamingRedactor(sensitive_env)
+        redactor = StreamingRedactor(mp.sensitive_env if mp is not None else ())
         try:
             while True:
                 chunk = await stream.read(4096)
@@ -538,6 +563,10 @@ class ProcessManager:
                     redacted = redactor.feed(text)
                     if redacted:
                         buf.append(redacted.encode("utf-8"))
+                if mp is not None:
+                    # Tracked on raw arrival so a fully redacted chunk still
+                    # counts as activity for idle reporting.
+                    mp.last_output_at = time.time()
         except Exception:
             pass
         finally:
@@ -590,6 +619,33 @@ class ProcessManager:
                     self._watch_process_group_exit(mp),
                     name=f"group-watch-{mp.info.process_id}",
                 )
+
+    async def _await_live_work_end(
+        self, mp: ManagedProcess, timeout_sec: float
+    ) -> bool:
+        """Wait until no live work remains; ``True`` if it ended in time.
+
+        ``completion_event`` latches when the tracked shell exits, which can
+        happen while descendants still hold the process group open. Waiting on
+        the event alone would then return instantly on every call even though
+        the record still reports ``running``, so the live-work check is what
+        actually gates the deadline here.
+        """
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            if not self._has_live_work(mp):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if mp.completion_event.is_set():
+                # Latched early: poll the process group until it drains.
+                await asyncio.sleep(min(0.05, remaining))
+            else:
+                try:
+                    await asyncio.wait_for(mp.completion_event.wait(), remaining)
+                except asyncio.TimeoutError:
+                    return not self._has_live_work(mp)
 
     async def _wait_for_process_group_exit(
         self, mp: ManagedProcess, timeout_sec: float
@@ -747,6 +803,7 @@ class ProcessManager:
         since_seq: int | None = None,
         max_output_bytes: int | None = None,
         streams: str = "both",
+        tail_lines: int | None = None,
     ) -> dict[str, Any]:
         """Read output from a managed process."""
         mp = self._processes.get(process_id)
@@ -756,6 +813,10 @@ class ProcessManager:
         if streams not in ("both", "stdout", "stderr"):
             return {"process_id": process_id, "error": f"Invalid streams: {streams!r}"}
 
+        selection_error = self._validate_selection(since_seq, tail_lines)
+        if selection_error:
+            return {"process_id": process_id, "error": selection_error}
+
         effective_max = self._max_output(max_output_bytes)
 
         selected: dict[str, RingBuffer] = {}
@@ -763,16 +824,17 @@ class ProcessManager:
             selected["stdout"] = mp.stdout_buf
         if streams in ("both", "stderr"):
             selected["stderr"] = mp.stderr_buf
-        data = read_buffers(selected, since_seq=since_seq, max_bytes=effective_max)
+        data = self._read_selected(
+            selected, effective_max, since_seq, tail_lines
+        )
 
         result: dict[str, Any] = {
             "process_id": process_id,
             "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
-            "next_seq": data["next_seq"],
-            "truncated": data["truncated"],
         }
+        result.update(self._cursor_fields(process_id, data))
         for stream, text in data["texts"].items():
             result[stream] = self._redact(mp, text)
         return self._with_stdin_error(mp, result)
@@ -854,36 +916,57 @@ class ProcessManager:
         process_id: str,
         timeout_ms: int = MAX_EFFECTIVE_WAIT_MS,
         max_output_bytes: int | None = None,
+        since_seq: int | None = None,
+        tail_lines: int | None = None,
     ) -> dict[str, Any]:
-        """Wait for a process to exit without killing it."""
+        """Wait for a process to exit without killing it.
+
+        ``timeout_ms`` is a maximum wait and never terminates the process.
+        Pass ``since_seq`` from a previous response to receive only output
+        produced since that cursor.
+        """
         mp = self._processes.get(process_id)
         if mp is None:
             return {"process_id": process_id, "error": f"Unknown process_id: {process_id}"}
 
+        selection_error = self._validate_selection(since_seq, tail_lines)
+        if selection_error:
+            return {"process_id": process_id, "error": selection_error}
+
         # Cap effective wait below typical MCP request timeout thresholds
         effective_wait_ms = max(0, min(timeout_ms, MAX_EFFECTIVE_WAIT_MS))
 
-        if self._has_live_work(mp):
-            try:
-                await asyncio.wait_for(
-                    mp.completion_event.wait(), timeout=effective_wait_ms / 1000.0
-                )
-            except asyncio.TimeoutError:
-                pass
+        started = time.monotonic()
+        exited = await self._await_live_work_end(mp, effective_wait_ms / 1000.0)
+        waited_ms = (time.monotonic() - started) * 1000
 
         effective_max = self._max_output(max_output_bytes)
-        snapshot = self._read_snapshot(mp, effective_max)
+        snapshot = self._read_snapshot(mp, effective_max, since_seq, tail_lines)
 
         return self._with_stdin_error(mp, {
             "process_id": process_id,
             "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
-            "stdout": snapshot["stdout"],
-            "stderr": snapshot["stderr"],
-            "next_seq": snapshot["next_seq"],
-            "truncated": snapshot["truncated"],
+            "wait_result": "exited" if exited else "deadline_reached",
+            "waited_ms": round(waited_ms, 1),
+            "max_wait_ms": effective_wait_ms,
+            **snapshot,
         })
+
+    @staticmethod
+    def _validate_selection(
+        since_seq: int | None, tail_lines: int | None
+    ) -> str | None:
+        if tail_lines is not None and since_seq is not None:
+            return (
+                "tail_lines and since_seq are mutually exclusive; use "
+                "tail_lines for a snapshot of the newest output or since_seq "
+                "to continue an incremental read"
+            )
+        if tail_lines is not None and tail_lines <= 0:
+            return f"tail_lines must be positive, got {tail_lines}"
+        return None
 
     async def stop_process(
         self,
@@ -975,6 +1058,7 @@ class ProcessManager:
         self, include_completed: bool = True, limit: int = 50
     ) -> dict[str, Any]:
         """List managed processes."""
+        now = time.time()
         processes = []
         for mp in list(self._processes.values()):
             has_live_work = self._has_live_work(mp)
@@ -1005,6 +1089,14 @@ class ProcessManager:
                     ),
                     "stdout_bytes": mp.stdout_buf.byte_count,
                     "stderr_bytes": mp.stderr_buf.byte_count,
+                    "last_output_at": mp.last_output_at,
+                    # Distinguishes a genuine hang from quiet work.
+                    "idle_ms": (
+                        None
+                        if mp.last_output_at is None
+                        else round((now - mp.last_output_at) * 1000, 1)
+                    ),
+                    "latest_seq": mp.latest_seq,
                     "stdin_error": mp.stdin_error,
                 }
             )

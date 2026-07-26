@@ -23,6 +23,12 @@ class Config:
         self.max_output_bytes: int = _parse_positive_int(
             os.environ.get("YIELDSHELL_MAX_OUTPUT_BYTES", ""), 20000
         )
+        # Retention is independent of the per-response cap: a process keeps
+        # far more output than any single response returns, so incremental
+        # cursors and tail reads still resolve after a quiet polling gap.
+        self.max_buffer_bytes: int = _parse_positive_int(
+            os.environ.get("YIELDSHELL_MAX_BUFFER_BYTES", ""), 262144
+        )
         self.max_processes: int = _parse_positive_int(
             os.environ.get("YIELDSHELL_MAX_PROCESSES", ""), 50
         )

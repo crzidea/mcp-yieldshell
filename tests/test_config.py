@@ -17,6 +17,11 @@ class TestConfigDefaults:
         config = Config()
         assert config.max_output_bytes == 20000
 
+    def test_default_max_buffer_bytes_exceeds_response_cap(self):
+        config = Config()
+        assert config.max_buffer_bytes == 262144
+        assert config.max_buffer_bytes > config.max_output_bytes
+
     def test_default_max_processes(self):
         config = Config()
         assert config.max_processes == 50
@@ -61,6 +66,17 @@ class TestConfigFromEnv:
         monkeypatch.setenv("YIELDSHELL_MAX_OUTPUT_BYTES", "5000")
         config = Config()
         assert config.max_output_bytes == 5000
+
+    def test_custom_max_buffer_bytes(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_MAX_BUFFER_BYTES", "1048576")
+        config = Config()
+        assert config.max_buffer_bytes == 1048576
+
+    def test_invalid_max_buffer_bytes_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("YIELDSHELL_MAX_BUFFER_BYTES", "not-a-number")
+        assert Config().max_buffer_bytes == 262144
+        monkeypatch.setenv("YIELDSHELL_MAX_BUFFER_BYTES", "0")
+        assert Config().max_buffer_bytes == 262144
 
     def test_custom_max_processes(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "10")

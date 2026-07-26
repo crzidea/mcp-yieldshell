@@ -118,13 +118,27 @@ async def read(
     since_seq: int | None = None,
     max_output_bytes: int | None = None,
     streams: str = "both",
+    tail_lines: int | None = None,
 ) -> dict:
-    """Read output from a managed process. Use since_seq for incremental reads."""
+    """Read output from a managed process.
+
+    Pass ``since_seq`` (the ``next_seq`` from the previous response) to get
+    only output produced since that point. Pass ``tail_lines`` instead to get
+    a snapshot of the newest N lines, which is the cheaper way to monitor a
+    noisy build or test run. The two are mutually exclusive.
+
+    Responses report withheld output with two distinct flags: ``capped``
+    means more output exists and a follow-up ``read(since_seq=next_seq)``
+    will return it, while ``evicted`` means output was dropped from the
+    buffer before it could be read and is gone. ``latest_seq`` shows how far
+    output has advanced beyond this response.
+    """
     return await _get_manager().read_output(
         process_id=process_id,
         since_seq=since_seq,
         max_output_bytes=max_output_bytes,
         streams=streams,
+        tail_lines=tail_lines,
     )
 
 
@@ -149,12 +163,29 @@ async def wait(
     process_id: str,
     timeout_ms: int = MAX_EFFECTIVE_WAIT_MS,
     max_output_bytes: int | None = None,
+    since_seq: int | None = None,
+    tail_lines: int | None = None,
 ) -> dict:
-    """Wait for a process to exit without killing it."""
+    """Wait for a process to exit without killing it.
+
+    ``timeout_ms`` is a **maximum wait**, not an execution limit: it never
+    terminates the process, and it is capped at 55,000ms to stay under
+    typical MCP request timeouts. The response reports ``wait_result``
+    (``exited`` or ``deadline_reached``), ``waited_ms``, and the effective
+    ``max_wait_ms`` so a capped request is visible rather than silent. The
+    separate execution limit that does terminate a process is
+    ``exec(timeout_ms=...)``.
+
+    Pass ``since_seq`` from the previous response to receive only new output
+    instead of replaying the whole buffer on every poll, or ``tail_lines``
+    for a snapshot of the newest N lines.
+    """
     return await _get_manager().wait_process(
         process_id=process_id,
         timeout_ms=timeout_ms,
         max_output_bytes=max_output_bytes,
+        since_seq=since_seq,
+        tail_lines=tail_lines,
     )
 
 
@@ -174,7 +205,13 @@ async def stop(
 
 @mcp.tool()
 async def ps(include_completed: bool = True, limit: int = 50) -> dict:
-    """List managed processes."""
+    """List managed processes.
+
+    Each entry reports ``idle_ms`` (time since output last arrived, ``null``
+    if none has), ``last_output_at``, and ``latest_seq`` alongside byte
+    counts, so a genuinely hung process is distinguishable from one that is
+    working quietly.
+    """
     return _get_manager().list_processes(
         include_completed=include_completed,
         limit=limit,

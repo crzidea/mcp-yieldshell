@@ -147,7 +147,7 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * `name` (string, optional): A human-readable label/name to identify this process.
   * `yield_ms` (integer, optional): Milliseconds to wait before yielding execution to background. Both omitted and explicit values are clamped to the lesser of `YIELDSHELL_MAX_YIELD_MS` and the transport-safe 55,000ms ceiling. Defaults to `YIELDSHELL_DEFAULT_YIELD_MS` (30,000ms).
   * `timeout_ms` (integer, optional): Total execution runtime limit in milliseconds. Process is terminated if it runs longer than this. Defaults to `YIELDSHELL_DEFAULT_TIMEOUT_MS` (3,600,000ms). Pass `0` explicitly for unlimited execution.
-  * `max_output_bytes` (integer, optional): Maximum bytes retained per stdout/stderr ring buffer and returned in total across both response streams. Subject to the `YIELDSHELL_MAX_OUTPUT_BYTES` cap.
+  * `max_output_bytes` (integer, optional): Maximum bytes returned in total across both response streams. Subject to the `YIELDSHELL_MAX_OUTPUT_BYTES` cap. This bounds the response only — retention is controlled separately by `YIELDSHELL_MAX_BUFFER_BYTES`, so output withheld here stays readable via `read`.
 
 * **Side-Effects Guide**:
   * `side_effects` is required and must be a non-empty list. Declare every plausible side-effect category before running the command.
@@ -167,8 +167,9 @@ Execute a shell command. If the command runs longer than `yield_ms`, it yields a
   * Inline code execution: prefer writing the content to a reviewable workspace file (for example `scripts/migrate.sql` or `tools/build.sh`) and run it in a small, inspectable step. Declaring `side_effects=["RUNS_INLINE_CODE"]` is rejected under the default policy; operators can clear that default with `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=,`.
 
 * **Output Statuses**:
-  * `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr. If the response is truncated and terminal-process retention is enabled, it also returns `process_id` so retained output can be inspected with `read`.
-  * `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, a snapshot of initial stdout/stderr, `duration_ms`, `truncated`, and a `message` string describing that the process is running in the background.
+  * Every status returns the cursor fields described under [Byte Cursors & Incremental Reads](#byte-cursors--incremental-reads): `start_seq`, `next_seq`, `latest_seq`, `capped`, and `evicted`. Pass `next_seq` back as `since_seq` to continue reading without replaying output.
+  * `completed`: Process finished within `yield_ms`. Returns exit code, stdout, and stderr. If output was withheld and terminal-process retention is enabled, it also returns `process_id` so the remainder can be inspected with `read`.
+  * `backgrounded`: Process auto-yielded. Returns `process_id`, `pid`, a snapshot of initial stdout/stderr, `duration_ms`, the cursor fields, and a `message` string describing that the process is running in the background.
   * `timed_out`: Process exceeded `timeout_ms` and was terminated.
   * `stopped`: Process was explicitly terminated.
   * `failed_to_start`: Command could not be spawned (e.g., bad directory or policy violation).
@@ -185,9 +186,12 @@ Read stdout and/or stderr output from a running or completed background process.
   * `since_seq` (integer, optional): Byte-position cursor returned as `next_seq` by the previous read. Enables lossless incremental log polling.
   * `max_output_bytes` (integer, optional): Clamps total output returned across the selected streams. Defaults to the server cap.
   * `streams` (string, default: `"both"`): The streams to read. Options: `"both"`, `"stdout"`, or `"stderr"`.
+  * `tail_lines` (integer, optional): Return only the newest N lines instead of reading forward. Useful for monitoring a noisy build or test run without paging through it. Mutually exclusive with `since_seq`; must be positive. If the requested tail exceeds `max_output_bytes`, the newest bytes are kept rather than the oldest.
 
 * **Returns**:
-  * `process_id`, `status`, `exit_code`, `signal`, `next_seq` (byte-position cursor to use in subsequent `since_seq` reads), `truncated` flag, and `stdin_error` when initial input delivery failed. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
+  * `process_id`, `status`, `exit_code`, `signal`, and `stdin_error` when initial input delivery failed. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
+  * Cursor fields: `start_seq` (position of the first byte returned), `next_seq` (cursor to use in the next `since_seq` read), and `latest_seq` (how far output has advanced overall — when it exceeds `next_seq`, more is waiting).
+  * Withheld-output flags: `capped` means the response cap stopped it short and the rest is still readable; `evicted` means output fell out of the ring buffer before it was read and cannot be recovered. When either is set, a `hint` field names the concrete follow-up call.
 
 ### `write`
 Write text input to the standard input (`stdin`) of a running process.
@@ -205,12 +209,31 @@ Block execution until the process exits or the wait timeout expires. This allows
 
 * **Parameters**:
   * `process_id` (string, **required**): Unique identifier of the process.
-  * `timeout_ms` (integer, default: `55000`): Maximum time to wait.
+  * `timeout_ms` (integer, default: `55000`): Maximum time to wait. Never terminates the process.
   * `max_output_bytes` (integer, optional): Maximum total output bytes to return across stdout and stderr.
+  * `since_seq` (integer, optional): Byte-position cursor from a previous response. **Recommended when polling**: without it, every `wait` replays the buffer from the beginning and re-sends output the caller already has.
+  * `tail_lines` (integer, optional): Return only the newest N lines. Mutually exclusive with `since_seq`.
+
+* **Returns**: the same cursor and withheld-output fields as `read`, plus:
+  * `wait_result`: `"exited"` when no live work remains, or `"deadline_reached"` when the wait budget ran out first. This is what distinguishes a still-running process from a wait that gave up — `status` alone cannot.
+  * `waited_ms`: time actually spent waiting.
+  * `max_wait_ms`: the effective budget after capping, so a clamped request is visible rather than silent.
 
 * **Important**: If the wait timeout expires, `wait` returns the current status but **does not kill** the process. It continues running in the background.
-* The effective wait duration is capped at 55 seconds to stay well under typical MCP request timeouts, even if a larger `timeout_ms` is requested.
+* The effective wait duration is capped at 55 seconds to stay well under typical MCP request timeouts, even if a larger `timeout_ms` is requested. The response reports that cap in `max_wait_ms`.
 * `wait` treats the managed process group disappearing as completion. If the tracked shell exits while descendants in its process group remain alive, the record continues to report `running`. For normal process-group completion, stdout/stderr are drained before the response is returned. Final drain waits are bounded so inherited pipes cannot block a request indefinitely.
+
+### Timing Parameters at a Glance
+
+Three separate timers control different things. Only one of them ever terminates a process:
+
+| Parameter | Meaning | Terminates the process? | Default | Effective cap |
+| :--- | :--- | :--- | :--- | :--- |
+| `exec(yield_ms)` | How long `exec` stays inline before handing back a `process_id` and letting the command continue in the background. | No | 30,000ms | Lesser of `YIELDSHELL_MAX_YIELD_MS` and 55,000ms |
+| `exec(timeout_ms)` | Total execution limit. On expiry the process group is sent `SIGTERM`, then `SIGKILL`, and the status becomes `timed_out`. | **Yes** | 3,600,000ms | None (`0` means unlimited) |
+| `wait(timeout_ms)` | Maximum time a single `wait` call blocks. On expiry it returns `wait_result: "deadline_reached"` and the process keeps running. | No | 55,000ms | 55,000ms |
+
+If `wait` returns sooner than expected with `status: "running"`, check `wait_result`: `"exited"` means the tracked shell finished while descendants in its process group are still alive, which keeps the record reported as `running`.
 
 ### `stop`
 Gracefully terminate or force kill a running process.
@@ -229,6 +252,10 @@ Terminal records are retained temporarily for inspection. Before each otherwise 
   * `include_completed` (boolean, default: `true`): If `false`, finished/stopped processes are excluded from the output.
   * `limit` (integer, default: `50`): Maximum number of entries.
 * **Returns**: `processes` — a list of process summary objects, each containing: `process_id`, `pid`, `name`, `command`, `cwd`, `status`, `exit_code`, `signal`, `started_at`, `ended_at`, `duration_ms`, `stdout_bytes`, `stderr_bytes`, and `stdin_error` (`null` unless initial input delivery failed).
+* Activity fields help distinguish a genuine hang from quiet work:
+  * `last_output_at`: wall-clock time output last arrived on either stream, or `null` if none has.
+  * `idle_ms`: milliseconds since that moment, or `null` if no output has arrived. A large and growing `idle_ms` on a `running` process is the signal that it may be stuck.
+  * `latest_seq`: the process-wide cursor position just past the newest captured byte. Comparing it to a `next_seq` you hold shows how much output is waiting.
 
 ### Error Responses
 
@@ -249,10 +276,14 @@ Prune completed, stopped, timed-out, and failed process records to free memory.
 To avoid sending duplicate data over the MCP protocol (which can consume context window space), the server implements a byte-position polling protocol:
 
 1. Every stdout/stderr byte receives a unique position in a cursor shared by both streams.
-2. `read` returns `next_seq`, the position immediately after the selected-stream range covered by the response. A response cap can therefore end safely inside a drain chunk.
-3. To retrieve the next output without gaps, call `read` with `since_seq` set to the previously returned `next_seq` and keep the same `streams` selection.
+2. `read`, `wait`, and `exec` all return `next_seq`, the position immediately after the range covered by the response. A response cap can therefore end safely inside a drain chunk.
+3. To retrieve the next output without gaps, pass that `next_seq` back as `since_seq` and keep the same `streams` selection. **This applies to `wait` as much as to `read`**: a `wait` without `since_seq` replays the buffer from the start on every poll.
 4. Omitting `since_seq` returns the entire contents currently stored in the buffer (clamped by `max_output_bytes`).
-5. If output exceeds the ring buffer's capacity between reads, older data is evicted and `since_seq` may no longer be available. In that case, `truncated` is set to `true` and the read returns data from the earliest retained position onward. Later reads report truncation only when their requested range overlaps evicted data.
+5. Two distinct flags report output the response did not carry, and they call for different responses:
+   * `capped` — the response cap stopped the read short. The remainder is still buffered; call `read(since_seq=next_seq)` to get it.
+   * `evicted` — output exceeded the ring buffer's capacity before it was read and is permanently gone. Retrying cannot recover it; poll more often or raise `YIELDSHELL_MAX_BUFFER_BYTES`. Reads report eviction only when their requested range overlaps evicted data.
+6. `latest_seq` reports how far output has advanced overall. `latest_seq > next_seq` means more is already waiting; `latest_seq == next_seq` means the caller is fully caught up.
+7. Because retention (`YIELDSHELL_MAX_BUFFER_BYTES`, 256 KB per stream) is much larger than the per-response cap (`YIELDSHELL_MAX_OUTPUT_BYTES`, 20 KB), a cursor normally stays resolvable across polling gaps.
 
 Cursor boundaries preserve valid UTF-8 characters. If a single character is larger than a very small requested page, that page may exceed `max_output_bytes` by at most three bytes so the cursor can make progress without corrupting the character.
 
@@ -270,7 +301,8 @@ Configure the server by setting these environment variables prior to launch:
 |---|---|---|
 | `YIELDSHELL_DEFAULT_CWD` | Current directory | The fallback working directory for commands. |
 | `YIELDSHELL_ALLOWED_CWDS` | *(none)* | A list of allowed directory paths separated by `os.pathsep` (e.g., `:` on UNIX, `;` on Windows). If set, all command execution paths must resolve inside one of these roots. |
-| `YIELDSHELL_MAX_OUTPUT_BYTES` | `20000` | The default and maximum capacity of the ring buffers for stdout/stderr. Nonpositive or nonnumeric values use the default. |
+| `YIELDSHELL_MAX_OUTPUT_BYTES` | `20000` | The default and maximum bytes any single response may return across stdout and stderr. This is a response cap only; it does not limit what is retained. Nonpositive or nonnumeric values use the default. |
+| `YIELDSHELL_MAX_BUFFER_BYTES` | `262144` | Capacity of each per-process stdout/stderr ring buffer. Retention is deliberately larger than one response so `since_seq` cursors and `tail_lines` still resolve after a gap between polls. Raise it for very chatty commands, at a cost of roughly this value × 2 streams × live processes in memory. Nonpositive or nonnumeric values use the default. |
 | `YIELDSHELL_MAX_PROCESSES` | `50` | Maximum concurrent live managed process groups, including descendants that outlive a completed shell. Spawning a new command when this limit is reached returns `failed_to_start`. Nonpositive or nonnumeric values use the default. |
 | `YIELDSHELL_DEFAULT_YIELD_MS` | `30000` | Fallback delay before auto-yielding. Effective yields are also capped at 55,000ms. |
 | `YIELDSHELL_MAX_YIELD_MS` | `300000` | Configured maximum for `yield_ms`; the effective maximum is the lesser of this value and 55,000ms. |

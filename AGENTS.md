@@ -22,12 +22,15 @@ graph TD
   * Acts as the central registry tracking active and completed processes in a dictionary mapped by unique IDs (`proc_<hex>`).
   * Implements the core MCP tool logic (`exec_command`, `read_output`, `write_input`, `wait_process`, `stop_process`, `list_processes`, `cleanup`).
   * `exec_command` enforces the required `side_effects` declaration (see `src/mcp_yieldshell/types.py`) before cwd validation, command policy evaluation, process-limit checks, environment overlay building, and subprocess spawn.
-  * `wait_process` caps its effective wait at `MAX_EFFECTIVE_WAIT_MS` (55 s) to avoid MCP request timeouts.
+  * `wait_process` caps its effective wait at `MAX_EFFECTIVE_WAIT_MS` (55 s) to avoid MCP request timeouts, and reports the outcome as `wait_result` (`exited` / `deadline_reached`) alongside `waited_ms` and the effective `max_wait_ms`.
+  * `wait_process` gates on `_await_live_work_end`, not on `completion_event` directly. The event latches when the tracked shell exits, which can happen while descendants still hold the process group open; waiting on it alone returns instantly on every call while the record still reports `running`. `exec_command` deliberately keeps waiting on the raw event so launching a daemon still auto-yields promptly.
 * **`ManagedProcess`** (`src/mcp_yieldshell/process/managed.py`):
   * Groups the underlying `asyncio.subprocess.Process` handle with its stdout/stderr buffers, status, and active control tasks.
+  * Tracks `last_output_at` for idle reporting and exposes `latest_seq`, the shared cursor position just past the newest captured byte.
 * **`RingBuffer`** (`src/mcp_yieldshell/process/ring_buffer.py`):
-  * Maintains a fixed-size, byte-capped buffer for stdout and stderr to avoid unbounded memory growth.
+  * Maintains a fixed-size, byte-capped buffer for stdout and stderr to avoid unbounded memory growth. Capacity comes from `YIELDSHELL_MAX_BUFFER_BYTES` (256 KB default) and is intentionally decoupled from the per-response cap `YIELDSHELL_MAX_OUTPUT_BYTES` (20 KB default), so a cursor stays resolvable across polling gaps.
   * Tracks shared byte-position cursors across stdout and stderr. Readers query the buffer with `since_seq` to retrieve lossless incremental logs, including responses capped inside an original drain chunk.
+  * Reads report withheld output as two independent flags: `capped` (response cap reached; remainder still readable) and `evicted` (data aged out of the buffer; unrecoverable). `tail_start_seq` resolves a `tail_lines` request to a cursor and then delegates to `read_buffers`, reusing its ordering and UTF-8 boundary handling.
 * **`SideEffect`** (`src/mcp_yieldshell/types.py`):
   * String enum of the canonical side-effect categories a command can declare. Shared with config parsing, MCP schema generation, and runtime validation.
   * Default blocked set: `KILLS_AGENT_PROCESS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_PROTECTED_FILES`, `RUNS_INLINE_CODE`. Configurable via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS`.
@@ -39,7 +42,7 @@ graph TD
 
 Whenever a command is executed, `ProcessManager` schedules several async tasks:
 
-1. **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks, decode UTF-8 incrementally, optionally redact secrets selected by `YIELDSHELL_REDACT_ENV_REGEX` across chunk boundaries, and write the resulting bytes to the corresponding `RingBuffer`. Redaction is disabled by default. The tasks must complete draining before a process is marked as fully completed.
+1. **Draining Tasks** (`drain-stdout`, `drain-stderr`): Running concurrently, these tasks read from the subprocess pipes in 4KB chunks, decode UTF-8 incrementally, optionally redact secrets selected by `YIELDSHELL_REDACT_ENV_REGEX` across chunk boundaries, and write the resulting bytes to the corresponding `RingBuffer`. Redaction is disabled by default. Each chunk also stamps `ManagedProcess.last_output_at`, which backs the `idle_ms` field in `ps`. The tasks must complete draining before a process is marked as fully completed.
 2. **Completion Tracker** (`completion-<id>`): Waits for the process to exit using `await proc.wait()`, waits for outstanding drain tasks to finish, and sets the final exit code, signal info, and state transitions.
 3. **Timeout Handler** (`timeout-<id>`): Scheduled if `timeout_ms` is set. After sleeping, if the process is still running, it escalates from `SIGTERM` (graceful) to `SIGKILL` (forced) to clean up hung tasks. To prevent resource leaks, this task is cancelled immediately once the process exits naturally or is stopped.
 4. **Server Shutdown Path**: `ProcessManager.shutdown()` is invoked from the FastMCP lifespan finally block (`src/mcp_yieldshell/server.py`) and is responsible for idempotently terminating all live process groups with a bounded graceful phase, force-killing survivors, draining final output, and settling completion tasks.
@@ -93,7 +96,7 @@ This is a Python 3.11 package using a `src/` layout:
 
 * Tests use `pytest` with `pytest-asyncio`. Async tests are supported automatically by the `asyncio_mode = "auto"` configuration.
 * Name new test files `test_<area>.py` and test functions `test_<expected_behavior>`.
-* Add tests for any edge cases introduced, specifically: process state transitions, timeouts, output truncation, CWD policy, command security checks, side-effect validation, and release script lock refresh/staging behavior.
+* Add tests for any edge cases introduced, specifically: process state transitions, timeouts, output truncation, incremental cursors and tail reads, wait deadline accounting, CWD policy, command security checks, side-effect validation, and release script lock refresh/staging behavior.
 
 ---
 

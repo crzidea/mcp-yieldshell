@@ -140,7 +140,7 @@ class TestAutomaticRetention:
         )
 
         assert result["status"] == "completed"
-        assert result["truncated"] is True
+        assert result["capped"] is True
         assert "process_id" not in result
 
     @pytest.mark.asyncio
@@ -886,6 +886,84 @@ class TestShutdownSpawnRace:
         assert manager._shutdown_complete is True
 
 
+class TestWaitDeadline:
+    @pytest.mark.asyncio
+    async def test_wait_uses_its_budget_when_descendants_hold_the_group(
+        self, monkeypatch
+    ):
+        """A latched completion event must not make wait return instantly.
+
+        When the tracked shell exits but descendants keep the process group
+        alive, the record still reports ``running``. wait must spend its
+        deadline instead of returning immediately, or a polling agent spins.
+        """
+        if sys.platform == "win32":
+            pytest.skip("POSIX process groups only")
+
+        monkeypatch.setattr(
+            "mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 200
+        )
+        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 200)
+        manager = ProcessManager(Config())
+        # The child redirects its own output, so every pipe disconnects and
+        # proc.wait() completes while the process group stays alive. This is
+        # the ordinary "launch a dev server" shape.
+        result = await manager.exec_command(
+            "sleep 30 > /dev/null 2>&1 &",
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = result["process_id"]
+        mp = manager.get_process(process_id)
+        assert mp is not None
+        pgid = mp.process_group_id
+
+        try:
+            # Let the shell exit and latch completion_event while the
+            # detached child keeps the process group alive.
+            for _ in range(100):
+                if mp.completion_event.is_set():
+                    break
+                await asyncio.sleep(0.05)
+            assert mp.completion_event.is_set()
+            assert manager._has_live_work(mp) is True
+
+            started = time.monotonic()
+            wait_result = await manager.wait_process(process_id, timeout_ms=1_000)
+            elapsed_ms = (time.monotonic() - started) * 1000
+
+            assert wait_result["status"] == "running"
+            assert wait_result["wait_result"] == "deadline_reached"
+            assert elapsed_ms >= 900
+        finally:
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_wait_reports_exit_and_effective_cap(self):
+        manager = ProcessManager(Config())
+        try:
+            result = await manager.exec_command(
+                "sleep 0.2", yield_ms=0, side_effects=NONE
+            )
+            process_id = result["process_id"]
+
+            wait_result = await manager.wait_process(
+                process_id, timeout_ms=600_000
+            )
+
+            assert wait_result["status"] == "completed"
+            assert wait_result["wait_result"] == "exited"
+            assert wait_result["max_wait_ms"] == MAX_EFFECTIVE_WAIT_MS
+            assert wait_result["waited_ms"] < 5_000
+        finally:
+            await manager.shutdown()
+
+
 class TestRedactionAcrossTools:
     @pytest.fixture(autouse=True)
     def _enable_redaction(self, monkeypatch):
@@ -936,7 +1014,7 @@ class TestRedactionAcrossTools:
             if page["next_seq"] == cursor:
                 break
             cursor = page["next_seq"]
-            if not page["truncated"]:
+            if not page["capped"]:
                 break
 
         combined = "".join(pages)

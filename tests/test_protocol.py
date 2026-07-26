@@ -54,6 +54,73 @@ async def test_stdio_server_lists_and_executes_tools():
 
 
 @pytest.mark.asyncio
+async def test_stdio_server_incremental_polling_does_not_replay_output():
+    """Poll a chatty process over the real transport without duplication."""
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mcp_yieldshell"],
+    )
+
+    async with stdio_client(params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+
+            started = _payload(
+                await session.call_tool(
+                    "exec",
+                    {
+                        "command": (
+                            "for i in 1 2 3 4 5 6; do echo chunk-$i; "
+                            "sleep 0.2; done"
+                        ),
+                        "side_effects": ["NONE"],
+                        "yield_ms": 0,
+                    },
+                )
+            )
+            assert started["status"] == "backgrounded"
+
+            collected = started["stdout"]
+            cursor = started["next_seq"]
+            pages = 0
+            for _ in range(20):
+                page = _payload(
+                    await session.call_tool(
+                        "wait",
+                        {
+                            "process_id": started["process_id"],
+                            "timeout_ms": 400,
+                            "since_seq": cursor,
+                        },
+                    )
+                )
+                pages += 1
+                collected += page["stdout"]
+                cursor = page["next_seq"]
+                assert page["wait_result"] in ("exited", "deadline_reached")
+                assert page["max_wait_ms"] == 400
+                if page["wait_result"] == "exited":
+                    break
+
+            expected = "".join(f"chunk-{index}\n" for index in range(1, 7))
+            assert collected == expected
+            assert pages > 1
+
+            tail = _payload(
+                await session.call_tool(
+                    "read",
+                    {"process_id": started["process_id"], "tail_lines": 2},
+                )
+            )
+            assert tail["stdout"] == "chunk-5\nchunk-6\n"
+
+            listing = _payload(await session.call_tool("ps", {}))
+            entry = listing["processes"][0]
+            assert entry["idle_ms"] >= 0
+            assert entry["latest_seq"] == len(expected) + 1
+
+
+@pytest.mark.asyncio
 async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
     params = StdioServerParameters(
         command=sys.executable,

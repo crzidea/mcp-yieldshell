@@ -108,8 +108,11 @@ class RingBuffer:
         )
         return {
             "text": result["texts"]["text"],
+            "start_seq": result["start_seq"],
             "next_seq": result["next_seq"],
-            "truncated": result["truncated"],
+            "latest_seq": result["latest_seq"],
+            "evicted": result["evicted"],
+            "capped": result["capped"],
         }
 
     def clear(self) -> None:
@@ -141,6 +144,7 @@ def read_buffers(
     )
     remaining = max(0, max_bytes)
     next_seq: int | None = None
+    start_seq: int | None = None
     capped = False
 
     for index, (start, name, data) in enumerate(segments):
@@ -157,6 +161,8 @@ def read_buffers(
             # Return that one code point so the cursor still makes progress.
             take = _first_utf8_unit_length(data)
         texts[name].extend(data[:take])
+        if start_seq is None:
+            start_seq = start
         next_seq = start + take
         remaining = max(0, remaining - take)
         if take < len(data):
@@ -184,9 +190,82 @@ def read_buffers(
             name: bytes(data).decode("utf-8", errors="replace")
             for name, data in texts.items()
         },
+        "start_seq": next_seq if start_seq is None else start_seq,
         "next_seq": next_seq,
-        "truncated": evicted or capped,
+        "latest_seq": max(
+            (buffer.next_seq for buffer in buffers.values()), default=next_seq
+        ),
+        "evicted": evicted,
+        "capped": capped,
     }
+
+
+def tail_start_seq(
+    buffers: Mapping[str, RingBuffer], tail_lines: int, max_bytes: int
+) -> int:
+    """Return the cursor that starts the last ``tail_lines`` lines of output.
+
+    The result is meant to be passed straight back into :func:`read_buffers`
+    as ``since_seq`` so tail reads reuse its cross-stream ordering and UTF-8
+    boundary handling. The window is additionally clamped to ``max_bytes`` so
+    a tail larger than one response returns its newest bytes rather than its
+    oldest.
+    """
+    segments = sorted(
+        (
+            (start, data)
+            for buffer in buffers.values()
+            for start, data in buffer._segments_from(None)
+        ),
+        key=lambda item: item[0],
+    )
+    if not segments:
+        return max((buffer.next_seq for buffer in buffers.values()), default=1)
+
+    earliest = segments[0][0]
+    latest = segments[-1][0] + len(segments[-1][1])
+    start = earliest
+
+    if tail_lines > 0:
+        remaining_lines = tail_lines
+        is_last_segment = True
+        for segment_start, data in reversed(segments):
+            end = len(data)
+            if is_last_segment:
+                is_last_segment = False
+                # A trailing newline terminates the final line rather than
+                # opening an empty one, matching `tail -n`.
+                if end > 0 and data[end - 1] == 0x0A:
+                    end -= 1
+            while end > 0:
+                index = data.rfind(b"\n", 0, end)
+                if index < 0:
+                    break
+                remaining_lines -= 1
+                if remaining_lines == 0:
+                    start = segment_start + index + 1
+                    end = -1
+                    break
+                end = index
+            if end < 0:
+                break
+
+    if max_bytes > 0 and latest - start > max_bytes:
+        start = _advance_past_continuation(segments, latest - max_bytes)
+    return start
+
+
+def _advance_past_continuation(segments: list[tuple[int, bytes]], seq: int) -> int:
+    """Move ``seq`` forward off a UTF-8 continuation byte, if it sits on one."""
+    for start, data in segments:
+        end = start + len(data)
+        if not start <= seq < end:
+            continue
+        offset = seq - start
+        while offset < len(data) and data[offset] & 0b1100_0000 == 0b1000_0000:
+            offset += 1
+        return start + offset
+    return seq
 
 
 def _utf8_safe_prefix_length(data: bytes, limit: int) -> int:

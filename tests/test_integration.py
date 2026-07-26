@@ -436,13 +436,19 @@ class TestBoundedOutput:
             f"{sys.executable} -c \"print('A' * 500)\"", side_effects=NONE
         )
         assert result["status"] == "completed"
-        assert result["truncated"] is True
+        # Retention is independent of the response cap, so the withheld bytes
+        # are still readable rather than lost.
+        assert result["capped"] is True
+        assert result["evicted"] is False
+        assert result["latest_seq"] > result["next_seq"]
 
     @pytest.mark.asyncio
     async def test_output_within_cap(self, manager):
         result = await manager.exec_command("echo hello", side_effects=NONE)
         assert result["status"] == "completed"
-        assert result["truncated"] is False
+        assert result["capped"] is False
+        assert result["evicted"] is False
+        assert "hint" not in result
 
     @pytest.mark.asyncio
     async def test_large_final_output_burst_preserves_tail(self, manager):
@@ -453,7 +459,7 @@ class TestBoundedOutput:
             side_effects=NONE,
         )
         assert result["status"] == "completed"
-        assert result["truncated"] is False
+        assert result["capped"] is False
         assert result["stdout"].endswith(marker)
 
     @pytest.mark.asyncio
@@ -470,8 +476,158 @@ class TestBoundedOutput:
             started["process_id"], timeout_ms=10_000
         )
         assert wait_result["status"] == "completed"
-        assert wait_result["truncated"] is False
+        assert wait_result["capped"] is False
         assert wait_result["stdout"].endswith(marker)
+
+class TestIncrementalPolling:
+    @pytest.mark.asyncio
+    async def test_repeated_wait_with_cursor_returns_only_new_output(self, manager):
+        started = await manager.exec_command(
+            f"{sys.executable} -c \"import sys,time; "
+            "[ (sys.stdout.write('line-%d\\n' % i), sys.stdout.flush(), "
+            'time.sleep(0.1)) for i in range(10) ]"',
+            yield_ms=0,
+            side_effects=NONE,
+        )
+        process_id = started["process_id"]
+        assert "next_seq" in started
+
+        collected = started["stdout"]
+        cursor = started["next_seq"]
+        for _ in range(20):
+            page = await manager.wait_process(
+                process_id, timeout_ms=300, since_seq=cursor
+            )
+            assert page["start_seq"] >= cursor
+            collected += page["stdout"]
+            cursor = page["next_seq"]
+            if page["wait_result"] == "exited":
+                break
+
+        assert collected == "".join(f"line-{index}\n" for index in range(10))
+
+    @pytest.mark.asyncio
+    async def test_exec_cursor_is_usable_by_read(self, manager):
+        # The yield window is shorter than the command, so exec returns the
+        # first write and a cursor positioned after it.
+        started = await manager.exec_command(
+            "printf 'first\\n'; sleep 2; printf 'second\\n'",
+            yield_ms=300,
+            side_effects=NONE,
+        )
+        process_id = started["process_id"]
+        assert started["status"] == "backgrounded"
+        assert started["stdout"] == "first\n"
+
+        await manager.wait_process(process_id, timeout_ms=5_000)
+        remainder = await manager.read_output(
+            process_id, since_seq=started["next_seq"]
+        )
+
+        assert remainder["stdout"] == "second\n"
+        assert started["stdout"] + remainder["stdout"] == "first\nsecond\n"
+
+    @pytest.mark.asyncio
+    async def test_wait_reports_latest_seq_beyond_a_capped_response(self, manager):
+        started = await manager.exec_command(
+            "seq 1 5000", yield_ms=0, side_effects=NONE
+        )
+        process_id = started["process_id"]
+
+        waited = await manager.wait_process(
+            process_id, timeout_ms=5_000, max_output_bytes=50
+        )
+
+        assert waited["capped"] is True
+        assert waited["latest_seq"] > waited["next_seq"]
+        assert f"since_seq={waited['next_seq']}" in waited["hint"]
+
+
+class TestTailMode:
+    @pytest.mark.asyncio
+    async def test_read_tail_lines_returns_newest_lines(self, manager):
+        await manager.exec_command("seq 1 5000", side_effects=NONE)
+        process_id = manager.list_processes(limit=1)["processes"][0]["process_id"]
+
+        tail = await manager.read_output(process_id, tail_lines=3)
+
+        assert tail["stdout"] == "4998\n4999\n5000\n"
+
+    @pytest.mark.asyncio
+    async def test_wait_tail_lines_returns_newest_lines(self, manager):
+        started = await manager.exec_command(
+            "seq 1 5000", yield_ms=0, side_effects=NONE
+        )
+
+        waited = await manager.wait_process(
+            started["process_id"], timeout_ms=5_000, tail_lines=2
+        )
+
+        assert waited["stdout"] == "4999\n5000\n"
+
+    @pytest.mark.asyncio
+    async def test_tail_lines_and_since_seq_are_mutually_exclusive(self, manager):
+        started = await manager.exec_command(
+            "echo hi", yield_ms=0, side_effects=NONE
+        )
+        process_id = manager.list_processes(limit=1)["processes"][0]["process_id"]
+        assert started is not None
+
+        result = await manager.read_output(
+            process_id, since_seq=1, tail_lines=5
+        )
+        waited = await manager.wait_process(
+            process_id, timeout_ms=100, since_seq=1, tail_lines=5
+        )
+
+        assert "mutually exclusive" in result["error"]
+        assert "mutually exclusive" in waited["error"]
+
+    @pytest.mark.asyncio
+    async def test_non_positive_tail_lines_is_rejected(self, manager):
+        await manager.exec_command("echo hi", side_effects=NONE)
+        process_id = manager.list_processes(limit=1)["processes"][0]["process_id"]
+
+        result = await manager.read_output(process_id, tail_lines=0)
+
+        assert "must be positive" in result["error"]
+
+
+class TestProcessActivity:
+    @pytest.mark.asyncio
+    async def test_ps_reports_idle_time_and_cursor(self, manager):
+        started = await manager.exec_command(
+            "printf 'ready\\n'; sleep 5", yield_ms=0, side_effects=NONE
+        )
+        process_id = started["process_id"]
+
+        try:
+            for _ in range(50):
+                entry = manager.list_processes()["processes"][0]
+                if entry["last_output_at"] is not None:
+                    break
+                await asyncio.sleep(0.05)
+
+            assert entry["status"] == "running"
+            assert entry["last_output_at"] is not None
+            assert entry["idle_ms"] >= 0
+            assert entry["latest_seq"] == len("ready\n") + 1
+        finally:
+            await manager.stop_process(process_id, force_after_ms=200)
+
+    @pytest.mark.asyncio
+    async def test_ps_idle_is_none_before_any_output(self, manager):
+        started = await manager.exec_command(
+            "sleep 5", yield_ms=0, side_effects=NONE
+        )
+        try:
+            entry = manager.list_processes()["processes"][0]
+            assert entry["last_output_at"] is None
+            assert entry["idle_ms"] is None
+            assert entry["latest_seq"] == 1
+        finally:
+            await manager.stop_process(started["process_id"], force_after_ms=200)
+
 
 class TestSecurityConfig:
     @pytest.mark.asyncio
@@ -817,8 +973,9 @@ class TestWaitCapBehavior:
         )
 
         assert result["status"] == "completed"
-        assert result["truncated"] is True
+        assert result["capped"] is True
         assert result["process_id"].startswith("proc_")
+        assert f"since_seq={result['next_seq']}" in result["hint"]
         retained = await manager.read_output(result["process_id"])
         assert retained["status"] == "completed"
 

@@ -1,6 +1,10 @@
 """Unit tests for the ring buffer."""
 
-from mcp_yieldshell.process.ring_buffer import RingBuffer, read_buffers
+from mcp_yieldshell.process.ring_buffer import (
+    RingBuffer,
+    read_buffers,
+    tail_start_seq,
+)
 
 
 class TestRingBufferAppendRead:
@@ -9,15 +13,19 @@ class TestRingBufferAppendRead:
         result = buf.read()
         assert result["text"] == ""
         assert result["next_seq"] == 1
-        assert result["truncated"] is False
+        assert result["capped"] is False
+        assert result["evicted"] is False
 
     def test_append_and_read(self):
         buf = RingBuffer(100)
         buf.append(b"hello")
         result = buf.read()
         assert result["text"] == "hello"
+        assert result["start_seq"] == 1
         assert result["next_seq"] == 6
-        assert result["truncated"] is False
+        assert result["latest_seq"] == 6
+        assert result["capped"] is False
+        assert result["evicted"] is False
 
     def test_multiple_appends(self):
         buf = RingBuffer(100)
@@ -46,7 +54,7 @@ class TestRingBufferEviction:
         buf.append(b"0123456789")  # fills buffer
         buf.append(b"ABCDE")  # overflow, evicts oldest
         result = buf.read()
-        assert result["truncated"] is True
+        assert result["evicted"] is True
         # Should have only the latest data that fits
         assert len(result["text"].encode("utf-8")) <= 10
 
@@ -61,7 +69,7 @@ class TestRingBufferEviction:
         buf = RingBuffer(100)
         buf.append(b"short")
         result = buf.read()
-        assert result["truncated"] is False
+        assert result["evicted"] is False
 
 
 class TestRingBufferSequence:
@@ -119,7 +127,7 @@ class TestRingBufferSequence:
         buf.append(b"ABCDEF")
         # Position 1 was evicted.
         result = buf.read(since_seq=1)
-        assert result["truncated"] is True
+        assert result["evicted"] is True
 
 
 class TestRingBufferTruncation:
@@ -127,14 +135,33 @@ class TestRingBufferTruncation:
         buf = RingBuffer(1000)
         buf.append(b"A" * 500)
         result = buf.read(max_bytes=10)
-        assert result["truncated"] is True
+        # Withheld by the response cap, not lost: the rest is still readable.
+        assert result["capped"] is True
+        assert result["evicted"] is False
+        assert result["latest_seq"] == 501
         assert len(result["text"].encode("utf-8")) <= 10
 
     def test_read_no_truncation_when_within_max(self):
         buf = RingBuffer(1000)
         buf.append(b"short")
         result = buf.read(max_bytes=100)
-        assert result["truncated"] is False
+        assert result["capped"] is False
+        assert result["evicted"] is False
+
+    def test_capped_and_evicted_are_independent(self):
+        buf = RingBuffer(10)
+        buf.append(b"0123456789")
+        buf.append(b"ABCDEFGHIJ")
+
+        result = buf.read(since_seq=1, max_bytes=4)
+
+        # Old bytes are gone and the response also stops short of the rest.
+        assert result["evicted"] is True
+        assert result["capped"] is True
+        assert result["text"] == "ABCD"
+        assert result["start_seq"] == 11
+        assert result["next_seq"] == 15
+        assert result["latest_seq"] == 21
 
     def test_capped_read_cursor_resumes_inside_chunk(self):
         buf = RingBuffer(1000)
@@ -160,7 +187,7 @@ class TestRingBufferTruncation:
         result = buf.read(since_seq=fresh_seq)
 
         assert result["text"] == "xy"
-        assert result["truncated"] is False
+        assert result["evicted"] is False
 
 
 class TestRingBufferUTF8:
@@ -206,7 +233,7 @@ class TestRingBufferUTF8:
 
         assert result["text"] == ""
         assert result["next_seq"] == 4
-        assert result["truncated"] is True
+        assert result["evicted"] is True
 
     def test_utf8_split_across_append_chunks_remains_lossless(self):
         buf = RingBuffer(100)
@@ -220,7 +247,7 @@ class TestRingBufferUTF8:
             result = buf.read(since_seq=cursor, max_bytes=2)
             pages.append(result["text"])
             cursor = result["next_seq"]
-            if not result["truncated"]:
+            if not result["capped"]:
                 break
 
         assert "".join(pages) == "a€z"
@@ -235,6 +262,89 @@ class TestRingBufferUTF8:
         assert buf.byte_count == total
         result = buf.read()
         assert result["text"] == ""
+
+
+class TestTailStartSeq:
+    def _read_tail(self, buffers, tail_lines, max_bytes=1000):
+        start = tail_start_seq(buffers, tail_lines, max_bytes)
+        return read_buffers(buffers, since_seq=start, max_bytes=max_bytes)
+
+    def test_returns_last_n_lines(self):
+        buf = RingBuffer(1000)
+        buf.append(b"one\ntwo\nthree\nfour\n")
+
+        result = self._read_tail({"text": buf}, 2)
+
+        assert result["texts"]["text"] == "three\nfour\n"
+
+    def test_trailing_newline_does_not_count_as_an_empty_line(self):
+        buf = RingBuffer(1000)
+        buf.append(b"alpha\nbeta\n")
+
+        assert self._read_tail({"text": buf}, 1)["texts"]["text"] == "beta\n"
+
+    def test_unterminated_final_line_is_returned(self):
+        buf = RingBuffer(1000)
+        buf.append(b"alpha\nbeta")
+
+        assert self._read_tail({"text": buf}, 1)["texts"]["text"] == "beta"
+
+    def test_fewer_lines_available_than_requested(self):
+        buf = RingBuffer(1000)
+        buf.append(b"only\ntwo\n")
+
+        result = self._read_tail({"text": buf}, 50)
+
+        assert result["texts"]["text"] == "only\ntwo\n"
+        assert result["start_seq"] == 1
+
+    def test_empty_buffer(self):
+        buf = RingBuffer(1000)
+
+        result = self._read_tail({"text": buf}, 5)
+
+        assert result["texts"]["text"] == ""
+
+    def test_tail_spans_both_streams_in_original_order(self):
+        seq_source = [1]
+        stdout_buf = RingBuffer(100, seq_source=seq_source)
+        stderr_buf = RingBuffer(100, seq_source=seq_source)
+        stdout_buf.append(b"out1\n")
+        stderr_buf.append(b"err1\n")
+        stdout_buf.append(b"out2\n")
+
+        result = self._read_tail(
+            {"stdout": stdout_buf, "stderr": stderr_buf}, 2
+        )
+
+        assert result["texts"] == {"stdout": "out2\n", "stderr": "err1\n"}
+
+    def test_tail_larger_than_max_bytes_keeps_newest_bytes(self):
+        buf = RingBuffer(1000)
+        buf.append(b"aaaa\nbbbb\ncccc\n")
+
+        result = self._read_tail({"text": buf}, 3, max_bytes=5)
+
+        # The byte clamp wins, and it keeps the end rather than the start.
+        assert result["texts"]["text"] == "cccc\n"
+
+    def test_byte_clamp_does_not_split_a_utf8_character(self):
+        buf = RingBuffer(1000)
+        buf.append("aa€bb\n".encode())
+
+        result = self._read_tail({"text": buf}, 1, max_bytes=5)
+
+        assert "�" not in result["texts"]["text"]
+        assert result["texts"]["text"] == "bb\n"
+
+    def test_tail_after_eviction_starts_at_retained_data(self):
+        buf = RingBuffer(10)
+        buf.append(b"old-line\n")
+        buf.append(b"new\n")
+
+        result = self._read_tail({"text": buf}, 5)
+
+        assert result["texts"]["text"].endswith("new\n")
 
 
 class TestRingBufferSharedSeq:
@@ -316,4 +426,5 @@ class TestRingBufferSharedSeq:
 
         assert stdout_only["next_seq"] == 11
         assert remainder["texts"] == {"stdout": "", "stderr": "ERR1\nERR2\n"}
-        assert remainder["truncated"] is False
+        assert remainder["capped"] is False
+        assert remainder["evicted"] is False
