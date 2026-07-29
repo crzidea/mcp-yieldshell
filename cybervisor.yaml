@@ -1,4 +1,8 @@
 # For guidance on editing this file, run: `cybervisor docs cybervisor.yaml`
+hooks:
+  before_stage: ~/.cybervisor/hooks/send-stage-notification.sh
+  after_stage: ~/.cybervisor/hooks/send-stage-notification.sh
+
 stages:
   - name: Plan
     prompt_template: |
@@ -351,6 +355,7 @@ stages:
       routes:
         APPROVED:
           description: Verification passed and no further implementation work is required.
+          next_stage: Commit
         CHANGES_REQUESTED:
           description: Verification found issues that must be fixed before the work can be accepted.
           next_stage: Review Code
@@ -367,6 +372,54 @@ stages:
     reset_iterations:
       - Review Code
       - Review Docs
+
+  - name: Commit
+    prompt_template: |
+      Commit the delivery that passed verification.
+
+      ## Repository Scope
+
+      - Inspect status and diffs in the outer repository.
+      - Inspect status and diffs in every independent nested repository.
+      - Identify only files belonging to the verified delivery.
+      - Use the planning artifacts and verification report as scope evidence.
+      - Preserve and leave unstaged every unrelated pre-existing or user-owned change.
+
+      ## Commit Requirements
+
+      - Create one focused Conventional Commit in each affected nested repository.
+      - Create the outer-repository commit after all affected nested repositories.
+      - Never stage secrets, `.env*`, keys, logs, `.cybervisor/` runtime state, or generated files.
+      - Never stage or commit any files under `.cybervisor/` directory under any circumstances.
+      - Never stage unrelated changes.
+      - Do not amend, rebase, force-push, push, or open a pull request.
+      - Verify every created commit.
+
+      ## Retry Safety
+
+      - Inspect recent commits before staging any file.
+      - Detect repositories whose verified changes were committed by an earlier attempt.
+      - Reuse an existing matching commit instead of creating a duplicate or empty commit.
+      - If an earlier attempt committed only part of the delivery, commit only the remaining repositories.
+      - Confirm every created commit contains the intended verified diff.
+    keep_artifacts:
+      - .cybervisor/artifacts/continuous/selection.md
+      - .cybervisor/artifacts/continuous/spec.md
+      - .cybervisor/artifacts/plan.md
+      - .cybervisor/artifacts/tasks.md
+      - .cybervisor/artifacts/verify.md
+      - .cybervisor/artifacts/verification-report.md
+    max_retries: 2
+    contract:
+      required_tasks:
+        - Inspect status and diffs in the outer and all nested repositories
+        - Stage only files belonging to the verified delivery
+        - Create focused Conventional Commits in every affected repository
+        - Avoid duplicate or empty commits when retrying a partially completed Commit stage
+        - Verify every created commit
+      routes:
+        COMMITTED:
+          description: All verified delivery changes were committed without including unrelated or sensitive files.
 
 disabled_skills:
   # superpowers skill set
