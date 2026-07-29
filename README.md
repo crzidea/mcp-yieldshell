@@ -259,7 +259,7 @@ Terminal records are retained temporarily for inspection. Before each otherwise 
 
 ### Error Responses
 
-All tools that accept a `process_id` parameter return a structured error dict when the ID is unknown, e.g. `{"process_id": "proc_abc123", "error": "Unknown process_id: proc_abc123"}`. Tools that accept `process_id` always include it in the response alongside the error.
+All tools that accept a `process_id` parameter return a structured error dict when the ID is unknown, e.g. `{"process_id": "a97e81c9034f", "error": "Unknown process_id: a97e81c9034f"}`. Tools that accept `process_id` always include it in the response alongside the error.
 
 ### `cleanup`
 Prune completed, stopped, timed-out, and failed process records to free memory.
@@ -334,6 +334,8 @@ Configure the server by setting these environment variables prior to launch:
 ## Lifecycle and Compatibility
 
 YieldShell gives graceful termination 10 seconds before force-killing, waits up to 5 seconds for a POSIX process group to disappear, and allows up to 3 seconds for final stream draining. On stdio server shutdown, all live managed processes are terminated concurrently using the same bounded graceful/forced policy. Already-terminal records are not changed by shutdown.
+
+`process_id` is an opaque, server-generated string. Clients must pass it through unchanged rather than parsing or pattern-matching it; in particular, the former fixed prefix has been removed.
 
 Current lifecycle defaults are a 30-second auto-yield, one-hour runtime timeout, 55-second effective request-wait and stop-grace ceilings, 10-second default stop grace, automatic terminal-record retention, opt-in streaming output redaction, and shutdown containment. Standard input closes after `exec` by default; callers that need an interactive session must set `close_stdin=false`. Use explicit shorter timing values where lower latency is preferred, and pass `timeout_ms=0` to retain unlimited runtime behavior.
 

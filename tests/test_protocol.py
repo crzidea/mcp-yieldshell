@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 import pytest
@@ -16,6 +17,12 @@ def _payload(result: CallToolResult) -> dict:
     assert len(result.content) == 1
     assert isinstance(result.content[0], TextContent)
     return json.loads(result.content[0].text)
+
+
+def _assert_bare_process_id(value: object) -> str:
+    assert isinstance(value, str)
+    assert re.fullmatch(r"[0-9a-f]{12}", value)
+    return value
 
 
 @pytest.mark.asyncio
@@ -79,6 +86,9 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
                 )
             )
             assert started["status"] == "backgrounded"
+            process_id = _assert_bare_process_id(started["process_id"])
+            assert isinstance(started["pid"], int)
+            assert process_id != str(started["pid"])
 
             # No since_seq anywhere: the server-side cursor is what keeps
             # these responses from repeating output.
@@ -89,11 +99,12 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
                     await session.call_tool(
                         "wait",
                         {
-                            "process_id": started["process_id"],
+                            "process_id": process_id,
                             "timeout_ms": 400,
                         },
                     )
                 )
+                assert _assert_bare_process_id(page["process_id"]) == process_id
                 pages += 1
                 collected += page["stdout"]
                 assert page["wait_result"] in ("exited", "deadline_reached")
@@ -108,13 +119,17 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
             tail = _payload(
                 await session.call_tool(
                     "read",
-                    {"process_id": started["process_id"], "tail_lines": 2},
+                    {"process_id": process_id, "tail_lines": 2},
                 )
             )
+            assert _assert_bare_process_id(tail["process_id"]) == process_id
             assert tail["stdout"] == "chunk-5\nchunk-6\n"
 
             listing = _payload(await session.call_tool("ps", {}))
             entry = listing["processes"][0]
+            assert _assert_bare_process_id(entry["process_id"]) == process_id
+            assert entry["pid"] == started["pid"]
+            assert entry["process_id"] != str(entry["pid"])
             assert entry["idle_ms"] >= 0
             assert entry["latest_seq"] == len(expected) + 1
 
@@ -142,12 +157,13 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                 )
             )
             assert started["status"] == "backgrounded"
+            process_id = _assert_bare_process_id(started["process_id"])
 
             written = _payload(
                 await session.call_tool(
                     "write",
                     {
-                        "process_id": started["process_id"],
+                        "process_id": process_id,
                         "input": "protocol-input",
                         "newline": True,
                         "close_stdin": True,
@@ -155,17 +171,19 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                 )
             )
             assert written["ok"] is True
+            assert _assert_bare_process_id(written["process_id"]) == process_id
 
             waited = _payload(
                 await session.call_tool(
                     "wait",
                     {
-                        "process_id": started["process_id"],
+                        "process_id": process_id,
                         "timeout_ms": 5_000,
                     },
                 )
             )
             assert waited["status"] == "completed"
+            assert _assert_bare_process_id(waited["process_id"]) == process_id
             assert waited["stdout"] == "protocol-input\n"
 
             sleeper = _payload(
@@ -179,17 +197,19 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                 )
             )
             assert sleeper["status"] == "backgrounded"
+            sleeper_id = _assert_bare_process_id(sleeper["process_id"])
 
             stopped = _payload(
                 await session.call_tool(
                     "stop",
                     {
-                        "process_id": sleeper["process_id"],
+                        "process_id": sleeper_id,
                         "force_after_ms": 100,
                     },
                 )
             )
             assert stopped["stopped"] is True
+            assert _assert_bare_process_id(stopped["process_id"]) == sleeper_id
 
             cleaned = _payload(
                 await session.call_tool(

@@ -98,7 +98,7 @@ class ProcessManager:
 
     def _new_id(self) -> str:
         while True:
-            process_id = f"proc_{uuid.uuid4().hex[:12]}"
+            process_id = uuid.uuid4().hex[:12]
             if process_id not in self._processes:
                 return process_id
 

@@ -53,7 +53,7 @@ class TestTerminalStateAccuracy:
         process.returncode = None
         process.stdin = None
         info = ProcessInfo(
-            process_id="proc_survivor",
+            process_id="survivor",
             pid=None,
             command="survivor",
             cwd=os.getcwd(),
@@ -89,7 +89,7 @@ class TestDrainLifecycle:
         process.stdout = MagicMock()
         process.stderr = MagicMock()
         info = ProcessInfo(
-            process_id="proc_pipes",
+            process_id="pipes",
             pid=None,
             command="child",
             cwd=os.getcwd(),
@@ -127,7 +127,7 @@ class TestConcurrentShutdown:
         process.stdout = None
         process.stderr = None
         info = ProcessInfo(
-            process_id="proc_shutdown",
+            process_id="shutdown",
             pid=None,
             command="long-running",
             cwd=os.getcwd(),

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import shutil
 import signal
 import sys
@@ -91,7 +92,7 @@ class TestLongCommand:
         )
         assert result["status"] == "backgrounded"
         assert "process_id" in result
-        assert result["process_id"].startswith("proc_")
+        assert re.fullmatch(r"[0-9a-f]{12}", result["process_id"])
         # Clean up
         await short_yield_manager.stop_process(result["process_id"], force_after_ms=500)
 
@@ -329,7 +330,7 @@ class TestWrite:
 
     @pytest.mark.asyncio
     async def test_write_unknown_process(self, manager):
-        result = await manager.write_input("proc_nonexistent", "hello")
+        result = await manager.write_input("nonexistent", "hello")
         assert result["ok"] is False
         assert "Unknown" in result.get("error", "")
 
@@ -378,7 +379,7 @@ class TestStop:
 
     @pytest.mark.asyncio
     async def test_stop_unknown_process(self, manager):
-        result = await manager.stop_process("proc_nonexistent")
+        result = await manager.stop_process("nonexistent")
         assert result["stopped"] is False
         assert "Unknown" in result.get("error", "")
 
@@ -910,7 +911,7 @@ class TestWriteErrors:
 
     @pytest.mark.asyncio
     async def test_write_unknown_process(self, manager):
-        result = await manager.write_input("proc_nonexistent", "hello")
+        result = await manager.write_input("nonexistent", "hello")
         assert result["ok"] is False
 
 
@@ -928,7 +929,7 @@ class TestStopResponseShape:
 
     @pytest.mark.asyncio
     async def test_stop_unknown_includes_error_field(self, manager):
-        result = await manager.stop_process("proc_nonexistent")
+        result = await manager.stop_process("nonexistent")
         assert "error" in result
 
 
@@ -948,28 +949,29 @@ class TestReadStreamValidation:
 class TestUnknownProcessIds:
     @pytest.mark.asyncio
     async def test_read_unknown_process(self, manager):
-        result = await manager.read_output("proc_nonexistent")
-        assert "error" in result
-        assert result["process_id"] == "proc_nonexistent"
+        result = await manager.read_output("nonexistent")
+        assert result["process_id"] == "nonexistent"
+        assert result["error"] == "Unknown process_id: nonexistent"
 
     @pytest.mark.asyncio
     async def test_wait_unknown_process(self, manager):
-        result = await manager.wait_process("proc_nonexistent")
-        assert "error" in result
-        assert result["process_id"] == "proc_nonexistent"
+        result = await manager.wait_process("nonexistent")
+        assert result["process_id"] == "nonexistent"
+        assert result["error"] == "Unknown process_id: nonexistent"
 
     @pytest.mark.asyncio
     async def test_stop_unknown_process(self, manager):
-        result = await manager.stop_process("proc_nonexistent")
-        assert "error" in result
-        assert result["process_id"] == "proc_nonexistent"
+        result = await manager.stop_process("nonexistent")
+        assert result["process_id"] == "nonexistent"
+        assert result["error"] == "Unknown process_id: nonexistent"
         assert result["stopped"] is False
 
     @pytest.mark.asyncio
     async def test_write_unknown_process(self, manager):
-        result = await manager.write_input("proc_nonexistent", "hello")
+        result = await manager.write_input("nonexistent", "hello")
+        assert result["process_id"] == "nonexistent"
         assert result["ok"] is False
-        assert "Unknown" in result.get("error", "")
+        assert result["error"] == "Unknown process_id: nonexistent"
 
 
 class TestWaitCapBehavior:
@@ -1009,7 +1011,7 @@ class TestWaitCapBehavior:
 
         assert result["status"] == "completed"
         assert result["capped"] is True
-        assert result["process_id"].startswith("proc_")
+        assert re.fullmatch(r"[0-9a-f]{12}", result["process_id"])
         assert f"since_seq={result['next_seq']}" in result["hint"]
         retained = await manager.read_output(result["process_id"])
         assert retained["status"] == "completed"

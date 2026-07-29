@@ -19,7 +19,7 @@ graph TD
 ### Key Components
 
 * **`ProcessManager`** (`src/mcp_yieldshell/process/manager.py`):
-  * Acts as the central registry tracking active and completed processes in a dictionary mapped by unique IDs (`proc_<hex>`).
+  * Acts as the central registry tracking active and completed processes in a dictionary mapped by unique bare 12-character hexadecimal IDs.
   * Implements the core MCP tool logic (`exec_command`, `read_output`, `write_input`, `wait_process`, `stop_process`, `list_processes`, `cleanup`).
   * `exec_command` enforces the required `side_effects` declaration (see `src/mcp_yieldshell/types.py`) before cwd validation, command policy evaluation, process-limit checks, environment overlay building, and subprocess spawn.
   * `wait_process` caps its effective wait at `MAX_EFFECTIVE_WAIT_MS` (55 s) to avoid MCP request timeouts, and reports the outcome as `wait_result` (`exited` / `deadline_reached`) alongside `waited_ms` and the effective `max_wait_ms`.
