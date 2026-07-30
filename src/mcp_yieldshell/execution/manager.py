@@ -135,7 +135,7 @@ class ExecutionManager:
         tail_lines: int | None,
         resumable: bool = True,
     ) -> dict[str, Any]:
-        """Read buffers, resuming from the process cursor when none is given.
+        """Read buffers, resuming from the execution cursor when none is given.
 
         A request with no ``since_seq`` and no ``tail_lines`` continues from
         where the last such read stopped and then advances that cursor, so a
@@ -162,7 +162,7 @@ class ExecutionManager:
 
     @staticmethod
     def _cursor_fields(execution_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Cursor and withheld-output fields shared by exec, read, and wait."""
+        """Cursor and withheld-output fields shared by execute, read, and wait."""
         fields: dict[str, Any] = {
             "start_seq": data["start_seq"],
             "next_seq": data["next_seq"],
@@ -179,7 +179,7 @@ class ExecutionManager:
             )
         if data["evicted"]:
             hints.append(
-                "Older output was dropped from the buffer before this read and "
+                "Older execution output was dropped before this read and "
                 "cannot be recovered; poll more often or raise "
                 "YIELDSHELL_MAX_BUFFER_BYTES."
             )
@@ -462,7 +462,6 @@ class ExecutionManager:
 
         # Prepare output for response
         snapshot = self._read_snapshot(mp, effective_max_output)
-        withheld = snapshot["capped"] or snapshot["evicted"]
         # Every branch carries the cursor so a caller can keep reading without
         # replaying output it already received.
         common = {"duration_ms": round(duration_ms, 1), **snapshot}
@@ -470,20 +469,32 @@ class ExecutionManager:
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
         }
+        # Response matrix: failed_to_start returns before a record is created;
+        # every retained result is addressable by its opaque execution ID and
+        # exposes the initial shell's OS process ID when one is available.
+        addressable = self._executions.get(execution_id) is mp
+        identifiers: dict[str, Any] = {}
+        if addressable:
+            identifiers["execution_id"] = execution_id
+            if mp.info.process_id is not None:
+                identifiers["process_id"] = mp.info.process_id
 
         if (
             mp.info.status == ExecutionStatus.COMPLETED
             and not self._has_live_work(mp)
         ):
-            result: dict[str, Any] = {"status": "completed", **exited, **common}
-            if withheld and self._executions.get(execution_id) is mp:
-                result["execution_id"] = execution_id
+            result: dict[str, Any] = {
+                "status": "completed",
+                **identifiers,
+                **exited,
+                **common,
+            }
             return self._with_stdin_error(mp, result)
 
         if mp.info.status == ExecutionStatus.TIMED_OUT:
             return self._with_stdin_error(mp, {
                 "status": "timed_out",
-                "execution_id": execution_id,
+                **identifiers,
                 **exited,
                 **common,
             })
@@ -491,7 +502,7 @@ class ExecutionManager:
         if mp.info.status == ExecutionStatus.STOPPED:
             return self._with_stdin_error(mp, {
                 "status": "stopped",
-                "execution_id": execution_id,
+                **identifiers,
                 **exited,
                 **common,
             })
@@ -499,7 +510,7 @@ class ExecutionManager:
         if mp.info.status == ExecutionStatus.FAILED:
             return self._with_stdin_error(mp, {
                 "status": "failed",
-                "execution_id": execution_id,
+                **identifiers,
                 **exited,
                 **common,
             })
@@ -507,10 +518,12 @@ class ExecutionManager:
         # Still running — background it
         return self._with_stdin_error(mp, {
             "status": "backgrounded",
-            "execution_id": execution_id,
-            "pid": mp.info.pid,
+            **identifiers,
             **common,
-            "message": "Process is running in the background. Use read/wait/stop with execution_id.",
+            "message": (
+                "Execution is running in the background. Use read, wait, or "
+                "stop with execution_id."
+            ),
         })
 
     async def _write_initial_input(
@@ -827,7 +840,7 @@ class ExecutionManager:
         streams: str = "both",
         tail_lines: int | None = None,
     ) -> dict[str, Any]:
-        """Read output from a managed process."""
+        """Read output from a managed execution."""
         mp = self._executions.get(execution_id)
         if mp is None:
             return {"execution_id": execution_id, "error": f"Unknown execution_id: {execution_id}"}
@@ -875,7 +888,7 @@ class ExecutionManager:
         newline: bool = False,
         close_stdin: bool = False,
     ) -> dict[str, Any]:
-        """Write to stdin of a managed process."""
+        """Write to stdin of a managed execution."""
         mp = self._executions.get(execution_id)
         if mp is None:
             return {
@@ -887,7 +900,7 @@ class ExecutionManager:
             return {
                 "execution_id": execution_id,
                 "ok": False,
-                "error": f"Process is not running (status: {mp.info.status.value})",
+                "error": f"Execution is not running (status: {mp.info.status.value})",
             }
 
         if mp.proc.stdin is None or mp.proc.stdin.is_closing():
@@ -948,9 +961,9 @@ class ExecutionManager:
         since_seq: int | None = None,
         tail_lines: int | None = None,
     ) -> dict[str, Any]:
-        """Wait for a process to exit without killing it.
+        """Wait for an execution to exit without stopping it.
 
-        ``timeout_ms`` is a maximum wait and never terminates the process.
+        ``timeout_ms`` is a maximum wait and never stops the execution.
         Pass ``since_seq`` from a previous response to receive only output
         produced since that cursor.
         """
@@ -1003,7 +1016,7 @@ class ExecutionManager:
         signal_name: str = "SIGTERM",
         force_after_ms: int = GRACEFUL_STOP_MS,
     ) -> dict[str, Any]:
-        """Stop a running process with graceful termination then force kill."""
+        """Stop a running execution with graceful termination then force kill."""
         from .spawn import get_signal
 
         mp = self._executions.get(execution_id)
@@ -1017,7 +1030,7 @@ class ExecutionManager:
             return {
                 "execution_id": execution_id,
                 "stopped": False,
-                "error": f"Process is not running (status: {mp.info.status.value})",
+                "error": f"Execution is not running (status: {mp.info.status.value})",
             }
 
         # Send requested signal
@@ -1086,18 +1099,18 @@ class ExecutionManager:
     def list_executions(
         self, include_completed: bool = True, limit: int = 50
     ) -> dict[str, Any]:
-        """List managed processes."""
+        """List managed executions."""
         now = time.time()
-        processes = []
+        executions = []
         for mp in list(self._executions.values()):
             has_live_work = self._has_live_work(mp)
             reported_status = self._reported_status(mp, has_live_work)
             if not include_completed and reported_status != ExecutionStatus.RUNNING.value:
                 continue
-            processes.append(
+            executions.append(
                 {
                     "execution_id": mp.info.execution_id,
-                    "pid": mp.info.pid,
+                    "process_id": mp.info.process_id,
                     "name": (
                         self._redact(mp, mp.info.name)
                         if mp.info.name is not None
@@ -1129,15 +1142,15 @@ class ExecutionManager:
                     "stdin_error": mp.stdin_error,
                 }
             )
-        processes.reverse()  # Most recent first
-        return {"processes": processes[: max(0, limit)]}
+        executions.reverse()  # Most recent first
+        return {"executions": executions[: max(0, limit)]}
 
     async def cleanup(
         self,
         completed_older_than_ms: int = 3600000,
         stopped_older_than_ms: int = 3600000,
     ) -> dict[str, Any]:
-        """Remove completed/stopped processes older than thresholds."""
+        """Remove completed/stopped executions older than thresholds."""
         if completed_older_than_ms < 0 or stopped_older_than_ms < 0:
             return {
                 "removed": 0,
