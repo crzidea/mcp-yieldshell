@@ -11,8 +11,8 @@ import pytest
 
 from mcp_yieldshell.config import Config
 from mcp_yieldshell.policy import MAX_EFFECTIVE_WAIT_MS
-from mcp_yieldshell.process.manager import ProcessManager
-from mcp_yieldshell.types import ProcessStatus, SideEffect
+from mcp_yieldshell.execution.manager import ProcessManager
+from mcp_yieldshell.types import ExecutionStatus, SideEffect
 
 NONE = [SideEffect.NONE]
 
@@ -144,7 +144,7 @@ class TestLongCommand:
         try:
             wait_result = await manager.wait_process(pid, timeout_ms=5000)
 
-            assert mp.info.status == ProcessStatus.COMPLETED
+            assert mp.info.status == ExecutionStatus.COMPLETED
             assert wait_result["status"] == "running"
             assert wait_result["exit_code"] == 0
         finally:
@@ -160,8 +160,8 @@ class TestLongCommand:
     ):
         if sys.platform == "win32":
             pytest.skip("POSIX process groups only")
-        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 100)
-        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 500)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.GRACEFUL_STOP_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.PROCESS_GROUP_EXIT_MS", 500)
 
         result = await manager.exec_command(
             "python -c \"import signal,time; "
@@ -1099,7 +1099,7 @@ class TestIncrementalReadSinceSeq:
 
 class TestRingBufferByteCount:
     def test_byte_count_tracks_total_written(self):
-        from mcp_yieldshell.process.ring_buffer import RingBuffer
+        from mcp_yieldshell.execution.ring_buffer import RingBuffer
 
         buf = RingBuffer(10)
         buf.append(b"0123456789")
@@ -1108,7 +1108,7 @@ class TestRingBufferByteCount:
         assert buf.byte_count == 15
 
     def test_byte_count_tracks_total_after_eviction(self):
-        from mcp_yieldshell.process.ring_buffer import RingBuffer
+        from mcp_yieldshell.execution.ring_buffer import RingBuffer
 
         buf = RingBuffer(10)
         buf.append(b"0123456789")
@@ -1117,7 +1117,7 @@ class TestRingBufferByteCount:
         assert buf._retained_bytes <= 10
 
     def test_clear_resets_retained_but_not_total(self):
-        from mcp_yieldshell.process.ring_buffer import RingBuffer
+        from mcp_yieldshell.execution.ring_buffer import RingBuffer
 
         buf = RingBuffer(100)
         buf.append(b"hello")
@@ -1282,9 +1282,9 @@ class TestDefectFixes:
         self, manager, monkeypatch
     ):
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 10
+            "mcp_yieldshell.execution.manager.PROCESS_GROUP_EXIT_MS", 10
         )
-        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 10)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.FINAL_DRAIN_MS", 10)
         command = (
             f"{sys.executable} -c 'import os,time; "
             "pid=os.fork(); time.sleep(30) if pid == 0 else None; os._exit(0)'"

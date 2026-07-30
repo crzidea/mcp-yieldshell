@@ -24,8 +24,8 @@ from ..security import (
     redact_text,
 )
 from ..side_effects import validate_side_effects
-from ..types import ProcessInfo, ProcessStatus, SideEffect
-from .managed import ManagedProcess
+from ..types import ExecutionInfo, ExecutionStatus, SideEffect
+from .managed import ManagedExecution
 from .ring_buffer import RingBuffer, read_buffers, tail_start_seq
 from .spawn import kill_process, spawn_process, terminate_process
 
@@ -36,7 +36,7 @@ class ProcessManager:
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._processes: dict[str, ManagedProcess] = {}
+        self._processes: dict[str, ManagedExecution] = {}
         self._pending_spawns = 0
         self._pending_spawn_tasks: set[asyncio.Task[Any]] = set()
         self._shutdown_lock = asyncio.Lock()
@@ -110,7 +110,7 @@ class ProcessManager:
 
     def _read_snapshot(
         self,
-        mp: ManagedProcess,
+        mp: ManagedExecution,
         max_output_bytes: int,
         since_seq: int | None = None,
         tail_lines: int | None = None,
@@ -128,7 +128,7 @@ class ProcessManager:
 
     @staticmethod
     def _read_for_response(
-        mp: ManagedProcess,
+        mp: ManagedExecution,
         buffers: dict[str, RingBuffer],
         max_output_bytes: int,
         since_seq: int | None,
@@ -187,7 +187,7 @@ class ProcessManager:
             fields["hint"] = " ".join(hints)
         return fields
 
-    def _redact(self, mp: ManagedProcess, text: str) -> str:
+    def _redact(self, mp: ManagedExecution, text: str) -> str:
         return redact_text(self._config, text, mp.sensitive_env)
 
     def _clamp_yield_ms(self, requested: int | None) -> int:
@@ -206,28 +206,28 @@ class ProcessManager:
         return max(0, min(requested, max_grace_ms))
 
     @staticmethod
-    def _is_terminal(mp: ManagedProcess) -> bool:
-        return mp.info.status != ProcessStatus.RUNNING
+    def _is_terminal(mp: ManagedExecution) -> bool:
+        return mp.info.status != ExecutionStatus.RUNNING
 
     @staticmethod
-    def _mark_ended(mp: ManagedProcess) -> None:
+    def _mark_ended(mp: ManagedExecution) -> None:
         mp.info.ended_at = time.time()
         mp.info.duration_ms = (
             time.monotonic() - mp.info.start_monotonic
         ) * 1000
 
-    def _has_live_work(self, mp: ManagedProcess) -> bool:
+    def _has_live_work(self, mp: ManagedExecution) -> bool:
         return not self._is_terminal(mp) or self._process_group_exists(mp)
 
     def _reported_status(
         self,
-        mp: ManagedProcess,
+        mp: ManagedExecution,
         has_live_work: bool | None = None,
     ) -> str:
         """Status exposed to tools; descendants keep the record logically running."""
         live = self._has_live_work(mp) if has_live_work is None else has_live_work
-        if live and mp.info.status == ProcessStatus.COMPLETED:
-            return ProcessStatus.RUNNING.value
+        if live and mp.info.status == ExecutionStatus.COMPLETED:
+            return ExecutionStatus.RUNNING.value
         return mp.info.status.value
 
     def _reap_terminal_processes(self) -> int:
@@ -272,7 +272,7 @@ class ProcessManager:
 
     @staticmethod
     def _with_stdin_error(
-        mp: ManagedProcess, result: dict[str, Any]
+        mp: ManagedExecution, result: dict[str, Any]
     ) -> dict[str, Any]:
         if mp.stdin_error is not None:
             result["stdin_error"] = mp.stdin_error
@@ -372,18 +372,18 @@ class ProcessManager:
         start_time = time.monotonic()
         start_timestamp = time.time()
 
-        info = ProcessInfo(
-            process_id=process_id,
-            pid=proc.pid,
+        info = ExecutionInfo(
+            execution_id=process_id,
+            process_id=proc.pid,
             command=command,
             cwd=resolved_cwd,
             name=name,
-            status=ProcessStatus.RUNNING,
+            status=ExecutionStatus.RUNNING,
             started_at=start_timestamp,
             start_monotonic=start_time,
         )
 
-        mp = ManagedProcess(
+        mp = ManagedExecution(
             info,
             proc,
             self._config.max_buffer_bytes,
@@ -472,7 +472,7 @@ class ProcessManager:
         }
 
         if (
-            mp.info.status == ProcessStatus.COMPLETED
+            mp.info.status == ExecutionStatus.COMPLETED
             and not self._has_live_work(mp)
         ):
             result: dict[str, Any] = {"status": "completed", **exited, **common}
@@ -480,7 +480,7 @@ class ProcessManager:
                 result["process_id"] = process_id
             return self._with_stdin_error(mp, result)
 
-        if mp.info.status == ProcessStatus.TIMED_OUT:
+        if mp.info.status == ExecutionStatus.TIMED_OUT:
             return self._with_stdin_error(mp, {
                 "status": "timed_out",
                 "process_id": process_id,
@@ -488,7 +488,7 @@ class ProcessManager:
                 **common,
             })
 
-        if mp.info.status == ProcessStatus.STOPPED:
+        if mp.info.status == ExecutionStatus.STOPPED:
             return self._with_stdin_error(mp, {
                 "status": "stopped",
                 "process_id": process_id,
@@ -496,7 +496,7 @@ class ProcessManager:
                 **common,
             })
 
-        if mp.info.status == ProcessStatus.FAILED:
+        if mp.info.status == ExecutionStatus.FAILED:
             return self._with_stdin_error(mp, {
                 "status": "failed",
                 "process_id": process_id,
@@ -514,7 +514,7 @@ class ProcessManager:
         })
 
     async def _write_initial_input(
-        self, mp: ManagedProcess, input_data: str, close_stdin: bool
+        self, mp: ManagedExecution, input_data: str, close_stdin: bool
     ) -> None:
         stdin = mp.proc.stdin
         try:
@@ -540,14 +540,14 @@ class ProcessManager:
         # in its process group are still alive.
         return proc.pid
 
-    def _process_group_id(self, mp: ManagedProcess) -> int:
+    def _process_group_id(self, mp: ManagedExecution) -> int:
         if mp.process_group_id is not None:
             return mp.process_group_id
         if mp.proc.pid is None:
             raise ProcessLookupError
         return mp.proc.pid
 
-    def _process_group_exists(self, mp: ManagedProcess) -> bool:
+    def _process_group_exists(self, mp: ManagedExecution) -> bool:
         if mp.process_group_exited:
             return False
         if sys.platform == "win32":
@@ -568,7 +568,7 @@ class ProcessManager:
         self,
         stream: asyncio.StreamReader | None,
         buf: RingBuffer,
-        mp: ManagedProcess | None = None,
+        mp: ManagedExecution | None = None,
     ) -> None:
         """Read from a subprocess stream into a ring buffer."""
         if stream is None:
@@ -598,7 +598,7 @@ class ProcessManager:
                 buf.append(redacted.encode("utf-8"))
 
     async def _track_completion(
-        self, proc: asyncio.subprocess.Process, mp: ManagedProcess
+        self, proc: asyncio.subprocess.Process, mp: ManagedExecution
     ) -> None:
         """Wait for process to exit and update status."""
         wait_completed = False
@@ -614,16 +614,16 @@ class ProcessManager:
             mp.info.exit_code = returncode
             mp.info.signal = self._exit_signal(proc)
             self._mark_ended(mp)
-            if mp.info.status == ProcessStatus.RUNNING:
+            if mp.info.status == ExecutionStatus.RUNNING:
                 if mp._timeout_triggered:
-                    mp.info.status = ProcessStatus.TIMED_OUT
+                    mp.info.status = ExecutionStatus.TIMED_OUT
                 else:
-                    mp.info.status = ProcessStatus.COMPLETED
+                    mp.info.status = ExecutionStatus.COMPLETED
         except asyncio.CancelledError:
             raise
         except Exception:
-            if mp.info.status == ProcessStatus.RUNNING:
-                mp.info.status = ProcessStatus.FAILED
+            if mp.info.status == ExecutionStatus.RUNNING:
+                mp.info.status = ExecutionStatus.FAILED
                 mp.completion_event.set()
         finally:
             if mp.timeout_task is not None and not mp.timeout_task.done():
@@ -643,7 +643,7 @@ class ProcessManager:
                 )
 
     async def _await_live_work_end(
-        self, mp: ManagedProcess, timeout_sec: float
+        self, mp: ManagedExecution, timeout_sec: float
     ) -> bool:
         """Wait until no live work remains; ``True`` if it ended in time.
 
@@ -670,13 +670,13 @@ class ProcessManager:
                     return not self._has_live_work(mp)
 
     async def _wait_for_process_group_exit(
-        self, mp: ManagedProcess, timeout_sec: float
+        self, mp: ManagedExecution, timeout_sec: float
     ) -> None:
         deadline = time.monotonic() + timeout_sec
         while self._process_group_exists(mp) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
 
-    async def _watch_process_group_exit(self, mp: ManagedProcess) -> None:
+    async def _watch_process_group_exit(self, mp: ManagedExecution) -> None:
         while self._process_group_exists(mp):
             await asyncio.sleep(0.1)
         self._mark_ended(mp)
@@ -713,7 +713,7 @@ class ProcessManager:
                 except asyncio.CancelledError:
                     pass
 
-    async def _drain_with_timeout(self, mp: ManagedProcess, timeout_sec: float) -> None:
+    async def _drain_with_timeout(self, mp: ManagedExecution, timeout_sec: float) -> None:
         """Drain stdout/stderr with a timeout; cancel tasks if they block."""
         tasks = [
             task
@@ -733,7 +733,7 @@ class ProcessManager:
             await asyncio.gather(*tasks, return_exceptions=True)
             self._close_output_pipes(mp)
 
-    async def _settle_completion(self, mp: ManagedProcess) -> None:
+    async def _settle_completion(self, mp: ManagedExecution) -> None:
         """Give the completion tracker time to reap an exited subprocess."""
         task = mp.completion_task
         if task is None or task.done() or task is asyncio.current_task():
@@ -748,14 +748,14 @@ class ProcessManager:
             # so a delayed platform transport can still be reaped later.
             pass
 
-    def _cancel_drains(self, mp: ManagedProcess) -> None:
+    def _cancel_drains(self, mp: ManagedExecution) -> None:
         for task in (mp.drain_stdout, mp.drain_stderr):
             if task is not None and not task.done():
                 task.cancel()
         self._close_output_pipes(mp)
 
     @staticmethod
-    def _close_output_pipes(mp: ManagedProcess) -> None:
+    def _close_output_pipes(mp: ManagedExecution) -> None:
         """Close subprocess read transports after bounded capture is abandoned."""
         ProcessManager._close_process_pipes(mp.proc)
 
@@ -786,7 +786,7 @@ class ProcessManager:
                 return f"SIG{sig_num}"
         return None
 
-    async def _handle_timeout(self, mp: ManagedProcess, timeout_sec: float) -> None:
+    async def _handle_timeout(self, mp: ManagedExecution, timeout_sec: float) -> None:
         """Handle total runtime timeout: graceful terminate then force kill."""
         try:
             await asyncio.sleep(timeout_sec)
@@ -799,7 +799,7 @@ class ProcessManager:
         if not self._has_live_work(mp):
             return
         mp._timeout_triggered = True
-        mp.info.status = ProcessStatus.TIMED_OUT
+        mp.info.status = ExecutionStatus.TIMED_OUT
         # Graceful termination
         await terminate_process(mp.proc, mp.process_group_id)
         grace_period = GRACEFUL_STOP_MS / 1000.0
@@ -883,7 +883,7 @@ class ProcessManager:
                 "error": f"Unknown process_id: {process_id}",
             }
 
-        if self._reported_status(mp) != ProcessStatus.RUNNING.value:
+        if self._reported_status(mp) != ExecutionStatus.RUNNING.value:
             return {
                 "process_id": process_id,
                 "ok": False,
@@ -929,7 +929,7 @@ class ProcessManager:
                 self._close_stdin(mp)
 
     @staticmethod
-    def _close_stdin(mp: ManagedProcess) -> None:
+    def _close_stdin(mp: ManagedExecution) -> None:
         stdin = mp.proc.stdin
         if stdin is None:
             return
@@ -1073,8 +1073,8 @@ class ProcessManager:
         # If the process exited due to our signal, mark it as STOPPED.
         # _track_completion may have set COMPLETED, but since we initiated
         # termination, the correct terminal status is STOPPED.
-        if mp.info.status in (ProcessStatus.RUNNING, ProcessStatus.COMPLETED):
-            mp.info.status = ProcessStatus.STOPPED
+        if mp.info.status in (ExecutionStatus.RUNNING, ExecutionStatus.COMPLETED):
+            mp.info.status = ExecutionStatus.STOPPED
 
         return {
             "process_id": process_id,
@@ -1092,7 +1092,7 @@ class ProcessManager:
         for mp in list(self._processes.values()):
             has_live_work = self._has_live_work(mp)
             reported_status = self._reported_status(mp, has_live_work)
-            if not include_completed and reported_status != ProcessStatus.RUNNING.value:
+            if not include_completed and reported_status != ExecutionStatus.RUNNING.value:
                 continue
             processes.append(
                 {
@@ -1154,11 +1154,11 @@ class ProcessManager:
 
             age_ms = (now - (mp.info.ended_at or mp.info.started_at)) * 1000
 
-            if mp.info.status == ProcessStatus.COMPLETED and age_ms > completed_older_than_ms:
+            if mp.info.status == ExecutionStatus.COMPLETED and age_ms > completed_older_than_ms:
                 to_remove.append(pid)
             elif mp.info.status in (
-                ProcessStatus.STOPPED, ProcessStatus.TIMED_OUT,
-                ProcessStatus.FAILED,
+                ExecutionStatus.STOPPED, ExecutionStatus.TIMED_OUT,
+                ExecutionStatus.FAILED,
             ):
                 if age_ms > stopped_older_than_ms:
                     to_remove.append(pid)
@@ -1254,10 +1254,10 @@ class ProcessManager:
                     mp.stdin_task.cancel()
                 self._close_output_pipes(mp)
                 if id(mp) in running_at_start and mp.info.status in (
-                    ProcessStatus.RUNNING,
-                    ProcessStatus.COMPLETED,
+                    ExecutionStatus.RUNNING,
+                    ExecutionStatus.COMPLETED,
                 ):
-                    mp.info.status = ProcessStatus.STOPPED
+                    mp.info.status = ExecutionStatus.STOPPED
                 mp.completion_event.set()
 
             tasks = [
@@ -1278,5 +1278,5 @@ class ProcessManager:
                 self._shutdown_complete = True
             return
 
-    def get_process(self, process_id: str) -> ManagedProcess | None:
+    def get_process(self, process_id: str) -> ManagedExecution | None:
         return self._processes.get(process_id)

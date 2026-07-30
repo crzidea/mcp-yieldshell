@@ -1,15 +1,15 @@
-"""State container for one managed subprocess and its control tasks."""
+"""State container for one managed execution and its control tasks."""
 
 from __future__ import annotations
 
 import asyncio
 
 from ..security import SensitiveEnv
-from ..types import ProcessInfo
+from ..types import ExecutionInfo
 from .ring_buffer import RingBuffer
 
 
-class ManagedProcess:
+class ManagedExecution:
     __slots__ = (
         "info",
         "proc",
@@ -34,7 +34,7 @@ class ManagedProcess:
 
     def __init__(
         self,
-        info: ProcessInfo,
+        info: ExecutionInfo,
         proc: asyncio.subprocess.Process,
         max_buffer_bytes: int,
         process_group_id: int | None = None,

@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import Config
 from .policy import GRACEFUL_STOP_MS, MAX_EFFECTIVE_WAIT_MS
-from .process.manager import ProcessManager
+from .execution.manager import ProcessManager
 from .types import SideEffect
 
 # Module-level manager, initialized once at startup

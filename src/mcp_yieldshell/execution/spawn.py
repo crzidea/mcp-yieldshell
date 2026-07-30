@@ -1,4 +1,4 @@
-"""Platform-isolated subprocess spawn helpers."""
+"""Platform-isolated OS process spawn helpers."""
 
 from __future__ import annotations
 

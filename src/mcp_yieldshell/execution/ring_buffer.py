@@ -10,7 +10,7 @@ from typing import Any
 class RingBuffer:
     """Strict byte-capped buffer using global byte positions as cursors.
 
-    Buffers belonging to the same process share ``seq_source``. Each output
+    Buffers belonging to the same execution share ``seq_source``. Each output
     byte therefore has one stable position even when stdout and stderr are
     interleaved. Unlike chunk sequence numbers, byte positions can represent
     a response ending in the middle of a drain chunk without losing output.

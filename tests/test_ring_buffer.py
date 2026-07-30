@@ -1,6 +1,6 @@
 """Unit tests for the ring buffer."""
 
-from mcp_yieldshell.process.ring_buffer import (
+from mcp_yieldshell.execution.ring_buffer import (
     RingBuffer,
     read_buffers,
     tail_start_seq,

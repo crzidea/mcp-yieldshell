@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from mcp_yieldshell.config import Config
-from mcp_yieldshell.process.manager import ProcessManager
+from mcp_yieldshell.execution.manager import ProcessManager
 from mcp_yieldshell.server import exec
 from mcp_yieldshell.types import SideEffect
 

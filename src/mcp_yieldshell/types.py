@@ -1,4 +1,4 @@
-"""Types for process status, tool response shapes, and side-effect taxonomy."""
+"""Types for execution status, tool response shapes, and side-effect taxonomy."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class ProcessStatus(str, Enum):
+class ExecutionStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     STOPPED = "stopped"
@@ -17,7 +17,7 @@ class ProcessStatus(str, Enum):
 class SideEffect(str, Enum):
     """Taxonomy of side effects a shell command may plausibly have.
 
-    Callers of ``exec_command`` must declare every category that plausibly
+    Callers of ``execute_command`` must declare every category that plausibly
     applies. If no meaningful side effect is expected, callers must pass
     ``[SideEffect.NONE]``. ``NONE`` is exclusive and must not be combined
     with any other category.
@@ -85,13 +85,13 @@ DEFAULT_BLOCKED_SIDE_EFFECTS: frozenset[SideEffect] = frozenset(
 
 
 @dataclass
-class ProcessInfo:
-    process_id: str
-    pid: int | None
+class ExecutionInfo:
+    execution_id: str
+    process_id: int | None
     command: str
     cwd: str
     name: str | None
-    status: ProcessStatus
+    status: ExecutionStatus
     exit_code: int | None = None
     signal: str | None = None
     started_at: float = 0.0

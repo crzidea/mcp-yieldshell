@@ -16,11 +16,11 @@ from mcp_yieldshell.policy import (
     MAX_EFFECTIVE_WAIT_MS,
     PROCESS_GROUP_EXIT_MS,
 )
-from mcp_yieldshell.process.managed import ManagedProcess
-from mcp_yieldshell.process.manager import ProcessManager
-from mcp_yieldshell.process.spawn import kill_process, terminate_process
+from mcp_yieldshell.execution.managed import ManagedExecution
+from mcp_yieldshell.execution.manager import ProcessManager
+from mcp_yieldshell.execution.spawn import kill_process, terminate_process
 from mcp_yieldshell.server import _server_lifespan, create_server, mcp
-from mcp_yieldshell.types import ProcessInfo, ProcessStatus, SideEffect
+from mcp_yieldshell.types import ExecutionInfo, ExecutionStatus, SideEffect
 
 NONE = [SideEffect.NONE]
 
@@ -52,17 +52,17 @@ class TestTerminalStateAccuracy:
         process.pid = None
         process.returncode = None
         process.stdin = None
-        info = ProcessInfo(
-            process_id="survivor",
-            pid=None,
+        info = ExecutionInfo(
+            execution_id="survivor",
+            process_id=None,
             command="survivor",
             cwd=os.getcwd(),
             name=None,
-            status=ProcessStatus.RUNNING,
+            status=ExecutionStatus.RUNNING,
             started_at=time.time(),
             start_monotonic=time.monotonic(),
         )
-        managed = ManagedProcess(info, process, 100)
+        managed = ManagedExecution(info, process, 100)
         manager._processes[info.process_id] = managed
         monkeypatch.setattr(manager, "_process_group_exists", lambda _mp: True)
         monkeypatch.setattr(manager, "_wait_for_process_group_exit", AsyncMock())
@@ -75,7 +75,7 @@ class TestTerminalStateAccuracy:
 
         assert result["stopped"] is False
         assert "did not stop" in result["error"]
-        assert managed.info.status == ProcessStatus.RUNNING
+        assert managed.info.status == ExecutionStatus.RUNNING
 
 
 class TestDrainLifecycle:
@@ -88,17 +88,17 @@ class TestDrainLifecycle:
         process.stdin = None
         process.stdout = MagicMock()
         process.stderr = MagicMock()
-        info = ProcessInfo(
-            process_id="pipes",
-            pid=None,
+        info = ExecutionInfo(
+            execution_id="pipes",
+            process_id=None,
             command="child",
             cwd=os.getcwd(),
             name=None,
-            status=ProcessStatus.COMPLETED,
+            status=ExecutionStatus.COMPLETED,
             started_at=time.time(),
             start_monotonic=time.monotonic(),
         )
-        managed = ManagedProcess(info, process, 100)
+        managed = ManagedExecution(info, process, 100)
 
         async def blocked_drain():
             await asyncio.Event().wait()
@@ -126,17 +126,17 @@ class TestConcurrentShutdown:
         process.stdin = None
         process.stdout = None
         process.stderr = None
-        info = ProcessInfo(
-            process_id="shutdown",
-            pid=None,
+        info = ExecutionInfo(
+            execution_id="shutdown",
+            process_id=None,
             command="long-running",
             cwd=os.getcwd(),
             name=None,
-            status=ProcessStatus.RUNNING,
+            status=ExecutionStatus.RUNNING,
             started_at=time.time(),
             start_monotonic=time.monotonic(),
         )
-        managed = ManagedProcess(info, process, 100)
+        managed = ManagedExecution(info, process, 100)
         manager._processes[info.process_id] = managed
         terminate_calls = 0
 
@@ -151,7 +151,7 @@ class TestConcurrentShutdown:
 
         monkeypatch.setattr(manager, "_process_group_exists", process_group_exists)
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.terminate_process",
+            "mcp_yieldshell.execution.manager.terminate_process",
             terminate_once,
         )
 
@@ -159,7 +159,7 @@ class TestConcurrentShutdown:
 
         assert terminate_calls == 1
         assert manager._shutdown_complete is True
-        assert managed.info.status == ProcessStatus.STOPPED
+        assert managed.info.status == ExecutionStatus.STOPPED
 
 
 class TestAutomaticRetention:
@@ -198,10 +198,10 @@ class TestAutomaticRetention:
         process_ids = []
         for index, status in enumerate(
             (
-                ProcessStatus.COMPLETED,
-                ProcessStatus.STOPPED,
-                ProcessStatus.TIMED_OUT,
-                ProcessStatus.FAILED,
+                ExecutionStatus.COMPLETED,
+                ExecutionStatus.STOPPED,
+                ExecutionStatus.TIMED_OUT,
+                ExecutionStatus.FAILED,
             )
         ):
             await manager.exec_command(f"echo {index}", side_effects=NONE)
@@ -270,8 +270,8 @@ class TestAutomaticRetention:
         self, monkeypatch
     ):
         monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "1")
-        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 100)
-        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.PROCESS_GROUP_EXIT_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.FINAL_DRAIN_MS", 100)
         manager = ProcessManager(Config())
         first = await manager.exec_command(
             f"{sys.executable} -c \"import subprocess; subprocess.Popen(['sleep','30'])\"",
@@ -292,7 +292,7 @@ class TestAutomaticRetention:
     async def test_completed_primary_with_live_descendant_reports_running(
         self, monkeypatch
     ):
-        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.PROCESS_GROUP_EXIT_MS", 100)
         manager = ProcessManager(Config())
         result = await manager.exec_command(
             f"{sys.executable} -c \"import subprocess; subprocess.Popen(['sleep','30'])\"",
@@ -308,7 +308,7 @@ class TestAutomaticRetention:
         assert listed["status"] == "running"
         assert read_result["status"] == "running"
         managed = manager.get_process(process_id)
-        assert managed.info.status == ProcessStatus.COMPLETED
+        assert managed.info.status == ExecutionStatus.COMPLETED
         primary_ended_at = managed.info.ended_at
         await manager.stop_process(process_id, force_after_ms=100)
         assert managed.info.ended_at is not None
@@ -347,9 +347,9 @@ class TestAutomaticRetention:
 class TestManagerShutdown:
     @pytest.fixture(autouse=True)
     def short_lifecycle_policy(self, monkeypatch):
-        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 100)
-        monkeypatch.setattr("mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 500)
-        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 500)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.GRACEFUL_STOP_MS", 100)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.PROCESS_GROUP_EXIT_MS", 500)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.FINAL_DRAIN_MS", 500)
 
     def test_process_group_id_does_not_depend_on_live_parent_lookup(
         self, monkeypatch
@@ -358,7 +358,7 @@ class TestManagerShutdown:
         proc = MagicMock()
         proc.pid = 12345
         getpgid = MagicMock(side_effect=ProcessLookupError)
-        monkeypatch.setattr("mcp_yieldshell.process.manager.os.getpgid", getpgid)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.os.getpgid", getpgid)
 
         assert manager._get_process_group_id(proc) == 12345
         getpgid.assert_not_called()
@@ -389,7 +389,7 @@ class TestManagerShutdown:
         await manager.shutdown()
 
         for result, group in zip((first, second), groups, strict=True):
-            assert manager.get_process(result["process_id"]).info.status == ProcessStatus.STOPPED
+            assert manager.get_process(result["process_id"]).info.status == ExecutionStatus.STOPPED
             with pytest.raises(ProcessLookupError):
                 os.killpg(group, 0)
 
@@ -426,12 +426,12 @@ class TestManagerShutdown:
         assert mp is not None and mp.process_group_id is not None
         group = mp.process_group_id
         wait_result = await manager.wait_process(result["process_id"], timeout_ms=2000)
-        assert mp.info.status == ProcessStatus.COMPLETED
+        assert mp.info.status == ExecutionStatus.COMPLETED
         assert wait_result["status"] == "running"
 
         await manager.shutdown()
 
-        assert mp.info.status == ProcessStatus.COMPLETED
+        assert mp.info.status == ExecutionStatus.COMPLETED
         with pytest.raises(ProcessLookupError):
             os.killpg(group, 0)
 
@@ -469,7 +469,7 @@ class TestManagerShutdown:
         assert mp is not None and mp.process_group_id is not None
         group = mp.process_group_id
         waited = await manager.wait_process(result["process_id"], timeout_ms=2000)
-        assert mp.info.status == ProcessStatus.COMPLETED
+        assert mp.info.status == ExecutionStatus.COMPLETED
         assert waited["status"] == "running"
         first_listing = manager.list_processes()["processes"][0]
         assert first_listing["ended_at"] is None
@@ -497,7 +497,7 @@ class TestManagerShutdown:
         )
         mp = manager.get_process(result["process_id"])
         assert mp is not None
-        mp.info.status = ProcessStatus.TIMED_OUT
+        mp.info.status = ExecutionStatus.TIMED_OUT
 
         stopped = await manager.stop_process(
             result["process_id"],
@@ -506,7 +506,7 @@ class TestManagerShutdown:
 
         assert stopped["stopped"] is True
         assert stopped["error"] is None
-        assert mp.info.status == ProcessStatus.TIMED_OUT
+        assert mp.info.status == ExecutionStatus.TIMED_OUT
 
     @pytest.mark.asyncio
     async def test_runtime_timeout_remains_active_for_live_descendant(self):
@@ -523,13 +523,13 @@ class TestManagerShutdown:
 
         await asyncio.sleep(1)
 
-        assert mp.info.status == ProcessStatus.TIMED_OUT
+        assert mp.info.status == ExecutionStatus.TIMED_OUT
         with pytest.raises(ProcessLookupError):
             os.killpg(group, 0)
 
     @pytest.mark.asyncio
     async def test_terminal_descendant_receives_full_grace(self, monkeypatch, tmp_path):
-        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 500)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.GRACEFUL_STOP_MS", 500)
         marker = tmp_path / "graceful"
         child = tmp_path / "child.py"
         child.write_text(
@@ -578,7 +578,7 @@ class TestManagerShutdown:
 
     @pytest.mark.asyncio
     async def test_stop_allows_natural_graceful_exit(self, monkeypatch):
-        monkeypatch.setattr("mcp_yieldshell.process.manager.GRACEFUL_STOP_MS", 1000)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.GRACEFUL_STOP_MS", 1000)
         manager = ProcessManager(Config())
         result = await manager.exec_command(
             f"exec {sys.executable} -c \"import signal,time,sys; "
@@ -592,7 +592,7 @@ class TestManagerShutdown:
         stopped = await manager.stop_process(result["process_id"])
 
         assert stopped["stopped"] is True
-        assert manager.get_process(result["process_id"]).info.status == ProcessStatus.STOPPED
+        assert manager.get_process(result["process_id"]).info.status == ExecutionStatus.STOPPED
 
 
 class TestWindowsFallback:
@@ -600,7 +600,7 @@ class TestWindowsFallback:
     async def test_termination_targets_primary_process(self, monkeypatch):
         process = MagicMock()
         process.pid = 123
-        monkeypatch.setattr("mcp_yieldshell.process.spawn.sys.platform", "win32")
+        monkeypatch.setattr("mcp_yieldshell.execution.spawn.sys.platform", "win32")
 
         await terminate_process(process, process_group_id=456)
         await kill_process(process, process_group_id=456)
@@ -687,7 +687,7 @@ class TestSpawnRegistration:
                 pass
 
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.spawn_process", AsyncMock(return_value=FakeProcess())
+            "mcp_yieldshell.execution.manager.spawn_process", AsyncMock(return_value=FakeProcess())
         )
         manager = ProcessManager(Config())
         task = asyncio.create_task(
@@ -760,7 +760,7 @@ class TestInitialStdinLifecycle:
 
         proc = self.FakeProcess(BlockingStdin())
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.spawn_process",
+            "mcp_yieldshell.execution.manager.spawn_process",
             AsyncMock(return_value=proc),
         )
         manager = ProcessManager(Config())
@@ -808,7 +808,7 @@ class TestInitialStdinLifecycle:
 
         proc = self.FakeProcess(BrokenStdin())
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.spawn_process",
+            "mcp_yieldshell.execution.manager.spawn_process",
             AsyncMock(return_value=proc),
         )
         manager = ProcessManager(Config())
@@ -885,7 +885,7 @@ class TestShutdownSpawnRace:
             return FakeProcess()
 
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.spawn_process", slow_spawn
+            "mcp_yieldshell.execution.manager.spawn_process", slow_spawn
         )
         manager = ProcessManager(Config())
         exec_task = asyncio.create_task(
@@ -907,7 +907,7 @@ class TestShutdownSpawnRace:
         self, monkeypatch
     ):
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.PENDING_SPAWN_SHUTDOWN_MS", 100
+            "mcp_yieldshell.execution.manager.PENDING_SPAWN_SHUTDOWN_MS", 100
         )
         spawn_started = asyncio.Event()
 
@@ -916,7 +916,7 @@ class TestShutdownSpawnRace:
             await asyncio.Event().wait()
 
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.spawn_process", stuck_spawn
+            "mcp_yieldshell.execution.manager.spawn_process", stuck_spawn
         )
         manager = ProcessManager(Config())
         exec_task = asyncio.create_task(
@@ -949,9 +949,9 @@ class TestWaitDeadline:
             pytest.skip("POSIX process groups only")
 
         monkeypatch.setattr(
-            "mcp_yieldshell.process.manager.PROCESS_GROUP_EXIT_MS", 200
+            "mcp_yieldshell.execution.manager.PROCESS_GROUP_EXIT_MS", 200
         )
-        monkeypatch.setattr("mcp_yieldshell.process.manager.FINAL_DRAIN_MS", 200)
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.FINAL_DRAIN_MS", 200)
         manager = ProcessManager(Config())
         # The child redirects its own output, so every pipe disconnects and
         # proc.wait() completes while the process group stays alive. This is
