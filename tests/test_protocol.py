@@ -19,7 +19,7 @@ def _payload(result: CallToolResult) -> dict:
     return json.loads(result.content[0].text)
 
 
-def _assert_bare_process_id(value: object) -> str:
+def _assert_bare_execution_id(value: object) -> str:
     assert isinstance(value, str)
     assert re.fullmatch(r"[0-9a-f]{12}", value)
     return value
@@ -37,18 +37,30 @@ async def test_stdio_server_lists_and_executes_tools():
             await session.initialize()
 
             tools = await session.list_tools()
-            assert {tool.name for tool in tools.tools} == {
+            tool_names = {tool.name for tool in tools.tools}
+            tools_by_name = {tool.name: tool for tool in tools.tools}
+            assert tool_names == {
                 "cleanup",
-                "exec",
+                "execute",
                 "ps",
                 "read",
                 "stop",
                 "wait",
                 "write",
             }
+            assert "exec" not in tool_names
+            for tool_name in ("read", "write", "wait", "stop"):
+                tool = tools_by_name[tool_name]
+                properties = tool.inputSchema["properties"]
+                assert "execution_id" in properties
+                assert properties["execution_id"]["type"] == "string"
+                assert "execution_id" in tool.inputSchema["required"]
+                assert "process_id" not in properties
+                assert "opaque" in (tool.description or "")
+                assert "passed through unchanged" in (tool.description or "")
 
             result = await session.call_tool(
-                "exec",
+                "execute",
                 {
                     "command": "printf protocol-ok",
                     "side_effects": ["NONE"],
@@ -58,6 +70,15 @@ async def test_stdio_server_lists_and_executes_tools():
             payload = _payload(result)
             assert payload["status"] == "completed"
             assert payload["stdout"] == "protocol-ok"
+            assert isinstance(payload["execution_id"], str)
+            assert isinstance(payload["process_id"], int)
+            assert "pid" not in payload
+
+            rejected = await session.call_tool(
+                "read",
+                {"process_id": str(payload["process_id"])},
+            )
+            assert rejected.isError is True
 
 
 @pytest.mark.asyncio
@@ -74,7 +95,7 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
 
             started = _payload(
                 await session.call_tool(
-                    "exec",
+                    "execute",
                     {
                         "command": (
                             "for i in 1 2 3 4 5 6; do echo chunk-$i; "
@@ -86,9 +107,9 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
                 )
             )
             assert started["status"] == "backgrounded"
-            process_id = _assert_bare_process_id(started["process_id"])
-            assert isinstance(started["pid"], int)
-            assert process_id != str(started["pid"])
+            execution_id = _assert_bare_execution_id(started["execution_id"])
+            assert isinstance(started["process_id"], int)
+            assert execution_id != str(started["process_id"])
 
             # No since_seq anywhere: the server-side cursor is what keeps
             # these responses from repeating output.
@@ -99,12 +120,12 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
                     await session.call_tool(
                         "wait",
                         {
-                            "process_id": process_id,
+                            "execution_id": execution_id,
                             "timeout_ms": 400,
                         },
                     )
                 )
-                assert _assert_bare_process_id(page["process_id"]) == process_id
+                assert _assert_bare_execution_id(page["execution_id"]) == execution_id
                 pages += 1
                 collected += page["stdout"]
                 assert page["wait_result"] in ("exited", "deadline_reached")
@@ -119,17 +140,17 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
             tail = _payload(
                 await session.call_tool(
                     "read",
-                    {"process_id": process_id, "tail_lines": 2},
+                    {"execution_id": execution_id, "tail_lines": 2},
                 )
             )
-            assert _assert_bare_process_id(tail["process_id"]) == process_id
+            assert _assert_bare_execution_id(tail["execution_id"]) == execution_id
             assert tail["stdout"] == "chunk-5\nchunk-6\n"
 
             listing = _payload(await session.call_tool("ps", {}))
-            entry = listing["processes"][0]
-            assert _assert_bare_process_id(entry["process_id"]) == process_id
-            assert entry["pid"] == started["pid"]
-            assert entry["process_id"] != str(entry["pid"])
+            entry = listing["executions"][0]
+            assert _assert_bare_execution_id(entry["execution_id"]) == execution_id
+            assert entry["process_id"] == started["process_id"]
+            assert entry["execution_id"] != str(entry["process_id"])
             assert entry["idle_ms"] >= 0
             assert entry["latest_seq"] == len(expected) + 1
 
@@ -147,7 +168,7 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
 
             started = _payload(
                 await session.call_tool(
-                    "exec",
+                    "execute",
                     {
                         "command": "cat",
                         "side_effects": ["NONE"],
@@ -157,13 +178,13 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                 )
             )
             assert started["status"] == "backgrounded"
-            process_id = _assert_bare_process_id(started["process_id"])
+            execution_id = _assert_bare_execution_id(started["execution_id"])
 
             written = _payload(
                 await session.call_tool(
                     "write",
                     {
-                        "process_id": process_id,
+                        "execution_id": execution_id,
                         "input": "protocol-input",
                         "newline": True,
                         "close_stdin": True,
@@ -171,24 +192,24 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                 )
             )
             assert written["ok"] is True
-            assert _assert_bare_process_id(written["process_id"]) == process_id
+            assert _assert_bare_execution_id(written["execution_id"]) == execution_id
 
             waited = _payload(
                 await session.call_tool(
                     "wait",
                     {
-                        "process_id": process_id,
+                        "execution_id": execution_id,
                         "timeout_ms": 5_000,
                     },
                 )
             )
             assert waited["status"] == "completed"
-            assert _assert_bare_process_id(waited["process_id"]) == process_id
+            assert _assert_bare_execution_id(waited["execution_id"]) == execution_id
             assert waited["stdout"] == "protocol-input\n"
 
             sleeper = _payload(
                 await session.call_tool(
-                    "exec",
+                    "execute",
                     {
                         "command": "sleep 30",
                         "side_effects": ["NONE"],
@@ -197,19 +218,19 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                 )
             )
             assert sleeper["status"] == "backgrounded"
-            sleeper_id = _assert_bare_process_id(sleeper["process_id"])
+            sleeper_id = _assert_bare_execution_id(sleeper["execution_id"])
 
             stopped = _payload(
                 await session.call_tool(
                     "stop",
                     {
-                        "process_id": sleeper_id,
+                        "execution_id": sleeper_id,
                         "force_after_ms": 100,
                     },
                 )
             )
             assert stopped["stopped"] is True
-            assert _assert_bare_process_id(stopped["process_id"]) == sleeper_id
+            assert _assert_bare_execution_id(stopped["execution_id"]) == sleeper_id
 
             cleaned = _payload(
                 await session.call_tool(
@@ -223,4 +244,4 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
             assert cleaned["removed"] == 2
 
             listing = _payload(await session.call_tool("ps", {}))
-            assert listing["processes"] == []
+            assert listing["executions"] == []

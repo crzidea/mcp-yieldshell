@@ -10,28 +10,30 @@ import pytest
 
 from mcp_yieldshell.config import Config
 from mcp_yieldshell.execution.manager import ExecutionManager
-from mcp_yieldshell.server import exec
+from mcp_yieldshell.server import execute
 from mcp_yieldshell.types import SideEffect
 
 NONE = [SideEffect.NONE]
 
 
-def _exec_tool_schema() -> dict:
-    """Return the JSON schema generated for the ``exec`` MCP tool."""
+def _execute_tool_schema() -> dict:
+    """Return the JSON schema generated for the ``execute`` MCP tool."""
     from mcp.server.fastmcp.tools.base import Tool
 
-    tool = Tool.from_function(exec, name="exec", description=exec.__doc__)
+    tool = Tool.from_function(
+        execute, name="execute", description=execute.__doc__
+    )
     return tool.parameters
 
 
-class TestExecSchema:
+class TestExecuteSchema:
     def test_side_effects_is_required(self):
-        schema = _exec_tool_schema()
+        schema = _execute_tool_schema()
         required = schema.get("required", [])
         assert "side_effects" in required
 
     def test_side_effects_items_reference_side_effect_enum(self):
-        schema = _exec_tool_schema()
+        schema = _execute_tool_schema()
         side_effects = schema["properties"]["side_effects"]
         assert side_effects["type"] == "array"
         items = side_effects["items"]
@@ -39,7 +41,7 @@ class TestExecSchema:
         assert items["$ref"] == "#/$defs/SideEffect"
 
     def test_side_effect_enum_def_contains_all_canonical_names(self):
-        schema = _exec_tool_schema()
+        schema = _execute_tool_schema()
         defs = schema["$defs"]["SideEffect"]
         enum_values = defs["enum"]
         expected = [member.value for member in SideEffect]
@@ -70,20 +72,20 @@ class TestExecSchema:
             assert canonical in enum_values
 
     def test_side_effect_enum_schema_order_is_alphabetical(self):
-        schema = _exec_tool_schema()
+        schema = _execute_tool_schema()
         enum_values = schema["$defs"]["SideEffect"]["enum"]
         assert enum_values == sorted(enum_values)
 
     def test_side_effect_enum_def_is_type_string(self):
-        schema = _exec_tool_schema()
+        schema = _execute_tool_schema()
         assert schema["$defs"]["SideEffect"]["type"] == "string"
 
     def test_schema_excludes_unknown_categories(self):
-        schema = _exec_tool_schema()
+        schema = _execute_tool_schema()
         assert "TELEPORT_COWS" not in schema["$defs"]["SideEffect"]["enum"]
 
     def test_full_schema_serializes_to_json(self):
-        schema = _exec_tool_schema()
+        schema = _execute_tool_schema()
         # The schema must be JSON-serializable for MCP transport.
         json.dumps(schema)
 
@@ -220,16 +222,16 @@ class TestBlockedRejection:
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         mgr = ExecutionManager(config)
-        ps_before = mgr.list_executions(include_completed=False)["processes"]
-        before_ids = {p["process_id"] for p in ps_before}
+        ps_before = mgr.list_executions(include_completed=False)["executions"]
+        before_ids = {p["execution_id"] for p in ps_before}
 
         result = await mgr.execute_command(
             "sleep 60", side_effects=["MODIFIES_PROTECTED_FILES"]
         )
         assert result["status"] == "failed_to_start"
 
-        ps_after = mgr.list_executions(include_completed=False)["processes"]
-        after_ids = {p["process_id"] for p in ps_after}
+        ps_after = mgr.list_executions(include_completed=False)["executions"]
+        after_ids = {p["execution_id"] for p in ps_after}
         assert after_ids == before_ids
 
     @pytest.mark.asyncio
@@ -740,21 +742,21 @@ class TestSideEffectEnumCanonical:
 
 class TestExecDocstring:
     def test_docstring_mentions_required_side_effects(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         assert "required" in doc.lower()
         assert "side_effects" in doc
 
     def test_docstring_states_none_is_exclusive(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         assert "NONE" in doc
         assert "exclusive" in doc.lower()
 
     def test_docstring_surfaces_inline_code_category(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         assert "RUNS_INLINE_CODE" in doc
 
     def test_docstring_states_category_in_default_blocklist(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         # The docstring must explicitly say the category is in the default
         # blocklist so agents learn it from the schema alone.
         assert "default blocklist" in doc.lower() or "default" in doc.lower()
@@ -767,22 +769,22 @@ class TestExecDocstring:
         assert "default" in window
 
     def test_docstring_mentions_modifies_os_user_settings(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         assert "MODIFIES_OS_USER_SETTINGS" in doc
 
     def test_docstring_mentions_kills_agent_process(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         assert "KILLS_AGENT_PROCESS" in doc
 
     def test_docstring_includes_safer_next_action_hint(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         lowered = doc.lower()
         # The safer-next-action hint must be discoverable in the docstring.
         assert "reviewable" in lowered
         assert "workspace" in lowered or "file" in lowered
 
     def test_docstring_includes_examples_for_major_categories(self):
-        doc = exec.__doc__ or ""
+        doc = execute.__doc__ or ""
         for canonical in (
             "NONE",
             "MODIFIES_WORKSPACE_FILES",

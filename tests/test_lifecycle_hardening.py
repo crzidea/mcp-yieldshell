@@ -10,15 +10,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mcp_yieldshell.config import Config
+from mcp_yieldshell.execution.managed import ManagedExecution
+from mcp_yieldshell.execution.manager import ExecutionManager
+from mcp_yieldshell.execution.spawn import kill_process, terminate_process
 from mcp_yieldshell.policy import (
     FINAL_DRAIN_MS,
     GRACEFUL_STOP_MS,
     MAX_EFFECTIVE_WAIT_MS,
     PROCESS_GROUP_EXIT_MS,
 )
-from mcp_yieldshell.execution.managed import ManagedExecution
-from mcp_yieldshell.execution.manager import ExecutionManager
-from mcp_yieldshell.execution.spawn import kill_process, terminate_process
 from mcp_yieldshell.server import _server_lifespan, create_server, mcp
 from mcp_yieldshell.types import ExecutionInfo, ExecutionStatus, SideEffect
 
@@ -63,13 +63,13 @@ class TestTerminalStateAccuracy:
             start_monotonic=time.monotonic(),
         )
         managed = ManagedExecution(info, process, 100)
-        manager._executions[info.process_id] = managed
+        manager._executions[info.execution_id] = managed
         monkeypatch.setattr(manager, "_process_group_exists", lambda _mp: True)
         monkeypatch.setattr(manager, "_wait_for_process_group_exit", AsyncMock())
         monkeypatch.setattr(manager, "_drain_with_timeout", AsyncMock())
 
         result = await manager.stop_execution(
-            info.process_id,
+            info.execution_id,
             force_after_ms=0,
         )
 
@@ -137,7 +137,7 @@ class TestConcurrentShutdown:
             start_monotonic=time.monotonic(),
         )
         managed = ManagedExecution(info, process, 100)
-        manager._executions[info.process_id] = managed
+        manager._executions[info.execution_id] = managed
         terminate_calls = 0
 
         def process_group_exists(mp):
@@ -172,7 +172,7 @@ class TestAutomaticRetention:
 
         assert result["status"] == "completed"
         assert "returned" in result["stdout"]
-        assert manager.list_executions()["processes"] == []
+        assert manager.list_executions()["executions"] == []
 
     @pytest.mark.asyncio
     async def test_zero_cap_does_not_return_dangling_truncated_process_id(
@@ -189,7 +189,7 @@ class TestAutomaticRetention:
 
         assert result["status"] == "completed"
         assert result["capped"] is True
-        assert "process_id" not in result
+        assert "execution_id" not in result
 
     @pytest.mark.asyncio
     async def test_reaps_every_terminal_state_and_ids_become_unknown(self, monkeypatch):
@@ -205,36 +205,36 @@ class TestAutomaticRetention:
             )
         ):
             await manager.execute_command(f"echo {index}", side_effects=NONE)
-            process_id = manager.list_executions(limit=1)["processes"][0]["process_id"]
-            mp = manager.get_execution(process_id)
+            execution_id = manager.list_executions(limit=1)["executions"][0]["execution_id"]
+            mp = manager.get_execution(execution_id)
             assert mp is not None
             mp.info.status = status
             mp.info.ended_at = time.time() - 2
-            process_ids.append(process_id)
+            process_ids.append(execution_id)
 
         await manager.execute_command("echo trigger", side_effects=NONE)
-        listed = {item["process_id"] for item in manager.list_executions()["processes"]}
+        listed = {item["execution_id"] for item in manager.list_executions()["executions"]}
         assert not listed.intersection(process_ids)
-        for process_id in process_ids:
-            assert "error" in await manager.read_execution_output(process_id)
-            assert "error" in await manager.wait_execution(process_id)
-            assert "error" in await manager.write_input(process_id, "x")
-            assert "error" in await manager.stop_execution(process_id)
+        for execution_id in process_ids:
+            assert "error" in await manager.read_execution_output(execution_id)
+            assert "error" in await manager.wait_execution(execution_id)
+            assert "error" in await manager.write_input(execution_id, "x")
+            assert "error" in await manager.stop_execution(execution_id)
 
     @pytest.mark.asyncio
     async def test_age_boundary_is_strict_and_reaping_is_repeatable(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_PROCESS_RETENTION_MS", "1000")
         manager = ExecutionManager(Config())
         await manager.execute_command("echo retained", side_effects=NONE)
-        process_id = manager.list_executions(limit=1)["processes"][0]["process_id"]
-        mp = manager.get_execution(process_id)
+        execution_id = manager.list_executions(limit=1)["executions"][0]["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         now = time.time()
         mp.info.ended_at = now - 1
 
         monkeypatch.setattr(time, "time", lambda: now)
         assert manager._reap_terminal_executions() == 0
-        assert manager.get_execution(process_id) is not None
+        assert manager.get_execution(execution_id) is not None
         monkeypatch.setattr(time, "time", lambda: now + 0.001)
         assert manager._reap_terminal_executions() == 1
         assert manager._reap_terminal_executions() == 0
@@ -246,11 +246,11 @@ class TestAutomaticRetention:
         completed = []
         for index in range(4):
             await manager.execute_command(f"echo {index}", side_effects=NONE)
-            completed.append(manager.list_executions(limit=1)["processes"][0]["process_id"])
+            completed.append(manager.list_executions(limit=1)["executions"][0]["execution_id"])
 
         running = await manager.execute_command("sleep 30", yield_ms=0, side_effects=NONE)
-        running_id = running["process_id"]
-        listed = {item["process_id"] for item in manager.list_executions()["processes"]}
+        running_id = running["execution_id"]
+        listed = {item["execution_id"] for item in manager.list_executions()["executions"]}
         assert running_id in listed
         assert completed[-2:] == [item for item in completed if item in listed]
         await manager.execute_command("echo trigger", side_effects=NONE)
@@ -278,7 +278,7 @@ class TestAutomaticRetention:
             yield_ms=0,
             side_effects=NONE,
         )
-        await manager.wait_execution(first["process_id"], timeout_ms=1000)
+        await manager.wait_execution(first["execution_id"], timeout_ms=1000)
 
         cleanup = await manager.cleanup(completed_older_than_ms=0)
         second = await manager.execute_command("echo rejected", side_effects=NONE)
@@ -299,18 +299,18 @@ class TestAutomaticRetention:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = result["process_id"]
-        await manager.wait_execution(process_id, timeout_ms=2000)
+        execution_id = result["execution_id"]
+        await manager.wait_execution(execution_id, timeout_ms=2000)
 
-        listed = manager.list_executions()["processes"][0]
-        read_result = await manager.read_execution_output(process_id)
+        listed = manager.list_executions()["executions"][0]
+        read_result = await manager.read_execution_output(execution_id)
 
         assert listed["status"] == "running"
         assert read_result["status"] == "running"
-        managed = manager.get_execution(process_id)
+        managed = manager.get_execution(execution_id)
         assert managed.info.status == ExecutionStatus.COMPLETED
         primary_ended_at = managed.info.ended_at
-        await manager.stop_execution(process_id, force_after_ms=100)
+        await manager.stop_execution(execution_id, force_after_ms=100)
         assert managed.info.ended_at is not None
         assert primary_ended_at is not None
         assert managed.info.ended_at > primary_ended_at
@@ -319,8 +319,8 @@ class TestAutomaticRetention:
     async def test_observed_group_exit_is_monotonic(self, monkeypatch):
         manager = ExecutionManager(Config())
         await manager.execute_command("echo done", side_effects=NONE)
-        process_id = manager.list_executions(limit=1)["processes"][0]["process_id"]
-        mp = manager.get_execution(process_id)
+        execution_id = manager.list_executions(limit=1)["executions"][0]["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         assert manager._process_group_exists(mp) is False
         monkeypatch.setattr(os, "killpg", lambda *_: None)
@@ -340,7 +340,7 @@ class TestAutomaticRetention:
         assert sum(result["status"] == "backgrounded" for result in results) == 1
         assert sum(result["status"] == "failed_to_start" for result in results) == 1
         running = next(result for result in results if result["status"] == "backgrounded")
-        await manager.stop_execution(running["process_id"], force_after_ms=100)
+        await manager.stop_execution(running["execution_id"], force_after_ms=100)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups only")
@@ -381,7 +381,7 @@ class TestManagerShutdown:
         )
         groups = []
         for result in (first, second):
-            mp = manager.get_execution(result["process_id"])
+            mp = manager.get_execution(result["execution_id"])
             assert mp is not None and mp.process_group_id is not None
             groups.append(mp.process_group_id)
 
@@ -389,7 +389,9 @@ class TestManagerShutdown:
         await manager.shutdown()
 
         for result, group in zip((first, second), groups, strict=True):
-            assert manager.get_execution(result["process_id"]).info.status == ExecutionStatus.STOPPED
+            managed = manager.get_execution(result["execution_id"])
+            assert managed is not None
+            assert managed.info.status == ExecutionStatus.STOPPED
             with pytest.raises(ProcessLookupError):
                 os.killpg(group, 0)
 
@@ -402,7 +404,7 @@ class TestManagerShutdown:
             yield_ms=0,
             side_effects=NONE,
         )
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None and mp.process_group_id is not None
         group = mp.process_group_id
         await asyncio.sleep(0.05)
@@ -422,10 +424,10 @@ class TestManagerShutdown:
             yield_ms=0,
             side_effects=NONE,
         )
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None and mp.process_group_id is not None
         group = mp.process_group_id
-        wait_result = await manager.wait_execution(result["process_id"], timeout_ms=2000)
+        wait_result = await manager.wait_execution(result["execution_id"], timeout_ms=2000)
         assert mp.info.status == ExecutionStatus.COMPLETED
         assert wait_result["status"] == "running"
 
@@ -446,12 +448,12 @@ class TestManagerShutdown:
             yield_ms=0,
             side_effects=NONE,
         )
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None and mp.process_group_id is not None
         group = mp.process_group_id
         await asyncio.sleep(0.1)
 
-        stopped = await manager.stop_execution(result["process_id"])
+        stopped = await manager.stop_execution(result["execution_id"])
 
         assert stopped["stopped"] is True
         with pytest.raises(ProcessLookupError):
@@ -465,23 +467,23 @@ class TestManagerShutdown:
             yield_ms=0,
             side_effects=NONE,
         )
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None and mp.process_group_id is not None
         group = mp.process_group_id
-        waited = await manager.wait_execution(result["process_id"], timeout_ms=2000)
+        waited = await manager.wait_execution(result["execution_id"], timeout_ms=2000)
         assert mp.info.status == ExecutionStatus.COMPLETED
         assert waited["status"] == "running"
-        first_listing = manager.list_executions()["processes"][0]
+        first_listing = manager.list_executions()["executions"][0]
         assert first_listing["ended_at"] is None
         first_duration = first_listing["duration_ms"]
         await asyncio.sleep(0.05)
-        second_listing = manager.list_executions()["processes"][0]
+        second_listing = manager.list_executions()["executions"][0]
         assert second_listing["duration_ms"] > first_duration
 
-        stopped = await manager.stop_execution(result["process_id"])
+        stopped = await manager.stop_execution(result["execution_id"])
 
         assert stopped["stopped"] is True
-        final_listing = manager.list_executions()["processes"][0]
+        final_listing = manager.list_executions()["executions"][0]
         assert final_listing["ended_at"] is not None
         assert final_listing["duration_ms"] >= second_listing["duration_ms"]
         with pytest.raises(ProcessLookupError):
@@ -495,12 +497,12 @@ class TestManagerShutdown:
             yield_ms=0,
             side_effects=NONE,
         )
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None
         mp.info.status = ExecutionStatus.TIMED_OUT
 
         stopped = await manager.stop_execution(
-            result["process_id"],
+            result["execution_id"],
             force_after_ms=100,
         )
 
@@ -517,7 +519,7 @@ class TestManagerShutdown:
             timeout_ms=300,
             side_effects=NONE,
         )
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None and mp.process_group_id is not None
         group = mp.process_group_id
 
@@ -551,9 +553,9 @@ class TestManagerShutdown:
             yield_ms=0,
             side_effects=NONE,
         )
-        await manager.wait_execution(result["process_id"], timeout_ms=2000)
+        await manager.wait_execution(result["execution_id"], timeout_ms=2000)
 
-        stopped = await manager.stop_execution(result["process_id"])
+        stopped = await manager.stop_execution(result["execution_id"])
 
         assert stopped["stopped"] is True
         assert marker.read_text(encoding="utf-8") == "done"
@@ -567,9 +569,9 @@ class TestManagerShutdown:
             yield_ms=0,
             side_effects=NONE,
         )
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None and mp.timeout_task is not None
-        await manager.wait_execution(result["process_id"], timeout_ms=2000)
+        await manager.wait_execution(result["execution_id"], timeout_ms=2000)
 
         await asyncio.sleep(2)
 
@@ -589,10 +591,10 @@ class TestManagerShutdown:
         )
         await asyncio.sleep(0.05)
 
-        stopped = await manager.stop_execution(result["process_id"])
+        stopped = await manager.stop_execution(result["execution_id"])
 
         assert stopped["stopped"] is True
-        assert manager.get_execution(result["process_id"]).info.status == ExecutionStatus.STOPPED
+        assert manager.get_execution(result["execution_id"]).info.status == ExecutionStatus.STOPPED
 
 
 class TestWindowsFallback:
@@ -695,7 +697,7 @@ class TestSpawnRegistration:
         )
         await entered_drain.wait()
 
-        assert len(manager.list_executions()["processes"]) == 1
+        assert len(manager.list_executions()["executions"]) == 1
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -779,11 +781,11 @@ class TestInitialStdinLifecycle:
         assert result["status"] == "backgrounded"
         assert elapsed < 0.5
         assert entered_drain.is_set()
-        mp = manager.get_execution(result["process_id"])
+        mp = manager.get_execution(result["execution_id"])
         assert mp is not None
         assert mp.stdin_task is not None and not mp.stdin_task.done()
 
-        write_result = await manager.write_input(result["process_id"], "later")
+        write_result = await manager.write_input(result["execution_id"], "later")
         assert write_result["ok"] is False
         assert "still in progress" in write_result["error"]
 
@@ -824,7 +826,7 @@ class TestInitialStdinLifecycle:
 
         assert result["status"] == "backgrounded"
         assert result["stdin_error"] == "stdin delivery failed"
-        read_result = await manager.read_execution_output(result["process_id"])
+        read_result = await manager.read_execution_output(result["execution_id"])
         assert read_result["stdin_error"] == "stdin delivery failed"
         await manager.shutdown()
 
@@ -900,7 +902,7 @@ class TestShutdownSpawnRace:
         result = await exec_task
         assert result["status"] == "failed_to_start"
         assert "shutting down" in result["error"].lower()
-        assert manager.list_executions()["processes"] == []
+        assert manager.list_executions()["executions"] == []
 
     @pytest.mark.asyncio
     async def test_shutdown_does_not_wait_indefinitely_for_pending_spawn(
@@ -961,8 +963,8 @@ class TestWaitDeadline:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = result["process_id"]
-        mp = manager.get_execution(process_id)
+        execution_id = result["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         pgid = mp.process_group_id
 
@@ -977,7 +979,7 @@ class TestWaitDeadline:
             assert manager._has_live_work(mp) is True
 
             started = time.monotonic()
-            wait_result = await manager.wait_execution(process_id, timeout_ms=1_000)
+            wait_result = await manager.wait_execution(execution_id, timeout_ms=1_000)
             elapsed_ms = (time.monotonic() - started) * 1000
 
             assert wait_result["status"] == "running"
@@ -998,10 +1000,10 @@ class TestWaitDeadline:
             result = await manager.execute_command(
                 "sleep 0.2", yield_ms=0, side_effects=NONE
             )
-            process_id = result["process_id"]
+            execution_id = result["execution_id"]
 
             wait_result = await manager.wait_execution(
-                process_id, timeout_ms=600_000
+                execution_id, timeout_ms=600_000
             )
 
             assert wait_result["status"] == "completed"
@@ -1029,10 +1031,10 @@ class TestRedactionAcrossTools:
             "sys.stdout.flush()\""
         )
         started = await manager.execute_command(command, yield_ms=0, side_effects=NONE)
-        process_id = started["process_id"]
-        await manager.wait_execution(process_id, timeout_ms=5000)
+        execution_id = started["execution_id"]
+        await manager.wait_execution(execution_id, timeout_ms=5000)
         read_result = await manager.read_execution_output(
-            process_id, max_output_bytes=48, streams="stdout"
+            execution_id, max_output_bytes=48, streams="stdout"
         )
         assert "[REDACTED:MY_SECRET]" not in read_result["stdout"]
         assert "abcdefghijklmnop" not in read_result["stdout"]
@@ -1046,14 +1048,14 @@ class TestRedactionAcrossTools:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = started["process_id"]
-        await manager.wait_execution(process_id, timeout_ms=2_000)
+        execution_id = started["execution_id"]
+        await manager.wait_execution(execution_id, timeout_ms=2_000)
 
         cursor = 1
         pages = []
         for _ in range(10):
             page = await manager.read_execution_output(
-                process_id,
+                execution_id,
                 since_seq=cursor,
                 max_output_bytes=5,
                 streams="stdout",

@@ -1,4 +1,4 @@
-"""Integration tests for process management and tool behaviors."""
+"""Integration tests for execution management and tool behaviors."""
 
 import asyncio
 import os
@@ -6,15 +6,31 @@ import re
 import shutil
 import signal
 import sys
+from unittest.mock import AsyncMock
 
 import pytest
 
 from mcp_yieldshell.config import Config
-from mcp_yieldshell.policy import MAX_EFFECTIVE_WAIT_MS
 from mcp_yieldshell.execution.manager import ExecutionManager
+from mcp_yieldshell.policy import MAX_EFFECTIVE_WAIT_MS
 from mcp_yieldshell.types import ExecutionStatus, SideEffect
 
 NONE = [SideEffect.NONE]
+
+
+def _assert_addressable_response(
+    result: dict, manager: ExecutionManager
+) -> str:
+    execution_id = result["execution_id"]
+    assert isinstance(execution_id, str)
+    assert re.fullmatch(r"[0-9a-f]{12}", execution_id)
+    assert not execution_id.startswith("proc_")
+    assert isinstance(result["process_id"], int)
+    assert "pid" not in result
+    managed = manager.get_execution(execution_id)
+    assert managed is not None
+    assert result["process_id"] == managed.proc.pid
+    return execution_id
 
 
 @pytest.fixture
@@ -78,6 +94,112 @@ class TestQuickCommand:
         assert result["duration_ms"] >= 0
 
 
+class TestExecutionResponseContract:
+    @pytest.mark.asyncio
+    async def test_completed_response_exposes_both_identifiers(self, manager):
+        result = await manager.execute_command("printf done", side_effects=NONE)
+
+        assert result["status"] == "completed"
+        _assert_addressable_response(result, manager)
+
+    @pytest.mark.asyncio
+    async def test_backgrounded_response_exposes_both_identifiers(self, manager):
+        result = await manager.execute_command(
+            "sleep 30", yield_ms=0, timeout_ms=0, side_effects=NONE
+        )
+
+        assert result["status"] == "backgrounded"
+        execution_id = _assert_addressable_response(result, manager)
+        assert result["message"] == (
+            "Execution is running in the background. Use read, wait, or stop "
+            "with execution_id."
+        )
+        await manager.stop_execution(execution_id, force_after_ms=100)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_response_exposes_both_identifiers(self, manager):
+        result = await manager.execute_command(
+            "sleep 30",
+            yield_ms=2_000,
+            timeout_ms=20,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == "timed_out"
+        _assert_addressable_response(result, manager)
+
+    @pytest.mark.parametrize(
+        ("terminal_status", "expected_status"),
+        [
+            (ExecutionStatus.STOPPED, "stopped"),
+            (ExecutionStatus.FAILED, "failed"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_terminal_response_branches_expose_both_identifiers(
+        self, manager, monkeypatch, terminal_status, expected_status
+    ):
+        class FakeProcess:
+            pid = 654_321
+            stdout = None
+            stderr = None
+            stdin = None
+            returncode = 1
+
+        proc = FakeProcess()
+
+        async def finish_with_status(_proc, managed):
+            managed.info.status = terminal_status
+            managed.info.exit_code = proc.returncode
+            managed.process_group_exited = True
+            manager._mark_ended(managed)
+            managed.completion_event.set()
+
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.spawn_process",
+            AsyncMock(return_value=proc),
+        )
+        monkeypatch.setattr(manager, "_track_completion", finish_with_status)
+
+        result = await manager.execute_command(
+            "synthetic terminal execution",
+            timeout_ms=0,
+            side_effects=NONE,
+        )
+
+        assert result["status"] == expected_status
+        _assert_addressable_response(result, manager)
+
+    @pytest.mark.asyncio
+    async def test_generated_execution_ids_are_bare_hex_and_unique(self, manager):
+        results = [
+            await manager.execute_command(f"printf {index}", side_effects=NONE)
+            for index in range(8)
+        ]
+
+        execution_ids = {
+            _assert_addressable_response(result, manager) for result in results
+        }
+        assert len(execution_ids) == len(results)
+
+    @pytest.mark.asyncio
+    async def test_failed_to_start_is_not_addressable(self, manager, monkeypatch):
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.spawn_process",
+            AsyncMock(side_effect=OSError("spawn unavailable")),
+        )
+
+        result = await manager.execute_command("never starts", side_effects=NONE)
+
+        assert result == {
+            "status": "failed_to_start",
+            "error": "spawn unavailable",
+        }
+        assert "execution_id" not in result
+        assert "process_id" not in result
+        assert "pid" not in result
+
+
 class TestLongCommand:
     @pytest.mark.asyncio
     async def test_six_second_command_completes_inline_with_default_yield(self, manager):
@@ -91,10 +213,10 @@ class TestLongCommand:
             "sleep 10", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        assert "process_id" in result
-        assert re.fullmatch(r"[0-9a-f]{12}", result["process_id"])
+        assert "execution_id" in result
+        assert re.fullmatch(r"[0-9a-f]{12}", result["execution_id"])
         # Clean up
-        await short_yield_manager.stop_execution(result["process_id"], force_after_ms=500)
+        await short_yield_manager.stop_execution(result["execution_id"], force_after_ms=500)
 
     @pytest.mark.asyncio
     async def test_wait_returns_completed(self, manager):
@@ -103,10 +225,10 @@ class TestLongCommand:
             "echo hello && sleep 1", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
-        # Wait for it to complete. Cursorless reads resume, so exec's snapshot
+        execution_id = result["execution_id"]
+        # Wait for it to complete. Cursorless reads resume, so execute's snapshot
         # and this response together carry the output exactly once.
-        wait_result = await manager.wait_execution(pid, timeout_ms=5000)
+        wait_result = await manager.wait_execution(execution_id, timeout_ms=5000)
         assert wait_result["status"] in ("completed", "stopped")
         combined = result.get("stdout", "") + wait_result.get("stdout", "")
         assert "hello" in combined
@@ -121,7 +243,7 @@ class TestLongCommand:
         )
         assert result["status"] == "backgrounded"
 
-        wait_result = await manager.wait_execution(result["process_id"], timeout_ms=5000)
+        wait_result = await manager.wait_execution(result["execution_id"], timeout_ms=5000)
 
         assert wait_result["status"] == "completed"
         assert "hello" in wait_result.get("stdout", "")
@@ -136,13 +258,13 @@ class TestLongCommand:
             yield_ms=0, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
-        mp = manager.get_execution(pid)
+        execution_id = result["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         pgid = mp.process_group_id
 
         try:
-            wait_result = await manager.wait_execution(pid, timeout_ms=5000)
+            wait_result = await manager.wait_execution(execution_id, timeout_ms=5000)
 
             assert mp.info.status == ExecutionStatus.COMPLETED
             assert wait_result["status"] == "running"
@@ -170,13 +292,13 @@ class TestLongCommand:
             timeout_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
-        mp = manager.get_execution(pid)
+        execution_id = result["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         pgid = mp.process_group_id
 
         try:
-            wait_result = await manager.wait_execution(pid, timeout_ms=5000)
+            wait_result = await manager.wait_execution(execution_id, timeout_ms=5000)
 
             assert wait_result["status"] == "timed_out"
             assert pgid is not None
@@ -197,7 +319,7 @@ class TestYieldZero:
             "sleep 5", yield_ms=0, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        await manager.stop_execution(result["process_id"], force_after_ms=500)
+        await manager.stop_execution(result["execution_id"], force_after_ms=500)
 
 
 class TestIncrementalRead:
@@ -207,21 +329,21 @@ class TestIncrementalRead:
             "echo first && sleep 0.2 && echo second", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         await asyncio.sleep(0.5)  # Let both lines emit
 
-        read_result = await manager.read_execution_output(pid)
+        read_result = await manager.read_execution_output(execution_id)
         assert (
             "first" in read_result.get("stdout", "")
             or "second" in read_result.get("stdout", "")
         )
 
         # Read with since_seq beyond next_seq
-        read_result2 = await manager.read_execution_output(pid, since_seq=999)
+        read_result2 = await manager.read_execution_output(execution_id, since_seq=999)
         assert read_result2["stdout"] == ""
 
         # Clean up
-        await manager.stop_execution(pid, force_after_ms=500)
+        await manager.stop_execution(execution_id, force_after_ms=500)
 
     @pytest.mark.asyncio
     async def test_read_streams_filter(self, manager):
@@ -229,17 +351,17 @@ class TestIncrementalRead:
             "echo out && echo err >&2 && sleep 5", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
 
         await asyncio.sleep(0.3)
-        stdout_only = await manager.read_execution_output(pid, streams="stdout")
+        stdout_only = await manager.read_execution_output(execution_id, streams="stdout")
         assert "stdout" in stdout_only
         assert "stderr" not in stdout_only
 
-        stderr_only = await manager.read_execution_output(pid, streams="stderr")
+        stderr_only = await manager.read_execution_output(execution_id, streams="stderr")
         assert "stderr" in stderr_only
         assert "stdout" not in stderr_only
-        await manager.stop_execution(pid, force_after_ms=500)
+        await manager.stop_execution(execution_id, force_after_ms=500)
 
 
 class TestWrite:
@@ -257,19 +379,19 @@ class TestWrite:
             cmd, yield_ms=200, close_stdin=False, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         await asyncio.sleep(0.2)
-        write_result = await manager.write_input(pid, "hello", newline=True)
+        write_result = await manager.write_input(execution_id, "hello", newline=True)
         assert write_result["ok"] is True
         await asyncio.sleep(0.3)
-        read_result = await manager.read_execution_output(pid, streams="stdout")
+        read_result = await manager.read_execution_output(execution_id, streams="stdout")
         assert "got: hello" in read_result.get("stdout", "")
         assert "ok" in write_result
-        await manager.stop_execution(pid, force_after_ms=500)
+        await manager.stop_execution(execution_id, force_after_ms=500)
 
     @pytest.mark.asyncio
     async def test_write_after_initial_stdin(self, manager):
-        """An explicitly interactive exec keeps stdin open for follow-up writes."""
+        """An explicitly interactive execute keeps stdin open for follow-up writes."""
         cmd = (
             f"{sys.executable} -c '"
             "import sys\n"
@@ -285,18 +407,22 @@ class TestWrite:
             side_effects=NONE,
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         await asyncio.sleep(0.3)
         # Initial stdin data should appear in output
-        read1 = await manager.read_execution_output(pid, streams="stdout")
+        read1 = await manager.read_execution_output(execution_id, streams="stdout")
         assert "got: first" in read1.get("stdout", "")
         # Follow-up write must succeed (stdin must still be open)
-        write_result = await manager.write_input(pid, "second", newline=True)
+        write_result = await manager.write_input(execution_id, "second", newline=True)
         assert write_result["ok"] is True
         await asyncio.sleep(0.3)
-        read2 = await manager.read_execution_output(pid, since_seq=read1["next_seq"], streams="stdout")
+        read2 = await manager.read_execution_output(
+            execution_id,
+            since_seq=read1["next_seq"],
+            streams="stdout",
+        )
         assert "got: second" in read2.get("stdout", "")
-        await manager.stop_execution(pid, force_after_ms=500)
+        await manager.stop_execution(execution_id, force_after_ms=500)
 
     @pytest.mark.asyncio
     async def test_initial_stdin_is_closed_by_default(self, manager):
@@ -321,10 +447,10 @@ class TestWrite:
         assert result["status"] == "backgrounded"
 
         write_result = await manager.write_input(
-            result["process_id"], "hello", close_stdin=True
+            result["execution_id"], "hello", close_stdin=True
         )
         assert write_result["ok"] is True
-        completed = await manager.wait_execution(result["process_id"], timeout_ms=2_000)
+        completed = await manager.wait_execution(result["execution_id"], timeout_ms=2_000)
         assert completed["status"] == "completed"
         assert completed["stdout"].strip() == "5"
 
@@ -342,9 +468,9 @@ class TestStop:
             "sleep 60", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
 
-        stop_result = await manager.stop_execution(pid, force_after_ms=500)
+        stop_result = await manager.stop_execution(execution_id, force_after_ms=500)
         assert stop_result["stopped"] is True
 
     @pytest.mark.asyncio
@@ -354,28 +480,28 @@ class TestStop:
             "sleep 60", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         stop_result = await manager.stop_execution(
-            pid, signal_name="SIGINT", force_after_ms=500
+            execution_id, signal_name="SIGINT", force_after_ms=500
         )
         assert stop_result["stopped"] is True
-        assert stop_result["process_id"] == pid
+        assert stop_result["execution_id"] == execution_id
 
     @pytest.mark.asyncio
     async def test_invalid_signal_is_rejected_without_stopping_process(self, manager):
         result = await manager.execute_command(
             "sleep 30", yield_ms=0, side_effects=NONE
         )
-        process_id = result["process_id"]
+        execution_id = result["execution_id"]
 
         stop_result = await manager.stop_execution(
-            process_id, signal_name="NOT_A_SIGNAL", force_after_ms=0
+            execution_id, signal_name="NOT_A_SIGNAL", force_after_ms=0
         )
 
         assert stop_result["stopped"] is False
         assert "Invalid signal" in stop_result["error"]
-        assert (await manager.read_execution_output(process_id))["status"] == "running"
-        await manager.stop_execution(process_id, force_after_ms=100)
+        assert (await manager.read_execution_output(execution_id))["status"] == "running"
+        await manager.stop_execution(execution_id, force_after_ms=100)
 
     @pytest.mark.asyncio
     async def test_stop_unknown_process(self, manager):
@@ -403,12 +529,12 @@ class TestTimeout:
         )
         # Should get backgrounded first, then timeout kills it
         if result["status"] == "backgrounded":
-            pid = result["process_id"]
+            execution_id = result["execution_id"]
             await asyncio.sleep(1.0)
-            read_result = await manager.read_execution_output(pid)
+            read_result = await manager.read_execution_output(execution_id)
             assert read_result["status"] in ("timed_out", "completed", "stopped")
         elif result["status"] == "timed_out":
-            assert "process_id" in result
+            assert "execution_id" in result
 
     @pytest.mark.asyncio
     async def test_default_timeout_task_and_explicit_unlimited_override(self, manager):
@@ -416,12 +542,12 @@ class TestTimeout:
         unlimited = await manager.execute_command(
             "sleep 30", yield_ms=0, timeout_ms=0, side_effects=NONE
         )
-        default_mp = manager.get_execution(default["process_id"])
-        unlimited_mp = manager.get_execution(unlimited["process_id"])
+        default_mp = manager.get_execution(default["execution_id"])
+        unlimited_mp = manager.get_execution(unlimited["execution_id"])
         assert default_mp is not None and default_mp.timeout_task is not None
         assert unlimited_mp is not None and unlimited_mp.timeout_task is None
-        await manager.stop_execution(default["process_id"], force_after_ms=100)
-        await manager.stop_execution(unlimited["process_id"], force_after_ms=100)
+        await manager.stop_execution(default["execution_id"], force_after_ms=100)
+        await manager.stop_execution(unlimited["execution_id"], force_after_ms=100)
         assert default_mp.completion_task is not None
         assert default_mp.completion_task.done()
         assert unlimited_mp.completion_task is not None
@@ -443,8 +569,8 @@ class TestBoundedOutput:
                 "printf 12345678901234567890",
                 side_effects=NONE,
             )
-            process_id = mgr.list_executions(limit=1)["processes"][0]["process_id"]
-            mp = mgr.get_execution(process_id)
+            execution_id = mgr.list_executions(limit=1)["executions"][0]["execution_id"]
+            mp = mgr.get_execution(execution_id)
 
             assert result["status"] == "completed"
             assert result["stdout"] == "1234567890"
@@ -501,7 +627,7 @@ class TestBoundedOutput:
             side_effects=NONE,
         )
         wait_result = await manager.wait_execution(
-            started["process_id"], timeout_ms=10_000
+            started["execution_id"], timeout_ms=10_000
         )
         assert wait_result["status"] == "completed"
         assert wait_result["capped"] is False
@@ -517,14 +643,14 @@ class TestIncrementalPolling:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = started["process_id"]
+        execution_id = started["execution_id"]
         assert "next_seq" in started
 
         collected = started["stdout"]
         cursor = started["next_seq"]
         for _ in range(20):
             page = await manager.wait_execution(
-                process_id, timeout_ms=300, since_seq=cursor
+                execution_id, timeout_ms=300, since_seq=cursor
             )
             assert page["start_seq"] >= cursor
             collected += page["stdout"]
@@ -536,20 +662,20 @@ class TestIncrementalPolling:
 
     @pytest.mark.asyncio
     async def test_exec_cursor_is_usable_by_read(self, manager):
-        # The yield window is shorter than the command, so exec returns the
+        # The yield window is shorter than the command, so execute returns the
         # first write and a cursor positioned after it.
         started = await manager.execute_command(
             "printf 'first\\n'; sleep 2; printf 'second\\n'",
             yield_ms=300,
             side_effects=NONE,
         )
-        process_id = started["process_id"]
+        execution_id = started["execution_id"]
         assert started["status"] == "backgrounded"
         assert started["stdout"] == "first\n"
 
-        await manager.wait_execution(process_id, timeout_ms=5_000)
+        await manager.wait_execution(execution_id, timeout_ms=5_000)
         remainder = await manager.read_execution_output(
-            process_id, since_seq=started["next_seq"]
+            execution_id, since_seq=started["next_seq"]
         )
 
         assert remainder["stdout"] == "second\n"
@@ -560,10 +686,10 @@ class TestIncrementalPolling:
         started = await manager.execute_command(
             "seq 1 5000", yield_ms=0, side_effects=NONE
         )
-        process_id = started["process_id"]
+        execution_id = started["execution_id"]
 
         waited = await manager.wait_execution(
-            process_id, timeout_ms=5_000, max_output_bytes=50
+            execution_id, timeout_ms=5_000, max_output_bytes=50
         )
 
         assert waited["capped"] is True
@@ -575,9 +701,9 @@ class TestTailMode:
     @pytest.mark.asyncio
     async def test_read_tail_lines_returns_newest_lines(self, manager):
         await manager.execute_command("seq 1 5000", side_effects=NONE)
-        process_id = manager.list_executions(limit=1)["processes"][0]["process_id"]
+        execution_id = manager.list_executions(limit=1)["executions"][0]["execution_id"]
 
-        tail = await manager.read_execution_output(process_id, tail_lines=3)
+        tail = await manager.read_execution_output(execution_id, tail_lines=3)
 
         assert tail["stdout"] == "4998\n4999\n5000\n"
 
@@ -588,7 +714,7 @@ class TestTailMode:
         )
 
         waited = await manager.wait_execution(
-            started["process_id"], timeout_ms=5_000, tail_lines=2
+            started["execution_id"], timeout_ms=5_000, tail_lines=2
         )
 
         assert waited["stdout"] == "4999\n5000\n"
@@ -598,14 +724,14 @@ class TestTailMode:
         started = await manager.execute_command(
             "echo hi", yield_ms=0, side_effects=NONE
         )
-        process_id = manager.list_executions(limit=1)["processes"][0]["process_id"]
+        execution_id = manager.list_executions(limit=1)["executions"][0]["execution_id"]
         assert started is not None
 
         result = await manager.read_execution_output(
-            process_id, since_seq=1, tail_lines=5
+            execution_id, since_seq=1, tail_lines=5
         )
         waited = await manager.wait_execution(
-            process_id, timeout_ms=100, since_seq=1, tail_lines=5
+            execution_id, timeout_ms=100, since_seq=1, tail_lines=5
         )
 
         assert "mutually exclusive" in result["error"]
@@ -614,9 +740,9 @@ class TestTailMode:
     @pytest.mark.asyncio
     async def test_non_positive_tail_lines_is_rejected(self, manager):
         await manager.execute_command("echo hi", side_effects=NONE)
-        process_id = manager.list_executions(limit=1)["processes"][0]["process_id"]
+        execution_id = manager.list_executions(limit=1)["executions"][0]["execution_id"]
 
-        result = await manager.read_execution_output(process_id, tail_lines=0)
+        result = await manager.read_execution_output(execution_id, tail_lines=0)
 
         assert "must be positive" in result["error"]
 
@@ -627,11 +753,11 @@ class TestProcessActivity:
         started = await manager.execute_command(
             "printf 'ready\\n'; sleep 5", yield_ms=0, side_effects=NONE
         )
-        process_id = started["process_id"]
+        execution_id = started["execution_id"]
 
         try:
             for _ in range(50):
-                entry = manager.list_executions()["processes"][0]
+                entry = manager.list_executions()["executions"][0]
                 if entry["last_output_at"] is not None:
                     break
                 await asyncio.sleep(0.05)
@@ -641,7 +767,7 @@ class TestProcessActivity:
             assert entry["idle_ms"] >= 0
             assert entry["latest_seq"] == len("ready\n") + 1
         finally:
-            await manager.stop_execution(process_id, force_after_ms=200)
+            await manager.stop_execution(execution_id, force_after_ms=200)
 
     @pytest.mark.asyncio
     async def test_ps_idle_is_none_before_any_output(self, manager):
@@ -649,12 +775,12 @@ class TestProcessActivity:
             "sleep 5", yield_ms=0, side_effects=NONE
         )
         try:
-            entry = manager.list_executions()["processes"][0]
+            entry = manager.list_executions()["executions"][0]
             assert entry["last_output_at"] is None
             assert entry["idle_ms"] is None
             assert entry["latest_seq"] == 1
         finally:
-            await manager.stop_execution(started["process_id"], force_after_ms=200)
+            await manager.stop_execution(started["execution_id"], force_after_ms=200)
 
 
 class TestSecurityConfig:
@@ -724,13 +850,13 @@ class TestRedaction:
             "print(os.environ['MY_SECRET_KEY'], flush=True); time.sleep(0.2)\""
         )
         result = await manager.execute_command(command, yield_ms=0, side_effects=NONE)
-        process_id = result["process_id"]
+        execution_id = result["execution_id"]
         await asyncio.sleep(0.1)
 
-        read_result = await manager.read_execution_output(process_id)
+        read_result = await manager.read_execution_output(execution_id)
         # since_seq=1 re-reads the same range rather than resuming past it.
         wait_result = await manager.wait_execution(
-            process_id, timeout_ms=1000, since_seq=1
+            execution_id, timeout_ms=1000, since_seq=1
         )
 
         assert "changed-secret" in read_result["stdout"]
@@ -752,16 +878,16 @@ class TestRedaction:
             name=secret,
             side_effects=NONE,
         )
-        process_id = started["process_id"]
+        execution_id = started["execution_id"]
         await asyncio.sleep(0.1)
 
-        read_result = await manager.read_execution_output(process_id)
+        read_result = await manager.read_execution_output(execution_id)
         # since_seq=1 re-reads the same range; a cursorless wait would resume
         # past what the read above already consumed.
         wait_result = await manager.wait_execution(
-            process_id, timeout_ms=1_000, since_seq=1
+            execution_id, timeout_ms=1_000, since_seq=1
         )
-        listed = manager.list_executions()["processes"][0]
+        listed = manager.list_executions()["executions"][0]
 
         for value in (
             started["stdout"],
@@ -806,12 +932,12 @@ class TestCleanup:
             "sleep 30", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         cleanup_result = await manager.cleanup(
             completed_older_than_ms=0, stopped_older_than_ms=0
         )
         assert cleanup_result["removed"] == 0
-        await manager.stop_execution(pid, force_after_ms=500)
+        await manager.stop_execution(execution_id, force_after_ms=500)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -833,20 +959,26 @@ class TestCleanup:
 
         assert result["removed"] == 0
         assert "non-negative" in result["error"]
-        assert len(manager.list_executions()["processes"]) == 1
+        assert len(manager.list_executions()["executions"]) == 1
 
 
 class TestPs:
     @pytest.mark.asyncio
     async def test_ps_returns_metadata(self, manager):
-        await manager.execute_command("echo test", name="testproc", side_effects=NONE)
+        started = await manager.execute_command(
+            "echo test", name="testproc", side_effects=NONE
+        )
         result = manager.list_executions()
-        assert "processes" in result
-        procs = result["processes"]
+        assert "executions" in result
+        assert "processes" not in result
+        procs = result["executions"]
         assert len(procs) >= 1
         proc = procs[0]
-        assert "process_id" in proc
-        assert "pid" in proc
+        assert proc["execution_id"] == started["execution_id"]
+        assert isinstance(proc["execution_id"], str)
+        assert proc["process_id"] == started["process_id"]
+        assert isinstance(proc["process_id"], int)
+        assert "pid" not in proc
         assert "name" in proc
         assert "command" in proc
         assert "cwd" in proc
@@ -859,19 +991,19 @@ class TestPs:
     async def test_ps_exclude_completed(self, manager):
         await manager.execute_command("echo done", side_effects=NONE)
         result = manager.list_executions(include_completed=False)
-        assert len(result["processes"]) == 0
+        assert len(result["executions"]) == 0
 
     @pytest.mark.asyncio
     async def test_ps_limit(self, manager):
         for i in range(5):
             await manager.execute_command(f"echo test{i}", side_effects=NONE)
         result = manager.list_executions(limit=3)
-        assert len(result["processes"]) <= 3
+        assert len(result["executions"]) <= 3
 
     @pytest.mark.asyncio
     async def test_ps_negative_limit_returns_no_executions(self, manager):
         await manager.execute_command("echo test", side_effects=NONE)
-        assert manager.list_executions(limit=-1)["processes"] == []
+        assert manager.list_executions(limit=-1)["executions"] == []
 
 
 class TestProcessLimit:
@@ -893,8 +1025,8 @@ class TestProcessLimit:
 
         # Clean up
         for r in [r1, r2]:
-            if "process_id" in r:
-                await mgr.stop_execution(r["process_id"], force_after_ms=500)
+            if "execution_id" in r:
+                await mgr.stop_execution(r["execution_id"], force_after_ms=500)
 
 
 class TestWriteErrors:
@@ -904,9 +1036,9 @@ class TestWriteErrors:
         assert result["status"] == "completed"
         # Find the process in ps
         ps_result = manager.list_executions()
-        if ps_result["processes"]:
-            pid = ps_result["processes"][0]["process_id"]
-            write_result = await manager.write_input(pid, "hello")
+        if ps_result["executions"]:
+            execution_id = ps_result["executions"][0]["execution_id"]
+            write_result = await manager.write_input(execution_id, "hello")
             assert write_result["ok"] is False
 
     @pytest.mark.asyncio
@@ -922,8 +1054,8 @@ class TestStopResponseShape:
             "sleep 60", yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
-        stop_result = await manager.stop_execution(pid, force_after_ms=500)
+        execution_id = result["execution_id"]
+        stop_result = await manager.stop_execution(execution_id, force_after_ms=500)
         assert "error" in stop_result
         assert stop_result["stopped"] is True
 
@@ -937,11 +1069,11 @@ class TestReadStreamValidation:
     @pytest.mark.asyncio
     async def test_read_invalid_streams(self, manager):
         result = await manager.execute_command("echo hello", side_effects=NONE)
-        pid = result.get("process_id")
-        if pid is None:
+        execution_id = result.get("execution_id")
+        if execution_id is None:
             ps_result = manager.list_executions(limit=1)
-            pid = ps_result["processes"][0]["process_id"]
-        read_result = await manager.read_execution_output(pid, streams="invalid")
+            execution_id = ps_result["executions"][0]["execution_id"]
+        read_result = await manager.read_execution_output(execution_id, streams="invalid")
         assert "error" in read_result
 
 
@@ -950,28 +1082,28 @@ class TestUnknownProcessIds:
     @pytest.mark.asyncio
     async def test_read_unknown_process(self, manager):
         result = await manager.read_execution_output("nonexistent")
-        assert result["process_id"] == "nonexistent"
-        assert result["error"] == "Unknown process_id: nonexistent"
+        assert result["execution_id"] == "nonexistent"
+        assert result["error"] == "Unknown execution_id: nonexistent"
 
     @pytest.mark.asyncio
     async def test_wait_unknown_process(self, manager):
         result = await manager.wait_execution("nonexistent")
-        assert result["process_id"] == "nonexistent"
-        assert result["error"] == "Unknown process_id: nonexistent"
+        assert result["execution_id"] == "nonexistent"
+        assert result["error"] == "Unknown execution_id: nonexistent"
 
     @pytest.mark.asyncio
     async def test_stop_unknown_process(self, manager):
         result = await manager.stop_execution("nonexistent")
-        assert result["process_id"] == "nonexistent"
-        assert result["error"] == "Unknown process_id: nonexistent"
+        assert result["execution_id"] == "nonexistent"
+        assert result["error"] == "Unknown execution_id: nonexistent"
         assert result["stopped"] is False
 
     @pytest.mark.asyncio
     async def test_write_unknown_process(self, manager):
         result = await manager.write_input("nonexistent", "hello")
-        assert result["process_id"] == "nonexistent"
+        assert result["execution_id"] == "nonexistent"
         assert result["ok"] is False
-        assert result["error"] == "Unknown process_id: nonexistent"
+        assert result["error"] == "Unknown execution_id: nonexistent"
 
 
 class TestWaitCapBehavior:
@@ -981,28 +1113,28 @@ class TestWaitCapBehavior:
             "sleep 60", yield_ms=0, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         try:
-            wait_result = await manager.wait_execution(pid, timeout_ms=500)
+            wait_result = await manager.wait_execution(execution_id, timeout_ms=500)
             assert wait_result["status"] == "running"
             assert wait_result["exit_code"] is None
             assert "next_seq" in wait_result
         finally:
-            await manager.stop_execution(pid, force_after_ms=500)
+            await manager.stop_execution(execution_id, force_after_ms=500)
 
     @pytest.mark.asyncio
     async def test_wait_already_completed_returns_immediately(self, manager):
         result = await manager.execute_command("echo hello", side_effects=NONE)
         assert result["status"] == "completed"
         ps_result = manager.list_executions(limit=1)
-        pid = ps_result["processes"][0]["process_id"]
-        # exec already consumed the output; since_seq=1 inspects it again.
-        wait_result = await manager.wait_execution(pid, timeout_ms=5000, since_seq=1)
+        execution_id = ps_result["executions"][0]["execution_id"]
+        # execute already consumed the output; since_seq=1 inspects it again.
+        wait_result = await manager.wait_execution(execution_id, timeout_ms=5000, since_seq=1)
         assert wait_result["status"] == "completed"
         assert "hello" in wait_result.get("stdout", "")
 
     @pytest.mark.asyncio
-    async def test_completed_truncated_exec_returns_process_id(self, manager):
+    async def test_completed_truncated_execute_returns_execution_id(self, manager):
         result = await manager.execute_command(
             "seq 1 20000",
             max_output_bytes=100,
@@ -1011,9 +1143,11 @@ class TestWaitCapBehavior:
 
         assert result["status"] == "completed"
         assert result["capped"] is True
-        assert re.fullmatch(r"[0-9a-f]{12}", result["process_id"])
+        assert re.fullmatch(r"[0-9a-f]{12}", result["execution_id"])
         assert f"since_seq={result['next_seq']}" in result["hint"]
-        retained = await manager.read_execution_output(result["process_id"])
+        assert "execution_id" in result["hint"]
+        assert "process_id" not in result["hint"]
+        retained = await manager.read_execution_output(result["execution_id"])
         assert retained["status"] == "completed"
 
     def test_yield_clamp_boundaries(self, monkeypatch):
@@ -1050,9 +1184,9 @@ class TestTimedOutStatus:
             "sleep 60", yield_ms=0, timeout_ms=500, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         await asyncio.sleep(1.0)
-        read_result = await manager.read_execution_output(pid)
+        read_result = await manager.read_execution_output(execution_id)
         assert read_result["status"] in ("timed_out", "completed", "stopped")
 
     @pytest.mark.asyncio
@@ -1061,8 +1195,8 @@ class TestTimedOutStatus:
             "sleep 60", yield_ms=0, timeout_ms=500, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
-        wait_result = await manager.wait_execution(pid, timeout_ms=5000)
+        execution_id = result["execution_id"]
+        wait_result = await manager.wait_execution(execution_id, timeout_ms=5000)
         assert wait_result["status"] in ("timed_out", "completed", "stopped")
 
 
@@ -1081,20 +1215,20 @@ class TestIncrementalReadSinceSeq:
             yield_ms=100, side_effects=NONE
         )
         assert result["status"] == "backgrounded"
-        pid = result["process_id"]
+        execution_id = result["execution_id"]
         await asyncio.sleep(1.0)
 
-        # exec's inline snapshot already consumed the first line, so read from
+        # execute's inline snapshot already consumed the first line, so read from
         # the head explicitly to see it again.
-        first_read = await manager.read_execution_output(pid, since_seq=1)
+        first_read = await manager.read_execution_output(execution_id, since_seq=1)
         assert "first" in first_read.get("stdout", "")
         next_seq = first_read["next_seq"]
 
-        incremental_read = await manager.read_execution_output(pid, since_seq=next_seq)
+        incremental_read = await manager.read_execution_output(execution_id, since_seq=next_seq)
         if "stdout" in incremental_read:
             assert "first" not in incremental_read["stdout"]
 
-        await manager.stop_execution(pid, force_after_ms=500)
+        await manager.stop_execution(execution_id, force_after_ms=500)
 
 
 class TestRingBufferByteCount:
@@ -1182,15 +1316,15 @@ class TestDefectFixes:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = result["process_id"]
+        execution_id = result["execution_id"]
 
         # Anchored at the head so the assertion does not depend on whether
-        # exec's inline snapshot already consumed the output.
+        # execute's inline snapshot already consumed the output.
         waited = await manager.wait_execution(
-            process_id, timeout_ms=2_000, max_output_bytes=4, since_seq=1
+            execution_id, timeout_ms=2_000, max_output_bytes=4, since_seq=1
         )
         remainder = await manager.read_execution_output(
-            process_id,
+            execution_id,
             since_seq=waited["next_seq"],
             max_output_bytes=100,
             streams="stdout",
@@ -1206,18 +1340,18 @@ class TestDefectFixes:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = result["process_id"]
-        mp = manager.get_execution(process_id)
+        execution_id = result["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         # since_seq=1 is out-of-band, so waiting for exit leaves the resume
         # cursor alone. Pin it so the assertions do not depend on whether
-        # exec's inline snapshot already consumed part of the output.
-        await manager.wait_execution(process_id, timeout_ms=2_000, since_seq=1)
+        # execute's inline snapshot already consumed part of the output.
+        await manager.wait_execution(execution_id, timeout_ms=2_000, since_seq=1)
         mp.read_cursor = 1
 
         pages = []
         for _ in range(6):
-            page = await manager.read_execution_output(process_id, max_output_bytes=4)
+            page = await manager.read_execution_output(execution_id, max_output_bytes=4)
             if not page["stdout"]:
                 break
             pages.append(page["stdout"])
@@ -1231,24 +1365,24 @@ class TestDefectFixes:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = result["process_id"]
-        mp = manager.get_execution(process_id)
+        execution_id = result["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         # since_seq=1 is out-of-band, so waiting for exit leaves the resume
         # cursor alone. Pin it so the polling below starts from a known point.
-        await manager.wait_execution(process_id, timeout_ms=2_000, since_seq=1)
+        await manager.wait_execution(execution_id, timeout_ms=2_000, since_seq=1)
         mp.read_cursor = 1
 
-        first = await manager.read_execution_output(process_id, max_output_bytes=4)
+        first = await manager.read_execution_output(execution_id, max_output_bytes=4)
         cursor_after_poll = mp.read_cursor
 
         # None of these are part of the polling stream.
-        await manager.read_execution_output(process_id, since_seq=1)
-        await manager.read_execution_output(process_id, tail_lines=1)
-        await manager.read_execution_output(process_id, streams="stdout")
+        await manager.read_execution_output(execution_id, since_seq=1)
+        await manager.read_execution_output(execution_id, tail_lines=1)
+        await manager.read_execution_output(execution_id, streams="stdout")
         assert mp.read_cursor == cursor_after_poll
 
-        resumed = await manager.read_execution_output(process_id, max_output_bytes=4)
+        resumed = await manager.read_execution_output(execution_id, max_output_bytes=4)
 
         assert first["stdout"] == "0123"
         assert resumed["stdout"] == "4567"
@@ -1260,14 +1394,14 @@ class TestDefectFixes:
             yield_ms=0,
             side_effects=NONE,
         )
-        process_id = result["process_id"]
-        await manager.wait_execution(process_id, timeout_ms=2_000)
+        execution_id = result["execution_id"]
+        await manager.wait_execution(execution_id, timeout_ms=2_000)
 
         cursor = 1
         output = ""
         for _ in range(4):
             page = await manager.read_execution_output(
-                process_id,
+                execution_id,
                 since_seq=cursor,
                 max_output_bytes=5,
                 streams="stdout",
@@ -1295,17 +1429,17 @@ class TestDefectFixes:
             yield_ms=100,
             side_effects=NONE,
         )
-        process_id = result["process_id"]
+        execution_id = result["execution_id"]
         await asyncio.sleep(0.1)
 
-        read_result = await manager.read_execution_output(process_id)
-        write_result = await manager.write_input(process_id, "x")
-        running_only = manager.list_executions(include_completed=False)["processes"]
+        read_result = await manager.read_execution_output(execution_id)
+        write_result = await manager.write_input(execution_id, "x")
+        running_only = manager.list_executions(include_completed=False)["executions"]
 
         assert read_result["status"] == "running"
         assert write_result["ok"] is True
-        assert any(item["process_id"] == process_id for item in running_only)
-        await manager.stop_execution(process_id, force_after_ms=100)
+        assert any(item["execution_id"] == execution_id for item in running_only)
+        await manager.stop_execution(execution_id, force_after_ms=100)
 
     @pytest.mark.asyncio
     async def test_max_processes_allows_sequential(self, monkeypatch):
@@ -1331,8 +1465,8 @@ class TestDefectFixes:
 
         # Find the process and check that its timeout task is cancelled
         ps_result = manager.list_executions(limit=1)
-        pid = ps_result["processes"][0]["process_id"]
-        mp = manager.get_execution(pid)
+        execution_id = ps_result["executions"][0]["execution_id"]
+        mp = manager.get_execution(execution_id)
         assert mp is not None
         assert mp.timeout_task is not None
         assert mp.timeout_task.cancelled() or mp.timeout_task.done()
