@@ -8,8 +8,8 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config
-from .policy import GRACEFUL_STOP_MS, MAX_EFFECTIVE_WAIT_MS
 from .execution.manager import ExecutionManager
+from .policy import GRACEFUL_STOP_MS, MAX_EFFECTIVE_WAIT_MS
 from .types import SideEffect
 
 # Module-level manager, initialized once at startup
@@ -36,7 +36,7 @@ def _get_manager() -> ExecutionManager:
 
 
 @mcp.tool()
-async def exec(
+async def execute(
     command: str,
     side_effects: list[SideEffect],
     cwd: str | None = None,
@@ -49,7 +49,11 @@ async def exec(
     timeout_ms: int | None = None,
     max_output_bytes: int | None = None,
 ) -> dict:
-    """Execute a shell command with auto-yield for long-running processes.
+    """Start a managed shell execution with automatic backgrounding.
+
+    Addressable responses include an opaque ``execution_id``. Pass that value
+    through unchanged to ``read``, ``write``, ``wait``, or ``stop``; never
+    parse it or substitute the numeric OS ``process_id``.
 
     ``side_effects`` is required and must be a non-empty list. Declare every
     plausible side-effect category before running the command. ``NONE`` is
@@ -73,7 +77,7 @@ async def exec(
     executable file unless the same command also executes inline code.
     When a command falls into that category, prefer writing the content to
     a reviewable workspace file and executing it in a small, inspectable
-    step rather than piping or inlining it as a single ``exec`` call.
+    step rather than piping or inlining it as a single ``execute`` call.
     ``RUNS_INLINE_CODE`` is in the default blocklist; the safer next
     action is to write a reviewable file and then run it.
 
@@ -114,13 +118,16 @@ async def exec(
 
 @mcp.tool()
 async def read(
-    process_id: str,
+    execution_id: str,
     since_seq: int | None = None,
     max_output_bytes: int | None = None,
     streams: str = "both",
     tail_lines: int | None = None,
 ) -> dict:
-    """Read output from a managed process.
+    """Read output from a managed execution.
+
+    ``execution_id`` is opaque and must be passed through unchanged from an
+    addressable ``execute`` response.
 
     Pass ``since_seq`` (the ``next_seq`` from the previous response) to get
     only output produced since that point. Pass ``tail_lines`` instead to get
@@ -128,7 +135,7 @@ async def read(
     noisy build or test run. The two are mutually exclusive.
 
     With neither, the read **resumes** from where the last cursorless read
-    or ``exec`` snapshot stopped and then advances that server-side cursor,
+    or ``execute`` snapshot stopped and then advances that server-side cursor,
     so repeated calls never return the same bytes twice and no cursor
     bookkeeping is needed. Because such a read consumes, inspecting output
     that was already delivered needs an explicit ``since_seq=1``.
@@ -144,7 +151,7 @@ async def read(
     has advanced overall.
     """
     return await _get_manager().read_execution_output(
-        process_id=process_id,
+        execution_id=execution_id,
         since_seq=since_seq,
         max_output_bytes=max_output_bytes,
         streams=streams,
@@ -154,14 +161,18 @@ async def read(
 
 @mcp.tool()
 async def write(
-    process_id: str,
+    execution_id: str,
     input: str,
     newline: bool = False,
     close_stdin: bool = False,
 ) -> dict:
-    """Write to process stdin, optionally closing it afterward to send EOF."""
+    """Write to an execution's stdin, optionally closing it to send EOF.
+
+    ``execution_id`` is opaque and must be passed through unchanged from an
+    addressable ``execute`` response.
+    """
     return await _get_manager().write_input(
-        process_id=process_id,
+        execution_id=execution_id,
         input_data=input,
         newline=newline,
         close_stdin=close_stdin,
@@ -170,21 +181,24 @@ async def write(
 
 @mcp.tool()
 async def wait(
-    process_id: str,
+    execution_id: str,
     timeout_ms: int = MAX_EFFECTIVE_WAIT_MS,
     max_output_bytes: int | None = None,
     since_seq: int | None = None,
     tail_lines: int | None = None,
 ) -> dict:
-    """Wait for a process to exit without killing it.
+    """Wait for an execution to exit without stopping it.
+
+    ``execution_id`` is opaque and must be passed through unchanged from an
+    addressable ``execute`` response.
 
     ``timeout_ms`` is a **maximum wait**, not an execution limit: it never
-    terminates the process, and it is capped at 55,000ms to stay under
+    stops the execution, and it is capped at 55,000ms to stay under
     typical MCP request timeouts. The response reports ``wait_result``
     (``exited`` or ``deadline_reached``), ``waited_ms``, and the effective
     ``max_wait_ms`` so a capped request is visible rather than silent. The
-    separate execution limit that does terminate a process is
-    ``exec(timeout_ms=...)``.
+    separate execution limit that does stop an execution is
+    ``execute(timeout_ms=...)``.
 
     Output follows the same rules as ``read``: with no ``since_seq`` and no
     ``tail_lines`` the response resumes from where the last cursorless read
@@ -193,7 +207,7 @@ async def wait(
     ``tail_lines`` for an out-of-band snapshot of the newest N lines.
     """
     return await _get_manager().wait_execution(
-        process_id=process_id,
+        execution_id=execution_id,
         timeout_ms=timeout_ms,
         max_output_bytes=max_output_bytes,
         since_seq=since_seq,
@@ -203,13 +217,17 @@ async def wait(
 
 @mcp.tool()
 async def stop(
-    process_id: str,
+    execution_id: str,
     signal: str = "SIGTERM",
     force_after_ms: int = GRACEFUL_STOP_MS,
 ) -> dict:
-    """Stop a running process with graceful termination then force kill."""
+    """Stop a running execution, escalating to force kill when needed.
+
+    ``execution_id`` is opaque and must be passed through unchanged from an
+    addressable ``execute`` response.
+    """
     return await _get_manager().stop_execution(
-        process_id=process_id,
+        execution_id=execution_id,
         signal_name=signal,
         force_after_ms=force_after_ms,
     )
@@ -217,12 +235,12 @@ async def stop(
 
 @mcp.tool()
 async def ps(include_completed: bool = True, limit: int = 50) -> dict:
-    """List managed processes.
+    """List managed executions, including retained terminal executions.
 
     Each entry reports ``idle_ms`` (time since output last arrived, ``null``
     if none has), ``last_output_at``, and ``latest_seq`` alongside byte
-    counts, so a genuinely hung process is distinguishable from one that is
-    working quietly.
+    counts. ``execution_id`` is an opaque handle that must be passed through
+    unchanged; ``process_id`` is the initial shell's numeric OS PID.
     """
     return _get_manager().list_executions(
         include_completed=include_completed,
@@ -235,7 +253,7 @@ async def cleanup(
     completed_older_than_ms: int = 3600000,
     stopped_older_than_ms: int = 3600000,
 ) -> dict:
-    """Remove completed/stopped processes older than non-negative thresholds."""
+    """Remove completed/stopped execution records older than the thresholds."""
     return await _get_manager().cleanup(
         completed_older_than_ms=completed_older_than_ms,
         stopped_older_than_ms=stopped_older_than_ms,
