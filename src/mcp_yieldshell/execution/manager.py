@@ -1,4 +1,4 @@
-"""Process registry and lifecycle management."""
+"""Execution registry and lifecycle management."""
 
 from __future__ import annotations
 
@@ -31,12 +31,12 @@ from .spawn import kill_process, spawn_process, terminate_process
 
 _SHUTDOWN_REJECT_ERROR = "Server is shutting down"
 
-class ProcessManager:
-    """Registry and lifecycle manager for managed shell processes."""
+class ExecutionManager:
+    """Registry and lifecycle manager for managed shell executions."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._processes: dict[str, ManagedExecution] = {}
+        self._executions: dict[str, ManagedExecution] = {}
         self._pending_spawns = 0
         self._pending_spawn_tasks: set[asyncio.Task[Any]] = set()
         self._shutdown_lock = asyncio.Lock()
@@ -75,7 +75,7 @@ class ProcessManager:
         self._pending_spawns -= 1
         self._pending_spawn_tasks.discard(spawn_owner)
 
-    async def _reject_spawned_process(
+    async def _reject_spawned_execution(
         self,
         proc: asyncio.subprocess.Process,
         process_group_id: int | None,
@@ -96,11 +96,11 @@ class ProcessManager:
     def _shutdown_reject_response(self) -> dict[str, Any]:
         return {"status": "failed_to_start", "error": _SHUTDOWN_REJECT_ERROR}
 
-    def _new_id(self) -> str:
+    def _new_execution_id(self) -> str:
         while True:
-            process_id = uuid.uuid4().hex[:12]
-            if process_id not in self._processes:
-                return process_id
+            execution_id = uuid.uuid4().hex[:12]
+            if execution_id not in self._executions:
+                return execution_id
 
     def _max_output(self, requested: int | None) -> int:
         cap = self._config.max_output_bytes
@@ -123,7 +123,7 @@ class ProcessManager:
             "stdout": self._redact(mp, data["texts"]["stdout"]),
             "stderr": self._redact(mp, data["texts"]["stderr"]),
         }
-        snapshot.update(self._cursor_fields(mp.info.process_id, data))
+        snapshot.update(self._cursor_fields(mp.info.execution_id, data))
         return snapshot
 
     @staticmethod
@@ -161,7 +161,7 @@ class ProcessManager:
         return data
 
     @staticmethod
-    def _cursor_fields(process_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    def _cursor_fields(execution_id: str, data: dict[str, Any]) -> dict[str, Any]:
         """Cursor and withheld-output fields shared by exec, read, and wait."""
         fields: dict[str, Any] = {
             "start_seq": data["start_seq"],
@@ -175,7 +175,7 @@ class ProcessManager:
             hints.append(
                 "More output is available; read again to continue, or pass "
                 f"since_seq={data['next_seq']} explicitly "
-                f"(process_id={process_id!r})."
+                f"(execution_id={execution_id!r})."
             )
         if data["evicted"]:
             hints.append(
@@ -230,24 +230,24 @@ class ProcessManager:
             return ExecutionStatus.RUNNING.value
         return mp.info.status.value
 
-    def _reap_terminal_processes(self) -> int:
+    def _reap_terminal_executions(self) -> int:
         """Apply configured age and count retention to terminal records."""
         now = time.time()
         retention_ms = self._config.process_retention_ms
         expired = [
-            process_id
-            for process_id, mp in self._processes.items()
+            execution_id
+            for execution_id, mp in self._executions.items()
             if self._is_terminal(mp)
             and not self._has_live_work(mp)
             and (now - (mp.info.ended_at or mp.info.started_at)) * 1000 > retention_ms
         ]
-        for process_id in expired:
-            self._remove_process(process_id)
+        for execution_id in expired:
+            self._remove_execution(execution_id)
 
         terminal = sorted(
             (
-                (process_id, mp)
-                for process_id, mp in self._processes.items()
+                (execution_id, mp)
+                for execution_id, mp in self._executions.items()
                 if self._is_terminal(mp) and not self._has_live_work(mp)
             ),
             key=lambda item: (
@@ -257,12 +257,12 @@ class ProcessManager:
             ),
         )
         overflow = len(terminal) - self._config.max_retained_processes
-        for process_id, _ in terminal[: max(0, overflow)]:
-            self._remove_process(process_id)
+        for execution_id, _ in terminal[: max(0, overflow)]:
+            self._remove_execution(execution_id)
         return len(expired) + max(0, overflow)
 
-    def _remove_process(self, process_id: str) -> None:
-        mp = self._processes.pop(process_id, None)
+    def _remove_execution(self, execution_id: str) -> None:
+        mp = self._executions.pop(execution_id, None)
         if mp is None:
             return
         current = asyncio.current_task()
@@ -278,7 +278,7 @@ class ProcessManager:
             result["stdin_error"] = mp.stdin_error
         return result
 
-    async def exec_command(
+    async def execute_command(
         self,
         command: str,
         side_effects: list[SideEffect] | Iterable[SideEffect],
@@ -331,14 +331,14 @@ class ProcessManager:
         if cwd_error:
             return {"status": "failed_to_start", "error": cwd_error}
 
-        self._reap_terminal_processes()
+        self._reap_terminal_executions()
 
         # Atomically reserve capacity before environment construction and spawn.
         async with self._shutdown_lock:
             if self._shutdown_complete or self._shutdown_requested:
                 return self._shutdown_reject_response()
             running_count = sum(
-                1 for p in self._processes.values() if self._has_live_work(p)
+                1 for p in self._executions.values() if self._has_live_work(p)
             ) + self._pending_spawns
             if running_count >= self._config.max_processes:
                 return {
@@ -368,12 +368,12 @@ class ProcessManager:
             return {"status": "failed_to_start", "error": str(exc)}
 
         process_group_id = self._get_process_group_id(proc)
-        process_id = self._new_id()
+        execution_id = self._new_execution_id()
         start_time = time.monotonic()
         start_timestamp = time.time()
 
         info = ExecutionInfo(
-            execution_id=process_id,
+            execution_id=execution_id,
             process_id=proc.pid,
             command=command,
             cwd=resolved_cwd,
@@ -395,11 +395,11 @@ class ProcessManager:
         drain_tasks = [
             asyncio.create_task(
                 self._drain_stream(proc.stdout, mp.stdout_buf, mp),
-                name=f"drain-stdout-{process_id}",
+                name=f"drain-stdout-{execution_id}",
             ),
             asyncio.create_task(
                 self._drain_stream(proc.stderr, mp.stderr_buf, mp),
-                name=f"drain-stderr-{process_id}",
+                name=f"drain-stderr-{execution_id}",
             ),
         ]
         mp.drain_stdout, mp.drain_stderr = drain_tasks
@@ -412,35 +412,35 @@ class ProcessManager:
                 if not reject_for_shutdown:
                     # Register before releasing the pending-spawn reservation so
                     # shutdown can find every subprocess throughout the handoff.
-                    self._processes[process_id] = mp
+                    self._executions[execution_id] = mp
                 self._release_spawn_reservation(spawn_owner)
         except asyncio.CancelledError:
             self._release_spawn_reservation(spawn_owner)
             await asyncio.shield(
-                self._reject_spawned_process(proc, process_group_id, drain_tasks)
+                self._reject_spawned_execution(proc, process_group_id, drain_tasks)
             )
             raise
 
         if reject_for_shutdown:
-            await self._reject_spawned_process(proc, process_group_id, drain_tasks)
+            await self._reject_spawned_execution(proc, process_group_id, drain_tasks)
             return self._shutdown_reject_response()
 
         mp.completion_task = asyncio.create_task(
-            self._track_completion(proc, mp), name=f"completion-{process_id}"
+            self._track_completion(proc, mp), name=f"completion-{execution_id}"
         )
 
         if effective_timeout > 0:
             mp.timeout_task = asyncio.create_task(
                 self._handle_timeout(mp, effective_timeout / 1000.0),
-                name=f"timeout-{process_id}",
+                name=f"timeout-{execution_id}",
             )
 
         # Initial input is tracked independently so pipe backpressure cannot
-        # prevent exec from honoring its auto-yield deadline.
+        # prevent execute from honoring its auto-yield deadline.
         if stdin is not None:
             mp.stdin_task = asyncio.create_task(
                 self._write_initial_input(mp, stdin, close_stdin),
-                name=f"stdin-{process_id}",
+                name=f"stdin-{execution_id}",
             )
             # Let immediately successful writes and failures settle before the
             # response path without waiting for a backpressured pipe.
@@ -456,7 +456,7 @@ class ProcessManager:
         except asyncio.TimeoutError:
             pass
 
-        self._reap_terminal_processes()
+        self._reap_terminal_executions()
 
         duration_ms = (time.monotonic() - start_time) * 1000
 
@@ -476,14 +476,14 @@ class ProcessManager:
             and not self._has_live_work(mp)
         ):
             result: dict[str, Any] = {"status": "completed", **exited, **common}
-            if withheld and self._processes.get(process_id) is mp:
-                result["process_id"] = process_id
+            if withheld and self._executions.get(execution_id) is mp:
+                result["execution_id"] = execution_id
             return self._with_stdin_error(mp, result)
 
         if mp.info.status == ExecutionStatus.TIMED_OUT:
             return self._with_stdin_error(mp, {
                 "status": "timed_out",
-                "process_id": process_id,
+                "execution_id": execution_id,
                 **exited,
                 **common,
             })
@@ -491,7 +491,7 @@ class ProcessManager:
         if mp.info.status == ExecutionStatus.STOPPED:
             return self._with_stdin_error(mp, {
                 "status": "stopped",
-                "process_id": process_id,
+                "execution_id": execution_id,
                 **exited,
                 **common,
             })
@@ -499,7 +499,7 @@ class ProcessManager:
         if mp.info.status == ExecutionStatus.FAILED:
             return self._with_stdin_error(mp, {
                 "status": "failed",
-                "process_id": process_id,
+                "execution_id": execution_id,
                 **exited,
                 **common,
             })
@@ -507,10 +507,10 @@ class ProcessManager:
         # Still running — background it
         return self._with_stdin_error(mp, {
             "status": "backgrounded",
-            "process_id": process_id,
+            "execution_id": execution_id,
             "pid": mp.info.pid,
             **common,
-            "message": "Process is running in the background. Use read/wait/stop with process_id.",
+            "message": "Process is running in the background. Use read/wait/stop with execution_id.",
         })
 
     async def _write_initial_input(
@@ -639,7 +639,7 @@ class ProcessManager:
             if pg_alive and mp.group_watch_task is None:
                 mp.group_watch_task = asyncio.create_task(
                     self._watch_process_group_exit(mp),
-                    name=f"group-watch-{mp.info.process_id}",
+                    name=f"group-watch-{mp.info.execution_id}",
                 )
 
     async def _await_live_work_end(
@@ -757,7 +757,7 @@ class ProcessManager:
     @staticmethod
     def _close_output_pipes(mp: ManagedExecution) -> None:
         """Close subprocess read transports after bounded capture is abandoned."""
-        ProcessManager._close_process_pipes(mp.proc)
+        ExecutionManager._close_process_pipes(mp.proc)
 
     @staticmethod
     def _close_process_pipes(proc: asyncio.subprocess.Process) -> None:
@@ -819,25 +819,25 @@ class ProcessManager:
 
         mp.completion_event.set()
 
-    async def read_output(
+    async def read_execution_output(
         self,
-        process_id: str,
+        execution_id: str,
         since_seq: int | None = None,
         max_output_bytes: int | None = None,
         streams: str = "both",
         tail_lines: int | None = None,
     ) -> dict[str, Any]:
         """Read output from a managed process."""
-        mp = self._processes.get(process_id)
+        mp = self._executions.get(execution_id)
         if mp is None:
-            return {"process_id": process_id, "error": f"Unknown process_id: {process_id}"}
+            return {"execution_id": execution_id, "error": f"Unknown execution_id: {execution_id}"}
 
         if streams not in ("both", "stdout", "stderr"):
-            return {"process_id": process_id, "error": f"Invalid streams: {streams!r}"}
+            return {"execution_id": execution_id, "error": f"Invalid streams: {streams!r}"}
 
         selection_error = self._validate_selection(since_seq, tail_lines)
         if selection_error:
-            return {"process_id": process_id, "error": selection_error}
+            return {"execution_id": execution_id, "error": selection_error}
 
         effective_max = self._max_output(max_output_bytes)
 
@@ -858,47 +858,47 @@ class ProcessManager:
         )
 
         result: dict[str, Any] = {
-            "process_id": process_id,
+            "execution_id": execution_id,
             "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
         }
-        result.update(self._cursor_fields(process_id, data))
+        result.update(self._cursor_fields(execution_id, data))
         for stream, text in data["texts"].items():
             result[stream] = self._redact(mp, text)
         return self._with_stdin_error(mp, result)
 
     async def write_input(
         self,
-        process_id: str,
+        execution_id: str,
         input_data: str,
         newline: bool = False,
         close_stdin: bool = False,
     ) -> dict[str, Any]:
         """Write to stdin of a managed process."""
-        mp = self._processes.get(process_id)
+        mp = self._executions.get(execution_id)
         if mp is None:
             return {
-                "process_id": process_id, "ok": False,
-                "error": f"Unknown process_id: {process_id}",
+                "execution_id": execution_id, "ok": False,
+                "error": f"Unknown execution_id: {execution_id}",
             }
 
         if self._reported_status(mp) != ExecutionStatus.RUNNING.value:
             return {
-                "process_id": process_id,
+                "execution_id": execution_id,
                 "ok": False,
                 "error": f"Process is not running (status: {mp.info.status.value})",
             }
 
         if mp.proc.stdin is None or mp.proc.stdin.is_closing():
             return {
-                "process_id": process_id,
+                "execution_id": execution_id,
                 "ok": False,
                 "error": "Process stdin is closed",
             }
         if mp.stdin_task is not None and not mp.stdin_task.done():
             return {
-                "process_id": process_id,
+                "execution_id": execution_id,
                 "ok": False,
                 "error": "Initial stdin write is still in progress",
             }
@@ -912,10 +912,10 @@ class ProcessManager:
                 mp.proc.stdin.drain(),
                 timeout=MAX_EFFECTIVE_WAIT_MS / 1000.0,
             )
-            return {"process_id": process_id, "ok": True}
+            return {"execution_id": execution_id, "ok": True}
         except asyncio.TimeoutError:
             return {
-                "process_id": process_id,
+                "execution_id": execution_id,
                 "ok": False,
                 "error": (
                     "Timed out waiting for process stdin to accept input "
@@ -923,7 +923,7 @@ class ProcessManager:
                 ),
             }
         except Exception as exc:
-            return {"process_id": process_id, "ok": False, "error": str(exc)}
+            return {"execution_id": execution_id, "ok": False, "error": str(exc)}
         finally:
             if close_stdin:
                 self._close_stdin(mp)
@@ -940,9 +940,9 @@ class ProcessManager:
         if close is not None:
             close()
 
-    async def wait_process(
+    async def wait_execution(
         self,
-        process_id: str,
+        execution_id: str,
         timeout_ms: int = MAX_EFFECTIVE_WAIT_MS,
         max_output_bytes: int | None = None,
         since_seq: int | None = None,
@@ -954,13 +954,13 @@ class ProcessManager:
         Pass ``since_seq`` from a previous response to receive only output
         produced since that cursor.
         """
-        mp = self._processes.get(process_id)
+        mp = self._executions.get(execution_id)
         if mp is None:
-            return {"process_id": process_id, "error": f"Unknown process_id: {process_id}"}
+            return {"execution_id": execution_id, "error": f"Unknown execution_id: {execution_id}"}
 
         selection_error = self._validate_selection(since_seq, tail_lines)
         if selection_error:
-            return {"process_id": process_id, "error": selection_error}
+            return {"execution_id": execution_id, "error": selection_error}
 
         # Cap effective wait below typical MCP request timeout thresholds
         effective_wait_ms = max(0, min(timeout_ms, MAX_EFFECTIVE_WAIT_MS))
@@ -973,7 +973,7 @@ class ProcessManager:
         snapshot = self._read_snapshot(mp, effective_max, since_seq, tail_lines)
 
         return self._with_stdin_error(mp, {
-            "process_id": process_id,
+            "execution_id": execution_id,
             "status": self._reported_status(mp),
             "exit_code": mp.info.exit_code,
             "signal": mp.info.signal,
@@ -997,25 +997,25 @@ class ProcessManager:
             return f"tail_lines must be positive, got {tail_lines}"
         return None
 
-    async def stop_process(
+    async def stop_execution(
         self,
-        process_id: str,
+        execution_id: str,
         signal_name: str = "SIGTERM",
         force_after_ms: int = GRACEFUL_STOP_MS,
     ) -> dict[str, Any]:
         """Stop a running process with graceful termination then force kill."""
         from .spawn import get_signal
 
-        mp = self._processes.get(process_id)
+        mp = self._executions.get(execution_id)
         if mp is None:
             return {
-                "process_id": process_id, "stopped": False,
-                "error": f"Unknown process_id: {process_id}",
+                "execution_id": execution_id, "stopped": False,
+                "error": f"Unknown execution_id: {execution_id}",
             }
 
         if not self._has_live_work(mp):
             return {
-                "process_id": process_id,
+                "execution_id": execution_id,
                 "stopped": False,
                 "error": f"Process is not running (status: {mp.info.status.value})",
             }
@@ -1024,7 +1024,7 @@ class ProcessManager:
         sig = get_signal(signal_name)
         if sig is None:
             return {
-                "process_id": process_id,
+                "execution_id": execution_id,
                 "stopped": False,
                 "error": f"Invalid signal: {signal_name!r}",
             }
@@ -1057,7 +1057,7 @@ class ProcessManager:
 
         if self._process_group_exists(mp):
             return {
-                "process_id": process_id,
+                "execution_id": execution_id,
                 "stopped": False,
                 "signal": signal_name,
                 "error": "Process group did not stop after force kill",
@@ -1077,26 +1077,26 @@ class ProcessManager:
             mp.info.status = ExecutionStatus.STOPPED
 
         return {
-            "process_id": process_id,
+            "execution_id": execution_id,
             "stopped": not self._has_live_work(mp),
             "signal": signal_name,
             "error": None,
         }
 
-    def list_processes(
+    def list_executions(
         self, include_completed: bool = True, limit: int = 50
     ) -> dict[str, Any]:
         """List managed processes."""
         now = time.time()
         processes = []
-        for mp in list(self._processes.values()):
+        for mp in list(self._executions.values()):
             has_live_work = self._has_live_work(mp)
             reported_status = self._reported_status(mp, has_live_work)
             if not include_completed and reported_status != ExecutionStatus.RUNNING.value:
                 continue
             processes.append(
                 {
-                    "process_id": mp.info.process_id,
+                    "execution_id": mp.info.execution_id,
                     "pid": mp.info.pid,
                     "name": (
                         self._redact(mp, mp.info.name)
@@ -1148,23 +1148,23 @@ class ProcessManager:
         removed = 0
         to_remove: list[str] = []
 
-        for pid, mp in self._processes.items():
+        for execution_id, mp in self._executions.items():
             if self._has_live_work(mp):
                 continue
 
             age_ms = (now - (mp.info.ended_at or mp.info.started_at)) * 1000
 
             if mp.info.status == ExecutionStatus.COMPLETED and age_ms > completed_older_than_ms:
-                to_remove.append(pid)
+                to_remove.append(execution_id)
             elif mp.info.status in (
                 ExecutionStatus.STOPPED, ExecutionStatus.TIMED_OUT,
                 ExecutionStatus.FAILED,
             ):
                 if age_ms > stopped_older_than_ms:
-                    to_remove.append(pid)
+                    to_remove.append(execution_id)
 
-        for pid in to_remove:
-            self._remove_process(pid)
+        for execution_id in to_remove:
+            self._remove_execution(execution_id)
             removed += 1
 
         return {"removed": removed}
@@ -1192,7 +1192,7 @@ class ProcessManager:
         while True:
             live = [
                 mp
-                for mp in self._processes.values()
+                for mp in self._executions.values()
                 if self._has_live_work(mp)
             ]
             if not live:
@@ -1278,5 +1278,5 @@ class ProcessManager:
                 self._shutdown_complete = True
             return
 
-    def get_process(self, process_id: str) -> ManagedExecution | None:
-        return self._processes.get(process_id)
+    def get_execution(self, execution_id: str) -> ManagedExecution | None:
+        return self._executions.get(execution_id)

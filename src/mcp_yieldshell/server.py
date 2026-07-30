@@ -9,11 +9,11 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import Config
 from .policy import GRACEFUL_STOP_MS, MAX_EFFECTIVE_WAIT_MS
-from .execution.manager import ProcessManager
+from .execution.manager import ExecutionManager
 from .types import SideEffect
 
 # Module-level manager, initialized once at startup
-_manager: ProcessManager | None = None
+_manager: ExecutionManager | None = None
 
 
 @asynccontextmanager
@@ -29,7 +29,7 @@ async def _server_lifespan(_: FastMCP) -> AsyncIterator[None]:
 mcp = FastMCP("YieldShell MCP", lifespan=_server_lifespan)
 
 
-def _get_manager() -> ProcessManager:
+def _get_manager() -> ExecutionManager:
     if _manager is None:
         raise RuntimeError("Server not initialized")
     return _manager
@@ -97,7 +97,7 @@ async def exec(
     EOF-driven commands can complete. Set ``close_stdin=False`` when later
     calls to ``write`` are expected.
     """
-    return await _get_manager().exec_command(
+    return await _get_manager().execute_command(
         command=command,
         side_effects=side_effects,
         cwd=cwd,
@@ -143,7 +143,7 @@ async def read(
     before it could be read and is gone. ``latest_seq`` shows how far output
     has advanced overall.
     """
-    return await _get_manager().read_output(
+    return await _get_manager().read_execution_output(
         process_id=process_id,
         since_seq=since_seq,
         max_output_bytes=max_output_bytes,
@@ -192,7 +192,7 @@ async def wait(
     same bytes twice. Pass ``since_seq`` to drive the cursor yourself, or
     ``tail_lines`` for an out-of-band snapshot of the newest N lines.
     """
-    return await _get_manager().wait_process(
+    return await _get_manager().wait_execution(
         process_id=process_id,
         timeout_ms=timeout_ms,
         max_output_bytes=max_output_bytes,
@@ -208,7 +208,7 @@ async def stop(
     force_after_ms: int = GRACEFUL_STOP_MS,
 ) -> dict:
     """Stop a running process with graceful termination then force kill."""
-    return await _get_manager().stop_process(
+    return await _get_manager().stop_execution(
         process_id=process_id,
         signal_name=signal,
         force_after_ms=force_after_ms,
@@ -224,7 +224,7 @@ async def ps(include_completed: bool = True, limit: int = 50) -> dict:
     counts, so a genuinely hung process is distinguishable from one that is
     working quietly.
     """
-    return _get_manager().list_processes(
+    return _get_manager().list_executions(
         include_completed=include_completed,
         limit=limit,
     )
@@ -249,5 +249,5 @@ def create_server(config: Config | None = None) -> FastMCP:
         raise RuntimeError("Server is already initialized")
     if config is None:
         config = Config()
-    _manager = ProcessManager(config)
+    _manager = ExecutionManager(config)
     return mcp

@@ -1,4 +1,4 @@
-"""Tests for the required side-effect declaration on ``exec_command``."""
+"""Tests for the required side-effect declaration on ``execute_command``."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from mcp_yieldshell.config import Config
-from mcp_yieldshell.execution.manager import ProcessManager
+from mcp_yieldshell.execution.manager import ExecutionManager
 from mcp_yieldshell.server import exec
 from mcp_yieldshell.types import SideEffect
 
@@ -90,37 +90,37 @@ class TestExecSchema:
 
 @pytest.fixture
 def manager():
-    return ProcessManager(Config())
+    return ExecutionManager(Config())
 
 
 class TestRuntimeSideEffectValidation:
     @pytest.mark.asyncio
     async def test_none_runs_command(self, manager):
-        result = await manager.exec_command("echo hello", side_effects=NONE)
+        result = await manager.execute_command("echo hello", side_effects=NONE)
         assert result["status"] == "completed"
         assert "hello" in result["stdout"]
 
     @pytest.mark.asyncio
     async def test_none_as_strings_runs_command(self, manager):
-        result = await manager.exec_command("echo hello", side_effects=["NONE"])
+        result = await manager.execute_command("echo hello", side_effects=["NONE"])
         assert result["status"] == "completed"
         assert "hello" in result["stdout"]
 
     @pytest.mark.asyncio
     async def test_empty_list_rejected(self, manager):
-        result = await manager.exec_command("echo hello", side_effects=[])
+        result = await manager.execute_command("echo hello", side_effects=[])
         assert result["status"] == "failed_to_start"
         assert "side_effects" in result["error"].lower()
 
     @pytest.mark.asyncio
     async def test_none_rejected(self, manager):
-        result = await manager.exec_command("echo hello", side_effects=None)
+        result = await manager.execute_command("echo hello", side_effects=None)
         assert result["status"] == "failed_to_start"
         assert "required" in result["error"].lower()
 
     @pytest.mark.asyncio
     async def test_unknown_value_rejected(self, manager):
-        result = await manager.exec_command(
+        result = await manager.execute_command(
             "echo hello", side_effects=["TELEPORT_COWS"]
         )
         assert result["status"] == "failed_to_start"
@@ -128,7 +128,7 @@ class TestRuntimeSideEffectValidation:
 
     @pytest.mark.asyncio
     async def test_none_combined_with_other_rejected(self, manager):
-        result = await manager.exec_command(
+        result = await manager.execute_command(
             "echo hello", side_effects=["NONE", "DELETES_FILES"]
         )
         assert result["status"] == "failed_to_start"
@@ -137,7 +137,7 @@ class TestRuntimeSideEffectValidation:
 
     @pytest.mark.asyncio
     async def test_allowed_non_none_runs_command(self, manager):
-        result = await manager.exec_command(
+        result = await manager.execute_command(
             "echo hello", side_effects=["MAKES_NETWORK_REQUESTS"]
         )
         assert result["status"] == "completed"
@@ -150,8 +150,8 @@ class TestBlockedRejection:
         # No env var: default blocks MODIFIES_PROTECTED_FILES
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_PROTECTED_FILES"]
         )
         assert result["status"] == "failed_to_start"
@@ -162,8 +162,8 @@ class TestBlockedRejection:
     async def test_blocked_modifies_os_settings_rejected(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_OS_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
@@ -177,8 +177,8 @@ class TestBlockedRejection:
             "MODIFIES_PROTECTED_FILES,DELETES_FILES",
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello",
             side_effects=["DELETES_FILES", "MODIFIES_PROTECTED_FILES"],
         )
@@ -198,8 +198,8 @@ class TestBlockedRejection:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_PROTECTED_FILES"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(command, side_effects=["MODIFIES_PROTECTED_FILES"])
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(command, side_effects=["MODIFIES_PROTECTED_FILES"])
         assert result["status"] == "failed_to_start"
         assert "blocked by policy" in result["error"].lower()
         # Cwd check would have produced "Cwd not under allowed roots" — verify
@@ -210,7 +210,7 @@ class TestBlockedRejection:
 
     @pytest.mark.asyncio
     async def test_allowed_category_does_not_create_blocked_rejection(self, manager):
-        result = await manager.exec_command(
+        result = await manager.execute_command(
             "echo hello", side_effects=["MAKES_NETWORK_REQUESTS"]
         )
         assert result["status"] == "completed"
@@ -219,16 +219,16 @@ class TestBlockedRejection:
     async def test_blocked_rejection_does_not_register_process(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        ps_before = mgr.list_processes(include_completed=False)["processes"]
+        mgr = ExecutionManager(config)
+        ps_before = mgr.list_executions(include_completed=False)["processes"]
         before_ids = {p["process_id"] for p in ps_before}
 
-        result = await mgr.exec_command(
+        result = await mgr.execute_command(
             "sleep 60", side_effects=["MODIFIES_PROTECTED_FILES"]
         )
         assert result["status"] == "failed_to_start"
 
-        ps_after = mgr.list_processes(include_completed=False)["processes"]
+        ps_after = mgr.list_executions(include_completed=False)["processes"]
         after_ids = {p["process_id"] for p in ps_after}
         assert after_ids == before_ids
 
@@ -238,8 +238,8 @@ class TestBlockedRejection:
     ):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_PROTECTED_FILES"]
         )
         assert result["status"] == "failed_to_start"
@@ -257,8 +257,8 @@ class TestBlockedRejection:
     ):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_OS_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
@@ -275,8 +275,8 @@ class TestBlockedRejection:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "DELETES_FILES"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["DELETES_FILES"]
         )
         assert result["status"] == "failed_to_start"
@@ -294,8 +294,8 @@ class TestBlockedRejection:
         """The new category is in the default blocklist when env is unset."""
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["RUNS_INLINE_CODE"]
         )
         assert result["status"] == "failed_to_start"
@@ -314,8 +314,8 @@ class TestBlockedRejection:
         """Operators can clear the default blocklist to allow inline code."""
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["RUNS_INLINE_CODE"]
         )
         assert result["status"] == "completed"
@@ -330,8 +330,8 @@ class TestBlockedRejection:
             "DELETES_FILES,RUNS_INLINE_CODE",
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello",
             side_effects=["DELETES_FILES", "RUNS_INLINE_CODE"],
         )
@@ -350,8 +350,8 @@ class TestBlockedRejection:
         """MODIFIES_OS_USER_SETTINGS is in the default blocklist when env is unset."""
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
@@ -368,8 +368,8 @@ class TestBlockedRejection:
         """Operators can clear the default blocklist to allow OS user settings."""
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "completed"
@@ -380,8 +380,8 @@ class TestBlockedRejection:
     ):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
@@ -398,8 +398,8 @@ class TestBlockedRejection:
         """KILLS_AGENT_PROCESS is in the default blocklist when env is unset."""
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
         )
         assert result["status"] == "failed_to_start"
@@ -416,8 +416,8 @@ class TestBlockedRejection:
         """Operators can clear the default blocklist to allow agent process."""
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
         )
         assert result["status"] == "completed"
@@ -428,8 +428,8 @@ class TestBlockedRejection:
     ):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
         )
         assert result["status"] == "failed_to_start"
@@ -446,8 +446,8 @@ class TestBlockedRejection:
             "MODIFIES_PROTECTED_FILES,DELETES_FILES,RUNS_INLINE_CODE",
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello",
             side_effects=[
                 "MODIFIES_PROTECTED_FILES",
@@ -472,8 +472,8 @@ class TestBlockedRejection:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "CHANGES_PACKAGES_OR_DEPENDENCIES"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["CHANGES_PACKAGES_OR_DEPENDENCIES"]
         )
         assert result["status"] == "failed_to_start"
@@ -489,8 +489,8 @@ class TestConfigEmptyBlockSet:
     async def test_unblocking_default_runs_default_blocked_category(self, monkeypatch):
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_PROTECTED_FILES"]
         )
         assert result["status"] == "completed"
@@ -499,8 +499,8 @@ class TestConfigEmptyBlockSet:
     async def test_unblocking_allows_modifies_os_user_settings(self, monkeypatch):
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "completed"
@@ -509,8 +509,8 @@ class TestConfigEmptyBlockSet:
     async def test_unblocking_allows_kills_agent_process(self, monkeypatch):
         monkeypatch.setenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", ",")
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
         )
         assert result["status"] == "completed"
@@ -526,11 +526,11 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_PROTECTED_FILES"
         )
         config = Config()
-        mgr = ProcessManager(config)
+        mgr = ExecutionManager(config)
         # /etc is outside the allowed cwd, so cwd policy would reject this.
         # The side-effect gate should still run first and produce a
         # side-effect rejection.
-        result = await mgr.exec_command(
+        result = await mgr.execute_command(
             "echo hello",
             cwd="/etc",
             side_effects=["MODIFIES_PROTECTED_FILES"],
@@ -547,10 +547,10 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_PROTECTED_FILES"
         )
         config = Config()
-        mgr = ProcessManager(config)
+        mgr = ExecutionManager(config)
         # The command regex would reject "echo hello", but the side-effect
         # gate should run first.
-        result = await mgr.exec_command(
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_PROTECTED_FILES"]
         )
         assert result["status"] == "failed_to_start"
@@ -565,9 +565,9 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_PROTECTED_FILES"
         )
         config = Config()
-        mgr = ProcessManager(config)
+        mgr = ExecutionManager(config)
         # We don't even start a process — the gate should run first.
-        result = await mgr.exec_command(
+        result = await mgr.execute_command(
             "sleep 60", side_effects=["MODIFIES_PROTECTED_FILES"], yield_ms=0
         )
         assert result["status"] == "failed_to_start"
@@ -582,8 +582,8 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "RUNS_INLINE_CODE"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello",
             cwd="/etc",
             side_effects=["RUNS_INLINE_CODE"],
@@ -600,8 +600,8 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "RUNS_INLINE_CODE"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["RUNS_INLINE_CODE"]
         )
         assert result["status"] == "failed_to_start"
@@ -616,8 +616,8 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "RUNS_INLINE_CODE"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "sleep 60",
             side_effects=["RUNS_INLINE_CODE"],
             yield_ms=0,
@@ -634,8 +634,8 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_OS_USER_SETTINGS"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello",
             cwd="/etc",
             side_effects=["MODIFIES_OS_USER_SETTINGS"],
@@ -652,8 +652,8 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "KILLS_AGENT_PROCESS"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello",
             cwd="/etc",
             side_effects=["KILLS_AGENT_PROCESS"],
@@ -672,8 +672,8 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "MODIFIES_OS_USER_SETTINGS"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["MODIFIES_OS_USER_SETTINGS"]
         )
         assert result["status"] == "failed_to_start"
@@ -690,8 +690,8 @@ class TestRejectionOrdering:
             "MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", "KILLS_AGENT_PROCESS"
         )
         config = Config()
-        mgr = ProcessManager(config)
-        result = await mgr.exec_command(
+        mgr = ExecutionManager(config)
+        result = await mgr.execute_command(
             "echo hello", side_effects=["KILLS_AGENT_PROCESS"]
         )
         assert result["status"] == "failed_to_start"
