@@ -175,7 +175,7 @@ class TestAutomaticRetention:
         assert manager.list_executions()["executions"] == []
 
     @pytest.mark.asyncio
-    async def test_zero_cap_does_not_return_dangling_truncated_process_id(
+    async def test_zero_cap_does_not_return_dangling_truncated_execution_id(
         self, monkeypatch
     ):
         monkeypatch.setenv("YIELDSHELL_MAX_RETAINED_PROCESSES", "0")
@@ -833,17 +833,17 @@ class TestInitialStdinLifecycle:
 
 class TestShutdownSpawnRace:
     @pytest.mark.asyncio
-    async def test_concurrent_shutdown_and_exec_leave_no_live_managed_work(self):
+    async def test_concurrent_shutdown_and_execute_leave_no_live_managed_work(self):
         for _ in range(25):
             manager = ExecutionManager(Config())
-            exec_task = asyncio.create_task(
+            execute_task = asyncio.create_task(
                 manager.execute_command("sleep 0.2", yield_ms=0, side_effects=NONE)
             )
             await asyncio.sleep(0)
             await manager.shutdown()
-            exec_task.cancel()
+            execute_task.cancel()
             try:
-                await exec_task
+                await execute_task
             except asyncio.CancelledError:
                 pass
             assert not any(
@@ -851,7 +851,7 @@ class TestShutdownSpawnRace:
             )
 
     @pytest.mark.asyncio
-    async def test_exec_rejected_after_shutdown_starts(self):
+    async def test_execute_rejected_after_shutdown_starts(self):
         manager = ExecutionManager(Config())
         await manager.shutdown()
         result = await manager.execute_command("echo late", side_effects=NONE)
@@ -890,7 +890,7 @@ class TestShutdownSpawnRace:
             "mcp_yieldshell.execution.manager.spawn_process", slow_spawn
         )
         manager = ExecutionManager(Config())
-        exec_task = asyncio.create_task(
+        execute_task = asyncio.create_task(
             manager.execute_command("sleep 30", yield_ms=0, side_effects=NONE)
         )
         await spawn_started.wait()
@@ -899,7 +899,7 @@ class TestShutdownSpawnRace:
         release_spawn.set()
 
         await shutdown_task
-        result = await exec_task
+        result = await execute_task
         assert result["status"] == "failed_to_start"
         assert "shutting down" in result["error"].lower()
         assert manager.list_executions()["executions"] == []
@@ -921,7 +921,7 @@ class TestShutdownSpawnRace:
             "mcp_yieldshell.execution.manager.spawn_process", stuck_spawn
         )
         manager = ExecutionManager(Config())
-        exec_task = asyncio.create_task(
+        execute_task = asyncio.create_task(
             manager.execute_command("sleep 30", yield_ms=0, side_effects=NONE)
         )
         await spawn_started.wait()
@@ -930,7 +930,7 @@ class TestShutdownSpawnRace:
         elapsed = time.monotonic() - started
         assert elapsed < 1.0
         with pytest.raises(asyncio.CancelledError):
-            await exec_task
+            await execute_task
         assert manager._pending_spawns == 0
         assert manager._pending_spawn_tasks == set()
         assert manager._shutdown_complete is True

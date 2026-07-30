@@ -455,7 +455,7 @@ class TestWrite:
         assert completed["stdout"].strip() == "5"
 
     @pytest.mark.asyncio
-    async def test_write_unknown_process(self, manager):
+    async def test_write_unknown_execution(self, manager):
         result = await manager.write_input("nonexistent", "hello")
         assert result["ok"] is False
         assert "Unknown" in result.get("error", "")
@@ -463,7 +463,7 @@ class TestWrite:
 
 class TestStop:
     @pytest.mark.asyncio
-    async def test_stop_running_process(self, manager):
+    async def test_stop_running_execution(self, manager):
         result = await manager.execute_command(
             "sleep 60", yield_ms=100, side_effects=NONE
         )
@@ -504,7 +504,7 @@ class TestStop:
         await manager.stop_execution(execution_id, force_after_ms=100)
 
     @pytest.mark.asyncio
-    async def test_stop_unknown_process(self, manager):
+    async def test_stop_unknown_execution(self, manager):
         result = await manager.stop_execution("nonexistent")
         assert result["stopped"] is False
         assert "Unknown" in result.get("error", "")
@@ -661,7 +661,7 @@ class TestIncrementalPolling:
         assert collected == "".join(f"line-{index}\n" for index in range(10))
 
     @pytest.mark.asyncio
-    async def test_exec_cursor_is_usable_by_read(self, manager):
+    async def test_execute_cursor_is_usable_by_read(self, manager):
         # The yield window is shorter than the command, so execute returns the
         # first write and a cursor positioned after it.
         started = await manager.execute_command(
@@ -1031,10 +1031,10 @@ class TestProcessLimit:
 
 class TestWriteErrors:
     @pytest.mark.asyncio
-    async def test_write_to_completed_process(self, manager):
+    async def test_write_to_completed_execution(self, manager):
         result = await manager.execute_command("echo done", side_effects=NONE)
         assert result["status"] == "completed"
-        # Find the process in ps
+        # Find the execution in ps
         ps_result = manager.list_executions()
         if ps_result["executions"]:
             execution_id = ps_result["executions"][0]["execution_id"]
@@ -1042,7 +1042,7 @@ class TestWriteErrors:
             assert write_result["ok"] is False
 
     @pytest.mark.asyncio
-    async def test_write_unknown_process(self, manager):
+    async def test_write_unknown_execution(self, manager):
         result = await manager.write_input("nonexistent", "hello")
         assert result["ok"] is False
 
@@ -1078,28 +1078,28 @@ class TestReadStreamValidation:
 
 
 
-class TestUnknownProcessIds:
+class TestUnknownExecutionIds:
     @pytest.mark.asyncio
-    async def test_read_unknown_process(self, manager):
+    async def test_read_unknown_execution(self, manager):
         result = await manager.read_execution_output("nonexistent")
         assert result["execution_id"] == "nonexistent"
         assert result["error"] == "Unknown execution_id: nonexistent"
 
     @pytest.mark.asyncio
-    async def test_wait_unknown_process(self, manager):
+    async def test_wait_unknown_execution(self, manager):
         result = await manager.wait_execution("nonexistent")
         assert result["execution_id"] == "nonexistent"
         assert result["error"] == "Unknown execution_id: nonexistent"
 
     @pytest.mark.asyncio
-    async def test_stop_unknown_process(self, manager):
+    async def test_stop_unknown_execution(self, manager):
         result = await manager.stop_execution("nonexistent")
         assert result["execution_id"] == "nonexistent"
         assert result["error"] == "Unknown execution_id: nonexistent"
         assert result["stopped"] is False
 
     @pytest.mark.asyncio
-    async def test_write_unknown_process(self, manager):
+    async def test_write_unknown_execution(self, manager):
         result = await manager.write_input("nonexistent", "hello")
         assert result["execution_id"] == "nonexistent"
         assert result["ok"] is False
@@ -1179,7 +1179,7 @@ class TestWaitCapBehavior:
 
 class TestTimedOutStatus:
     @pytest.mark.asyncio
-    async def test_exec_timeout_returns_timed_out(self, manager):
+    async def test_execute_timeout_returns_timed_out(self, manager):
         result = await manager.execute_command(
             "sleep 60", yield_ms=0, timeout_ms=500, side_effects=NONE
         )
@@ -1264,7 +1264,7 @@ class TestRingBufferByteCount:
 class TestDefectFixes:
     @pytest.mark.asyncio
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX custom shell")
-    async def test_exec_uses_requested_shell(self, manager):
+    async def test_execute_uses_requested_shell(self, manager):
         bash = shutil.which("bash")
         if bash is None:
             pytest.skip("bash is not installed")

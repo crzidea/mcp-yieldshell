@@ -218,7 +218,7 @@ class TestBlockedRejection:
         assert result["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_blocked_rejection_does_not_register_process(self, monkeypatch):
+    async def test_blocked_rejection_does_not_register_execution(self, monkeypatch):
         monkeypatch.delenv("MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS", raising=False)
         config = Config()
         mgr = ExecutionManager(config)

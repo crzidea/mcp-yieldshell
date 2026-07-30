@@ -357,7 +357,7 @@ Configure the server by setting these environment variables prior to launch:
 | `YIELDSHELL_DEFAULT_YIELD_MS` | `30000` | Fallback delay before auto-yielding. Effective yields are also capped at 55,000ms. |
 | `YIELDSHELL_MAX_YIELD_MS` | `300000` | Configured maximum for `yield_ms`; the effective maximum is the lesser of this value and 55,000ms. |
 | `YIELDSHELL_DEFAULT_TIMEOUT_MS` | `3600000` | Default hard runtime limit (1 hour). An explicit tool argument of `0` means no limit. |
-| `YIELDSHELL_PROCESS_RETENTION_MS` | `3600000` | Age after which terminal process records are reaped before a valid spawn. Zero requests immediate age-based reaping. Negative or nonnumeric values use the default. |
+| `YIELDSHELL_PROCESS_RETENTION_MS` | `3600000` | Age after which terminal execution records are reaped before a valid spawn. Zero requests immediate age-based reaping. Negative or nonnumeric values use the default. |
 | `YIELDSHELL_MAX_RETAINED_PROCESSES` | `100` | Maximum retained terminal records after age reaping; oldest records are removed first. Zero retains no prior terminal records. Negative or nonnumeric values use the default. Running records are excluded. |
 | `YIELDSHELL_DENY_COMMAND_REGEX` | *(none)* | A regular expression pattern. Commands matching this pattern are blocked before starting. Invalid patterns cause startup to fail with a configuration error naming this variable. |
 | `YIELDSHELL_ALLOW_COMMAND_REGEX` | *(none)* | A regular expression pattern. If set, only commands matching this pattern are permitted. Invalid patterns cause startup to fail with a configuration error naming this variable. |
