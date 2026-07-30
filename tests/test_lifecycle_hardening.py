@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import shutil
 import signal
 import sys
 import time
@@ -161,6 +162,56 @@ class TestConcurrentShutdown:
         assert manager._shutdown_complete is True
         assert managed.info.status == ExecutionStatus.STOPPED
 
+    @pytest.mark.asyncio
+    async def test_force_kill_survivor_keeps_shutdown_retryable(self, monkeypatch):
+        manager = ExecutionManager(Config())
+        process = MagicMock()
+        process.pid = 12345
+        process.returncode = None
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+        info = ExecutionInfo(
+            execution_id="shutdown-survivor",
+            process_id=process.pid,
+            command="resistant",
+            cwd=os.getcwd(),
+            name=None,
+            status=ExecutionStatus.RUNNING,
+            started_at=time.time(),
+            start_monotonic=time.monotonic(),
+        )
+        managed = ManagedExecution(info, process, 100, process_group_id=process.pid)
+        manager._executions[info.execution_id] = managed
+        group_alive = True
+
+        monkeypatch.setattr(
+            manager, "_process_group_exists", lambda _mp: group_alive
+        )
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.terminate_process", AsyncMock()
+        )
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.kill_process", AsyncMock()
+        )
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.GRACEFUL_STOP_MS", 0)
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.PROCESS_GROUP_EXIT_MS", 0
+        )
+        monkeypatch.setattr("mcp_yieldshell.execution.manager.FINAL_DRAIN_MS", 0)
+
+        with pytest.raises(RuntimeError, match="shutdown.*process group"):
+            await manager.shutdown()
+
+        assert manager._shutdown_complete is False
+        assert managed.info.status == ExecutionStatus.RUNNING
+
+        group_alive = False
+        await manager.shutdown()
+
+        assert manager._shutdown_complete is True
+        assert managed.info.status == ExecutionStatus.STOPPED
+
 
 class TestAutomaticRetention:
     @pytest.mark.asyncio
@@ -188,8 +239,10 @@ class TestAutomaticRetention:
         )
 
         assert result["status"] == "completed"
-        assert result["capped"] is True
+        assert result["capped"] is False
+        assert result["evicted"] is True
         assert "execution_id" not in result
+        assert "cannot be recovered" in result["hint"]
 
     @pytest.mark.asyncio
     async def test_reaps_every_terminal_state_and_ids_become_unknown(self, monkeypatch):
@@ -265,6 +318,37 @@ class TestAutomaticRetention:
         assert result["removed"] == 1
 
     @pytest.mark.asyncio
+    async def test_wait_does_not_offer_paging_after_concurrent_cleanup(
+        self, monkeypatch
+    ):
+        manager = ExecutionManager(Config())
+        started = await manager.execute_command("printf abcdef", side_effects=NONE)
+        execution_id = started["execution_id"]
+        managed = manager.get_execution(execution_id)
+        assert managed is not None
+        managed.info.ended_at = time.time() - 1
+
+        async def cleanup_during_wait(_managed, _timeout_sec):
+            cleanup = await manager.cleanup(completed_older_than_ms=0)
+            assert cleanup["removed"] == 1
+            return True
+
+        monkeypatch.setattr(manager, "_await_live_work_end", cleanup_during_wait)
+
+        result = await manager.wait_execution(
+            execution_id,
+            timeout_ms=100,
+            max_output_bytes=2,
+            since_seq=1,
+        )
+
+        assert manager.get_execution(execution_id) is None
+        assert result["stdout"] == "ab"
+        assert result["capped"] is False
+        assert result["evicted"] is True
+        assert "cannot be recovered" in result["hint"]
+
+    @pytest.mark.asyncio
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups only")
     async def test_live_descendant_counts_toward_limit_and_survives_cleanup(
         self, monkeypatch
@@ -327,6 +411,25 @@ class TestAutomaticRetention:
         assert manager._process_group_exists(mp) is False
 
     @pytest.mark.asyncio
+    async def test_absent_linux_descendants_are_not_rescanned(self, monkeypatch):
+        manager = ExecutionManager(Config())
+        await manager.execute_command("echo done", side_effects=NONE)
+        execution_id = manager.list_executions(limit=1)["executions"][0]["execution_id"]
+        managed = manager.get_execution(execution_id)
+        assert managed is not None
+        managed.process_group_exited = True
+        managed.containment_token = "test-token"
+        managed.contained_processes_exited = False
+        scan = MagicMock(return_value=False)
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.contained_processes_exist", scan
+        )
+
+        assert manager._process_group_exists(managed) is False
+        assert manager._process_group_exists(managed) is False
+        scan.assert_called_once_with("test-token")
+
+    @pytest.mark.asyncio
     async def test_concurrent_spawn_reservation_enforces_process_limit(self, monkeypatch):
         monkeypatch.setenv("YIELDSHELL_MAX_PROCESSES", "1")
         manager = ExecutionManager(Config())
@@ -341,6 +444,42 @@ class TestAutomaticRetention:
         assert sum(result["status"] == "failed_to_start" for result in results) == 1
         running = next(result for result in results if result["status"] == "backgrounded")
         await manager.stop_execution(running["execution_id"], force_after_ms=100)
+
+
+class TestTimeoutRaces:
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_relabel_an_already_exited_process_group(
+        self, monkeypatch
+    ):
+        manager = ExecutionManager(Config())
+        process = MagicMock()
+        process.pid = 12345
+        process.returncode = None
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+        info = ExecutionInfo(
+            execution_id="timeout-race",
+            process_id=process.pid,
+            command="already exited",
+            cwd=os.getcwd(),
+            name=None,
+            status=ExecutionStatus.RUNNING,
+            started_at=time.time(),
+            start_monotonic=time.monotonic(),
+        )
+        managed = ManagedExecution(info, process, 100, process_group_id=process.pid)
+        terminate = AsyncMock()
+        monkeypatch.setattr(manager, "_process_group_exists", lambda _mp: False)
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.terminate_process", terminate
+        )
+
+        await manager._handle_timeout(managed, timeout_sec=0)
+
+        assert managed.info.status == ExecutionStatus.RUNNING
+        assert managed._timeout_triggered is False
+        terminate.assert_not_awaited()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups only")
@@ -394,6 +533,153 @@ class TestManagerShutdown:
             assert managed.info.status == ExecutionStatus.STOPPED
             with pytest.raises(ProcessLookupError):
                 os.killpg(group, 0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux") or shutil.which("setsid") is None,
+        reason="Linux procfs and setsid are required",
+    )
+    async def test_shutdown_kills_descendant_that_leaves_process_group(self):
+        manager = ExecutionManager(Config())
+        child_pid: int | None = None
+        try:
+            result = await manager.execute_command(
+                "setsid sh -c 'trap \"\" HUP TERM; echo CHILD=$$; exec sleep 30'",
+                yield_ms=0,
+                timeout_ms=0,
+                side_effects=NONE,
+            )
+            for _ in range(50):
+                page = await manager.read_execution_output(
+                    result["execution_id"], since_seq=1
+                )
+                if page["stdout"].startswith("CHILD="):
+                    child_pid = int(page["stdout"].split("=", 1)[1])
+                    break
+                await asyncio.sleep(0.02)
+            assert child_pid is not None
+            managed = manager.get_execution(result["execution_id"])
+            assert managed is not None and managed.process_group_id is not None
+            assert os.getpgid(child_pid) != managed.process_group_id
+
+            await manager.shutdown()
+
+            stat_path = f"/proc/{child_pid}/stat"
+            if os.path.exists(stat_path):
+                with open(stat_path) as stat_file:
+                    assert stat_file.read().split()[2] == "Z"
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if not manager._shutdown_complete:
+                await manager.shutdown()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux") or shutil.which("setsid") is None,
+        reason="Linux procfs and setsid are required",
+    )
+    async def test_daemonized_descendant_remains_managed_after_shell_exits(self):
+        manager = ExecutionManager(Config())
+        child_pid: int | None = None
+        try:
+            result = await manager.execute_command(
+                "setsid sh -c 'trap \"\" HUP TERM; exec sleep 30' "
+                ">/dev/null 2>&1 & echo CHILD=$!",
+                yield_ms=0,
+                timeout_ms=0,
+                side_effects=NONE,
+            )
+            execution_id = result["execution_id"]
+            for _ in range(100):
+                page = await manager.read_execution_output(
+                    execution_id, since_seq=1
+                )
+                if page["stdout"].startswith("CHILD="):
+                    child_pid = int(page["stdout"].split("=", 1)[1])
+                managed = manager.get_execution(execution_id)
+                if (
+                    child_pid is not None
+                    and managed is not None
+                    and managed.info.status == ExecutionStatus.COMPLETED
+                ):
+                    break
+                await asyncio.sleep(0.02)
+
+            assert child_pid is not None
+            managed = manager.get_execution(execution_id)
+            assert managed is not None
+            assert managed.info.status == ExecutionStatus.COMPLETED
+            assert manager.list_executions()["executions"][0]["status"] == "running"
+
+            await manager.shutdown()
+
+            stat_path = f"/proc/{child_pid}/stat"
+            if os.path.exists(stat_path):
+                with open(stat_path) as stat_file:
+                    assert stat_file.read().split()[2] == "Z"
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if not manager._shutdown_complete:
+                await manager.shutdown()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("termination", ("stop", "timeout"))
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux") or shutil.which("setsid") is None,
+        reason="Linux procfs and setsid are required",
+    )
+    async def test_stop_and_timeout_kill_descendant_outside_group(
+        self, termination
+    ):
+        manager = ExecutionManager(Config())
+        child_pid: int | None = None
+        try:
+            result = await manager.execute_command(
+                "setsid sh -c 'trap \"\" HUP TERM; echo CHILD=$$; exec sleep 30'",
+                yield_ms=0,
+                timeout_ms=100 if termination == "timeout" else 0,
+                side_effects=NONE,
+            )
+            execution_id = result["execution_id"]
+            for _ in range(50):
+                page = await manager.read_execution_output(
+                    execution_id, since_seq=1
+                )
+                if page["stdout"].startswith("CHILD="):
+                    child_pid = int(page["stdout"].split("=", 1)[1])
+                    break
+                await asyncio.sleep(0.02)
+            assert child_pid is not None
+
+            if termination == "stop":
+                stopped = await manager.stop_execution(
+                    execution_id, force_after_ms=100
+                )
+                assert stopped["stopped"] is True
+            else:
+                waited = await manager.wait_execution(execution_id, timeout_ms=3_000)
+                assert waited["status"] == "timed_out"
+                assert waited["wait_result"] == "exited"
+
+            stat_path = f"/proc/{child_pid}/stat"
+            if os.path.exists(stat_path):
+                with open(stat_path) as stat_file:
+                    assert stat_file.read().split()[2] == "Z"
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            await manager.shutdown()
 
     @pytest.mark.asyncio
     async def test_shutdown_force_kills_group_ignoring_termination(self):
@@ -933,6 +1219,44 @@ class TestShutdownSpawnRace:
             await execute_task
         assert manager._pending_spawns == 0
         assert manager._pending_spawn_tasks == set()
+        assert manager._shutdown_complete is True
+
+    @pytest.mark.asyncio
+    async def test_shutdown_reports_spawn_that_ignores_cancellation(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.PENDING_SPAWN_SHUTDOWN_MS", 20
+        )
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+
+        async def stubborn_spawn(*_args, **_kwargs):
+            spawn_started.set()
+            try:
+                await release_spawn.wait()
+            except asyncio.CancelledError:
+                await release_spawn.wait()
+            return TestInitialStdinLifecycle.FakeProcess(None)
+
+        monkeypatch.setattr(
+            "mcp_yieldshell.execution.manager.spawn_process", stubborn_spawn
+        )
+        manager = ExecutionManager(Config())
+        execute_task = asyncio.create_task(
+            manager.execute_command("sleep 30", yield_ms=0, side_effects=NONE)
+        )
+        await spawn_started.wait()
+
+        try:
+            with pytest.raises(RuntimeError, match="pending spawn"):
+                await asyncio.wait_for(manager.shutdown(), timeout=0.5)
+            assert manager._shutdown_complete is False
+        finally:
+            release_spawn.set()
+            await execute_task
+            await manager.shutdown()
+
         assert manager._shutdown_complete is True
 
 

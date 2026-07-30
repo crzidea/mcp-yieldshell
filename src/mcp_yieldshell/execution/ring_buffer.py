@@ -117,9 +117,15 @@ class RingBuffer:
 
     def clear(self) -> None:
         """Clear all buffered data."""
+        if self._chunks:
+            last_start, last_chunk = self._chunks[-1]
+            cleared_until = last_start + len(last_chunk)
+            self._evicted_until_seq = max(
+                self._evicted_until_seq or cleared_until,
+                cleared_until,
+            )
         self._chunks.clear()
         self._retained_bytes = 0
-        self._evicted_until_seq = None
 
 
 def read_buffers(

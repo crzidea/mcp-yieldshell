@@ -46,6 +46,8 @@ graph TD
 * **`ManagedExecution`** (`src/mcp_yieldshell/execution/managed.py`):
   * Groups the underlying `asyncio.subprocess.Process` handle with the
     execution's stdout/stderr buffers, status, and active control tasks.
+  * On Linux, retains a random internal environment token used to discover
+    ordinary descendants that explicitly leave the original process group.
   * Tracks `last_output_at` for idle reporting and exposes `latest_seq`, the shared cursor position just past the newest captured byte.
 * **`RingBuffer`** (`src/mcp_yieldshell/execution/ring_buffer.py`):
   * Maintains a fixed-size, byte-capped buffer for stdout and stderr to avoid unbounded memory growth. Capacity comes from `YIELDSHELL_MAX_BUFFER_BYTES` (256 KB default) and is intentionally decoupled from the per-response cap `YIELDSHELL_MAX_OUTPUT_BYTES` (20 KB default), so a cursor stays resolvable across polling gaps.
@@ -79,7 +81,7 @@ Whenever a command is executed, `ExecutionManager` schedules several async tasks
    final exit code, signal information, and status.
 3. **Timeout Handler** (`timeout-<execution_id>`): Scheduled if `timeout_ms`
    is set. It escalates from `SIGTERM` to `SIGKILL` for the OS process group.
-4. **Server Shutdown Path**: `ExecutionManager.shutdown()` is invoked from the FastMCP lifespan finally block (`src/mcp_yieldshell/server.py`) and is responsible for idempotently terminating all live process groups with a bounded graceful phase, force-killing survivors, draining final output, and settling completion tasks.
+4. **Server Shutdown Path**: `ExecutionManager.shutdown()` is invoked from the FastMCP lifespan finally block (`src/mcp_yieldshell/server.py`) and is responsible for idempotently terminating all live process groups with a bounded graceful phase, force-killing survivors, draining final output, and settling completion tasks. Shutdown remains incomplete and retryable, and raises visibly, if a process group survives force-kill or a pending spawn does not settle after cancellation.
 
 ---
 
@@ -87,6 +89,11 @@ Whenever a command is executed, `ExecutionManager` schedules several async tasks
 
 * **POSIX**: To ensure that child processes launched by commands are fully cleaned up (and not orphaned), commands are spawned with `start_new_session=True` (`src/mcp_yieldshell/execution/spawn.py`).
   * The spawned PID is retained as the process-group ID (a new session leader's PGID equals its PID), and signals are sent with `os.killpg(pgid, signal)` to terminate the entire process group without a post-spawn lookup race.
+  * On Linux, `execution/containment.py` adds an internal random environment
+    token and uses procfs to keep ordinary re-sessioned or re-grouped
+    descendants in lifecycle checks and signal fan-out. Commands that
+    deliberately replace their inherited environment can evade this
+    best-effort extension; YieldShell is not a security sandbox.
 * **Windows**: Spawning utilizes standard `asyncio.create_subprocess_shell` parameters. Process group termination is not natively supported via POSIX signals, so process termination is best-effort and acts on the primary PID.
 
 ---
@@ -102,9 +109,9 @@ This is a Python 3.11 package using a `src/` layout:
 * `src/mcp_yieldshell/side_effects.py` validates declarations and formats blocked-category guidance.
 * `src/mcp_yieldshell/security.py` controls allowed path roots, command regex rules, and environment overlays/redactions.
 * `src/mcp_yieldshell/execution/` contains managed-execution state, buffering,
-  process-spawn helpers, and lifecycle management.
+  process-spawn and Linux containment helpers, and lifecycle management.
 * `tests/` mirrors the code structure (e.g. `test_config.py`, `test_ring_buffer.py`, `test_security.py`, `test_integration.py`, `test_side_effects.py`, `test_lifecycle_hardening.py`).
-* `scripts/release.py` automates transactional version/lock refresh, scoped staging and commit, tagging, and an atomic branch/tag push.
+* `scripts/release.py` automates transactional version/lock refresh, scoped staging and commit, tagging, and an atomic branch/tag push. A rerun can resume after either tag creation or the final push failed following a successful release commit.
 
 ---
 

@@ -227,6 +227,75 @@ class TestReleaseLockfileRefresh:
         assert remote_branch == local_head
         assert remote_tag == local_head
 
+    def test_release_resumes_after_commit_if_tagging_failed(
+        self, release_module, fake_repo, tmp_path, monkeypatch
+    ):
+        repo = fake_repo["repo"]
+        remote = tmp_path / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-q", str(remote)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(remote)],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        monkeypatch.chdir(repo)
+        original_run_cmd = release_module.run_cmd
+
+        def fail_first_tag(cmd, check=True):
+            if cmd == "git tag v0.4.0":
+                raise SystemExit(1)
+            return original_run_cmd(cmd, check=check)
+
+        release_module.run_cmd = fail_first_tag
+        monkeypatch.setattr(sys, "argv", ["release.py", "0.4.0", "-y"])
+        with pytest.raises(SystemExit):
+            release_module.main()
+
+        assert release_module.get_current_version() == "0.4.0"
+        assert (
+            subprocess.run(
+                ["git", "log", "-1", "--format=%s"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == "chore: bump version to v0.4.0"
+        )
+        assert (
+            subprocess.run(
+                ["git", "tag", "--list", "v0.4.0"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == ""
+        )
+
+        release_module.run_cmd = original_run_cmd
+        release_module.main()
+
+        local_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        remote_tag = subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", "refs/tags/v0.4.0^{commit}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert remote_tag == local_head
+
     def test_uv_lock_failure_aborts_release(self, release_module, fake_repo, monkeypatch):
         """If ``uv lock`` fails, the release script exits non-zero before any commit/tag."""
         # Make the uv shim fail.

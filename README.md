@@ -219,7 +219,7 @@ Read stdout and/or stderr from a running or completed execution.
 * **Returns**:
   * `execution_id`, `status`, `exit_code`, `signal`, and `stdin_error` when initial input delivery failed. `stdout` and `stderr` text are included based on the `streams` filter — `"both"` includes both, `"stdout"` includes only `stdout`, and `"stderr"` includes only `stderr`.
   * Cursor fields: `start_seq` (position of the first byte returned), `next_seq` (cursor to use in the next `since_seq` read), and `latest_seq` (how far output has advanced overall — when it exceeds `next_seq`, more is waiting).
-  * Withheld-output flags: `capped` means more output is available and reading again continues from `next_seq`; `evicted` means output fell out of the ring buffer before it was read and cannot be recovered. When either is set, a `hint` field names the concrete follow-up call.
+  * Withheld-output flags: `capped` means more output is available and reading again continues from `next_seq`; `evicted` means output became unrecoverable before it could be read. This normally means it fell out of the ring buffer; it can also mean retention concurrently removed the completed record. When either is set, a `hint` field names the concrete follow-up action.
 
 ### `write`
 Write text input to the standard input (`stdin`) of a running execution.
@@ -329,7 +329,7 @@ To avoid sending duplicate data over the MCP protocol (which can consume context
 6. Requests that pass `since_seq`, pass `tail_lines`, or narrow `streams` are treated as **out-of-band**: they neither consult nor advance the server-side cursor. This means a peek at the tail or at stderr cannot silently skip output the polling stream has not seen yet.
 7. Two distinct flags report output the response did not carry, and they call for different responses:
    * `capped` — the response cap stopped the read short. The remainder is still buffered; read again to continue, or pass the returned `next_seq` as `since_seq`. The `hint` field spells out the call.
-   * `evicted` — output exceeded the ring buffer's capacity before it was read and is permanently gone. Retrying cannot recover it; poll more often or raise `YIELDSHELL_MAX_BUFFER_BYTES`. Reads report eviction only when their requested range overlaps evicted data.
+   * `evicted` — output is permanently gone. This normally means it exceeded the ring buffer's capacity before it was read; a completed record reaped concurrently with a capped response is also reported as unrecoverable instead of offering a dangling follow-up read. Retrying cannot recover it; poll more often, raise `YIELDSHELL_MAX_BUFFER_BYTES`, or increase terminal retention as indicated by the response hint.
 8. `latest_seq` reports how far output has advanced overall. `latest_seq > next_seq` means more is already waiting; `latest_seq == next_seq` means the caller is fully caught up.
 9. Because retention (`YIELDSHELL_MAX_BUFFER_BYTES`, 256 KB per stream) is much larger than the per-response cap (`YIELDSHELL_MAX_OUTPUT_BYTES`, 20 KB), a cursor normally stays resolvable across polling gaps.
 
@@ -375,6 +375,7 @@ Configure the server by setting these environment variables prior to launch:
 * **Agent Process Termination**: `KILLS_AGENT_PROCESS` covers commands that may terminate the MCP client, agent, or related process running the agent workflow (e.g., `kill` commands targeting the agent PID, or commands that cause the agent to exit). This is distinct from `STOPS_OR_RESTARTS_SERVICES`, which covers OS-level services. Blocked by default; operators can override.
 * **Path Validation**: CWD path verification resolves traversal and symlinks, then requires the target to be an allowed root itself or a true descendant. Lexically similar siblings and symlink escapes are rejected before spawn.
 * **Additive Environments**: The `env` argument overlays existing env parameters. It merges with the parent process environment instead of completely replacing it, protecting critical OS vars.
+* **Linux Descendant Discovery**: Each Linux execution receives a random internal environment token. If a descendant creates a new session or process group, procfs discovery keeps ordinary daemonized descendants associated with the execution so `stop`, runtime timeout, and shutdown can signal them too. This is lifecycle containment, not a security sandbox: deliberately replacing the inherited environment can evade discovery.
 * **Opt-in Best-effort Redaction**: Redaction is disabled unless `YIELDSHELL_REDACT_ENV_REGEX` is configured. When enabled, matching environment values are snapshotted at startup, ordered longest first, and values shorter than 8 characters are excluded to avoid corrupting ordinary output. Matching values supplied through an `env` overlay are added for that process. Redaction is applied while streams are drained, including across subprocess chunks and incremental read pages. Restart the server to refresh the parent-environment snapshot after changes. Redaction does not remove variables from subprocess environments, and secrets not selected by the regex or printed through transformed formats might not be caught.
 
 ## Lifecycle and Compatibility
@@ -383,7 +384,10 @@ YieldShell gives graceful termination 10 seconds before force-killing, waits up
 to 5 seconds for a POSIX process group to disappear, and allows up to 3 seconds
 for final stream draining. On stdio server shutdown, all live managed
 executions are terminated concurrently using the same bounded graceful/forced
-policy. Already-terminal records are not changed by shutdown.
+policy. Already-terminal records are not changed by shutdown. If a process
+group survives force-kill or a pending spawn ignores cancellation, shutdown
+fails visibly, remains incomplete, and can be retried instead of silently
+orphaning live work.
 
 `execution_id` is an opaque, server-generated string. Clients must pass it
 through unchanged rather than parsing or pattern-matching it. Its current
@@ -413,7 +417,8 @@ unchanged to `read`, `write`, `wait`, and `stop`. Calls that send the OS
 
 ## Platform Support
 
-* **POSIX (Linux & macOS)**: Fully supported. Spawns processes in distinct sessions (`start_new_session=True`), allowing `stop`, runtime timeout, and server shutdown signals (`SIGTERM`/`SIGKILL`) to target the entire process group. This cleans up child processes started by managed commands.
+* **Linux**: Fully supported. Commands start in distinct sessions (`start_new_session=True`), and `stop`, runtime timeout, and shutdown target the process group. Procfs token discovery also tracks ordinary descendants that explicitly create another session or process group.
+* **macOS**: Supported with POSIX process-group controls. Descendants that explicitly leave the managed process group are outside that mechanism and may persist.
 * **Windows**: Supported with best-effort process controls. Windows lacks native POSIX process-group signals, so `stop`, `timeout_ms`, and server shutdown act on the primary process; child subprocesses might persist if they do not exit cleanly.
 
 ---

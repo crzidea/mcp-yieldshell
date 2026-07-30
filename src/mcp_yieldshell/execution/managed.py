@@ -30,6 +30,8 @@ class ManagedExecution:
         "_seq_source",
         "_timeout_triggered",
         "sensitive_env",
+        "containment_token",
+        "contained_processes_exited",
     )
 
     def __init__(
@@ -39,6 +41,7 @@ class ManagedExecution:
         max_buffer_bytes: int,
         process_group_id: int | None = None,
         sensitive_env: SensitiveEnv = (),
+        containment_token: str | None = None,
     ) -> None:
         self.info = info
         self.proc = proc
@@ -61,6 +64,8 @@ class ManagedExecution:
         self.stdin_error: str | None = None
         self._timeout_triggered = False
         self.sensitive_env = sensitive_env
+        self.containment_token = containment_token
+        self.contained_processes_exited = False
 
     @property
     def latest_seq(self) -> int:

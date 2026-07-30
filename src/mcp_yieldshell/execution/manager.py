@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import os
+import signal
 import sys
 import time
 import uuid
@@ -25,6 +26,12 @@ from ..security import (
 )
 from ..side_effects import validate_side_effects
 from ..types import ExecutionInfo, ExecutionStatus, SideEffect
+from .containment import (
+    EXECUTION_TOKEN_ENV,
+    contained_processes_exist,
+    new_execution_token,
+    signal_contained_processes,
+)
 from .managed import ManagedExecution
 from .ring_buffer import RingBuffer, read_buffers, tail_start_seq
 from .spawn import kill_process, spawn_process, terminate_process
@@ -64,7 +71,12 @@ class ExecutionManager:
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=PENDING_SPAWN_SHUTDOWN_MS / 1000.0,
+            )
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
 
     def _release_spawn_reservation(
         self, spawn_owner: asyncio.Task[Any] | None
@@ -80,6 +92,7 @@ class ExecutionManager:
         proc: asyncio.subprocess.Process,
         process_group_id: int | None,
         drain_tasks: list[asyncio.Task[None]],
+        containment_token: str | None = None,
     ) -> None:
         for task in drain_tasks:
             if not task.done():
@@ -87,6 +100,11 @@ class ExecutionManager:
         if drain_tasks:
             await asyncio.gather(*drain_tasks, return_exceptions=True)
         await kill_process(proc, process_group_id)
+        signal_contained_processes(
+            containment_token,
+            signal.SIGKILL,
+            exclude_process_group_id=process_group_id,
+        )
         try:
             await asyncio.wait_for(proc.wait(), timeout=1.0)
         except (asyncio.TimeoutError, ProcessLookupError):
@@ -186,6 +204,18 @@ class ExecutionManager:
         if hints:
             fields["hint"] = " ".join(hints)
         return fields
+
+    @staticmethod
+    def _mark_snapshot_unrecoverable(snapshot: dict[str, Any]) -> None:
+        """Replace a paging promise after its execution record was reaped."""
+        if not snapshot["capped"]:
+            return
+        snapshot["capped"] = False
+        snapshot["evicted"] = True
+        snapshot["hint"] = (
+            "Additional execution output was omitted and cannot be recovered "
+            "because retention removed the completed record."
+        )
 
     def _redact(self, mp: ManagedExecution, text: str) -> str:
         return redact_text(self._config, text, mp.sensitive_env)
@@ -354,6 +384,9 @@ class ExecutionManager:
 
         try:
             env = build_env(self._config, env_overlay)
+            containment_token = new_execution_token()
+            if containment_token is not None:
+                env[EXECUTION_TOKEN_ENV] = containment_token
             effective_yield = self._clamp_yield_ms(yield_ms)
             effective_timeout = self._clamp_timeout_ms(timeout_ms)
             effective_max_output = self._max_output(max_output_bytes)
@@ -389,6 +422,7 @@ class ExecutionManager:
             self._config.max_buffer_bytes,
             process_group_id,
             collect_sensitive_env(self._config, env_overlay),
+            containment_token,
         )
 
         # Start drain tasks immediately after spawn to prevent blocking on full pipe buffers
@@ -417,12 +451,22 @@ class ExecutionManager:
         except asyncio.CancelledError:
             self._release_spawn_reservation(spawn_owner)
             await asyncio.shield(
-                self._reject_spawned_execution(proc, process_group_id, drain_tasks)
+                self._reject_spawned_execution(
+                    proc,
+                    process_group_id,
+                    drain_tasks,
+                    containment_token,
+                )
             )
             raise
 
         if reject_for_shutdown:
-            await self._reject_spawned_execution(proc, process_group_id, drain_tasks)
+            await self._reject_spawned_execution(
+                proc,
+                process_group_id,
+                drain_tasks,
+                containment_token,
+            )
             return self._shutdown_reject_response()
 
         mp.completion_task = asyncio.create_task(
@@ -462,6 +506,11 @@ class ExecutionManager:
 
         # Prepare output for response
         snapshot = self._read_snapshot(mp, effective_max_output)
+        addressable = self._executions.get(execution_id) is mp
+        if not addressable:
+            # Retention removed the terminal record before this response was
+            # assembled. Do not emit a dangling read hint.
+            self._mark_snapshot_unrecoverable(snapshot)
         # Every branch carries the cursor so a caller can keep reading without
         # replaying output it already received.
         common = {"duration_ms": round(duration_ms, 1), **snapshot}
@@ -472,7 +521,6 @@ class ExecutionManager:
         # Response matrix: failed_to_start returns before a record is created;
         # every retained result is addressable by its opaque execution ID and
         # exposes the initial shell's OS process ID when one is available.
-        addressable = self._executions.get(execution_id) is mp
         identifiers: dict[str, Any] = {}
         if addressable:
             identifiers["execution_id"] = execution_id
@@ -562,20 +610,49 @@ class ExecutionManager:
 
     def _process_group_exists(self, mp: ManagedExecution) -> bool:
         if mp.process_group_exited:
-            return False
+            return self._contained_processes_exist(mp)
         if sys.platform == "win32":
             exists = mp.proc.returncode is None
             if not exists:
                 mp.process_group_exited = True
-            return exists
+            return exists or self._contained_processes_exist(mp)
         try:
             os.killpg(self._process_group_id(mp), 0)
         except ProcessLookupError:
             mp.process_group_exited = True
-            return False
+            return self._contained_processes_exist(mp)
         except PermissionError:
             return True
         return True
+
+    @staticmethod
+    def _contained_processes_exist(mp: ManagedExecution) -> bool:
+        if mp.contained_processes_exited:
+            return False
+        exists = contained_processes_exist(mp.containment_token)
+        if not exists:
+            # Once the original group is gone and no tagged descendants exist,
+            # no process remains that could create another tagged descendant.
+            mp.contained_processes_exited = True
+        return exists
+
+    @staticmethod
+    def _signal_contained_processes(
+        mp: ManagedExecution, sig: signal.Signals
+    ) -> None:
+        signal_contained_processes(
+            mp.containment_token,
+            sig,
+            exclude_process_group_id=mp.process_group_id,
+        )
+
+    async def _terminate_execution(self, mp: ManagedExecution) -> None:
+        await terminate_process(mp.proc, mp.process_group_id)
+        self._signal_contained_processes(mp, signal.SIGTERM)
+
+    async def _kill_execution(self, mp: ManagedExecution) -> None:
+        await kill_process(mp.proc, mp.process_group_id)
+        self._signal_contained_processes(mp, signal.SIGKILL)
 
     async def _drain_stream(
         self,
@@ -805,23 +882,24 @@ class ExecutionManager:
             await asyncio.sleep(timeout_sec)
         except asyncio.CancelledError:
             return
-        # The subprocess may have exited naturally while its completion tracker
-        # was waiting to run. Do not relabel that race as a timeout.
-        if mp.proc.returncode is not None and not self._process_group_exists(mp):
+        # Managed processes may have exited naturally while the completion
+        # tracker is still waiting to publish the subprocess return code.
+        # Containment disappearance is authoritative; do not relabel that race.
+        if not self._process_group_exists(mp):
             return
         if not self._has_live_work(mp):
             return
         mp._timeout_triggered = True
         mp.info.status = ExecutionStatus.TIMED_OUT
         # Graceful termination
-        await terminate_process(mp.proc, mp.process_group_id)
+        await self._terminate_execution(mp)
         grace_period = GRACEFUL_STOP_MS / 1000.0
         await self._wait_for_process_group_exit(mp, timeout_sec=grace_period)
 
         if self._process_group_exists(mp):
             # Force kill any children that survived graceful termination, even if
             # the shell process already exited.
-            await kill_process(mp.proc, mp.process_group_id)
+            await self._kill_execution(mp)
             await self._wait_for_process_group_exit(
                 mp, timeout_sec=PROCESS_GROUP_EXIT_MS / 1000.0
             )
@@ -984,6 +1062,8 @@ class ExecutionManager:
 
         effective_max = self._max_output(max_output_bytes)
         snapshot = self._read_snapshot(mp, effective_max, since_seq, tail_lines)
+        if self._executions.get(execution_id) is not mp:
+            self._mark_snapshot_unrecoverable(snapshot)
 
         return self._with_stdin_error(mp, {
             "execution_id": execution_id,
@@ -1051,6 +1131,8 @@ class ExecutionManager:
                     pass
         else:
             await terminate_process(mp.proc)
+        if sys.platform != "win32":
+            self._signal_contained_processes(mp, sig)
 
         # Wait for grace period
         # Reserve time for force-kill observation, final drain, and subprocess
@@ -1062,7 +1144,7 @@ class ExecutionManager:
 
         if self._process_group_exists(mp):
             # The primary shell may exit before a resistant descendant.
-            await kill_process(mp.proc, mp.process_group_id)
+            await self._kill_execution(mp)
             await self._wait_for_process_group_exit(
                 mp, timeout_sec=PROCESS_GROUP_EXIT_MS / 1000.0
             )
@@ -1195,12 +1277,28 @@ class ExecutionManager:
                     name="yieldshell-shutdown",
                 )
                 self._shutdown_task = task
-        await asyncio.shield(task)
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            # A failed teardown must be retryable. Keep an in-progress task
+            # shared when only this caller was cancelled, but release a settled
+            # failed task so a later shutdown call can try containment again.
+            async with self._shutdown_lock:
+                if self._shutdown_task is task and task.done():
+                    self._shutdown_task = None
+            raise
 
     async def _run_shutdown(self) -> None:
         """Perform the shutdown sequence once, independently of caller cancellation."""
         await self._wait_for_no_pending_spawns()
         await self._cancel_pending_spawns()
+        async with self._shutdown_lock:
+            pending_spawns = self._pending_spawns
+        if pending_spawns:
+            raise RuntimeError(
+                "Server shutdown could not settle "
+                f"{pending_spawns} pending spawn call(s)"
+            )
 
         while True:
             live = [
@@ -1217,7 +1315,7 @@ class ExecutionManager:
             running_at_start = {id(mp) for mp in live if not self._is_terminal(mp)}
 
             await asyncio.gather(
-                *(terminate_process(mp.proc, mp.process_group_id) for mp in live),
+                *(self._terminate_execution(mp) for mp in live),
                 return_exceptions=True,
             )
 
@@ -1229,7 +1327,7 @@ class ExecutionManager:
 
             survivors = [mp for mp in live if self._process_group_exists(mp)]
             await asyncio.gather(
-                *(kill_process(mp.proc, mp.process_group_id) for mp in survivors),
+                *(self._kill_execution(mp) for mp in survivors),
                 return_exceptions=True,
             )
             await asyncio.gather(
@@ -1252,8 +1350,10 @@ class ExecutionManager:
                 *(self._settle_completion(mp) for mp in live),
                 return_exceptions=True,
             )
+            survivors = [mp for mp in live if self._process_group_exists(mp)]
+            survivor_ids = {id(mp) for mp in survivors}
             for mp in live:
-                if not self._process_group_exists(mp):
+                if id(mp) not in survivor_ids:
                     self._mark_ended(mp)
 
             for mp in live:
@@ -1266,9 +1366,13 @@ class ExecutionManager:
                 if mp.stdin_task is not None and not mp.stdin_task.done():
                     mp.stdin_task.cancel()
                 self._close_output_pipes(mp)
-                if id(mp) in running_at_start and mp.info.status in (
-                    ExecutionStatus.RUNNING,
-                    ExecutionStatus.COMPLETED,
+                if (
+                    id(mp) not in survivor_ids
+                    and id(mp) in running_at_start
+                    and mp.info.status in (
+                        ExecutionStatus.RUNNING,
+                        ExecutionStatus.COMPLETED,
+                    )
                 ):
                     mp.info.status = ExecutionStatus.STOPPED
                 mp.completion_event.set()
@@ -1286,6 +1390,12 @@ class ExecutionManager:
             ]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            if survivors:
+                raise RuntimeError(
+                    "Server shutdown could not terminate process group(s): "
+                    + ", ".join(mp.info.execution_id for mp in survivors)
+                )
 
             async with self._shutdown_lock:
                 self._shutdown_complete = True

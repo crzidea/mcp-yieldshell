@@ -262,6 +262,9 @@ class TestRingBufferUTF8:
         assert buf.byte_count == total
         result = buf.read()
         assert result["text"] == ""
+        assert result["start_seq"] == 6
+        assert result["next_seq"] == 6
+        assert result["evicted"] is True
 
 
 class TestTailStartSeq:

@@ -210,13 +210,19 @@ def main():
         )
         head_commit = run_cmd("git rev-parse HEAD")
         head_subject = run_cmd("git log -1 --format=%s")
+        head_is_release = head_subject.stdout.strip() == expected_subject
         if (
             tag_exists
             and tag_commit.returncode == 0
             and tag_commit.stdout.strip() == head_commit.stdout.strip()
-            and head_subject.stdout.strip() == expected_subject
+            and head_is_release
         ):
             print(f"Resuming push for existing local release {tag}.")
+            push_release(branch, tag)
+            return
+        if not tag_exists and head_is_release:
+            print(f"Resuming tagging and push for existing local release {tag}.")
+            run_cmd(f"git tag {tag}")
             push_release(branch, tag)
             return
         print(f"Error: Version is already {current_version}.")
