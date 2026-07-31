@@ -341,7 +341,7 @@ wheels = [
 
 [[package]]
 name = "mcp-yieldshell"
-version = "1.1.1"
+version = "1.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
