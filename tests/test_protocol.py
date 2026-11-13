@@ -49,6 +49,9 @@ async def test_stdio_server_lists_and_executes_tools():
                 "write",
             }
             assert "exec" not in tool_names
+            execute_schema = tools_by_name["execute"].inputSchema
+            assert "description" in execute_schema["required"]
+            assert execute_schema["properties"]["description"]["type"] == "string"
             for tool_name in ("read", "write", "wait", "stop"):
                 tool = tools_by_name[tool_name]
                 properties = tool.inputSchema["properties"]
@@ -59,11 +62,21 @@ async def test_stdio_server_lists_and_executes_tools():
                 assert "opaque" in (tool.description or "")
                 assert "passed through unchanged" in (tool.description or "")
 
+            missing_description = await session.call_tool(
+                "execute",
+                {"command": "printf should-not-run", "side_effects": ["NONE"]},
+            )
+            assert missing_description.isError is True
+            assert isinstance(missing_description.content[0], TextContent)
+            assert "description" in missing_description.content[0].text
+            assert _payload(await session.call_tool("ps", {}))["executions"] == []
+
             result = await session.call_tool(
                 "execute",
                 {
                     "command": "printf protocol-ok",
                     "side_effects": ["NONE"],
+                    "description": "Print a marker to verify command execution",
                 },
             )
 
@@ -73,6 +86,11 @@ async def test_stdio_server_lists_and_executes_tools():
             assert isinstance(payload["execution_id"], str)
             assert isinstance(payload["process_id"], int)
             assert "pid" not in payload
+            assert "description" not in payload
+            listing = _payload(await session.call_tool("ps", {}))
+            entry = listing["executions"][0]
+            assert entry["execution_id"] == payload["execution_id"]
+            assert "description" not in entry
 
             rejected = await session.call_tool(
                 "read",
@@ -102,6 +120,7 @@ async def test_stdio_server_incremental_polling_does_not_replay_output():
                             "sleep 0.2; done"
                         ),
                         "side_effects": ["NONE"],
+                        "description": "Emit numbered chunks to verify incremental polling",
                         "yield_ms": 0,
                     },
                 )
@@ -172,6 +191,7 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                     {
                         "command": "cat",
                         "side_effects": ["NONE"],
+                        "description": "Echo input to verify interactive execution",
                         "close_stdin": False,
                         "yield_ms": 0,
                     },
@@ -213,6 +233,7 @@ async def test_stdio_server_background_input_wait_stop_and_cleanup_workflow():
                     {
                         "command": "sleep 30",
                         "side_effects": ["NONE"],
+                        "description": "Start a background process to verify stopping it",
                         "yield_ms": 0,
                     },
                 )

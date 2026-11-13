@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from .config import Config
 from .execution.manager import ExecutionManager
@@ -39,6 +41,18 @@ def _get_manager() -> ExecutionManager:
 async def execute(
     command: str,
     side_effects: list[SideEffect],
+    description: Annotated[
+        str,
+        Field(
+            strict=True,
+            min_length=1,
+            pattern=r"\S",
+            description=(
+                "A concise explanation of what the command does, "
+                "for example: Run the project test suite. Must not be blank."
+            ),
+        ),
+    ],
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     shell: str | None = None,
@@ -54,6 +68,12 @@ async def execute(
     Addressable responses include an opaque ``execution_id``. Pass that value
     through unchanged to ``read``, ``write``, ``wait``, or ``stop``; never
     parse it or substitute the numeric OS ``process_id``.
+
+    ``description`` is required and must be a non-blank string explaining
+    what the command does, for example ``"Run the project test suite"``.
+    It appears only in the tool call and is not retained as execution
+    metadata or included in responses. Invalid descriptions are rejected
+    by MCP argument validation before the execution manager is invoked.
 
     ``side_effects`` is required and must be a non-empty list. Declare every
     plausible side-effect category before running the command. ``NONE`` is

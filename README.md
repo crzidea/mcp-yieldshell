@@ -147,8 +147,12 @@ to the background. Addressable responses include an opaque `execution_id`;
 clients must pass it through unchanged to lifecycle tools. `process_id` is the
 numeric OS PID of the initial shell and is not a lifecycle handle.
 
+Every call must now supply `description`. Missing, null, non-string, empty,
+or whitespace-only descriptions fail MCP argument validation before execution.
+
 * **Parameters**:
   * `command` (string, **required**): The command string to execute in the shell.
+  * `description` (string, **required**): A concise, non-blank explanation of what the command does, for example `"Run the project test suite"`. It appears only in the tool call; it is not saved as execution metadata or included in responses or `ps` results. There is no fixed length limit.
   * `side_effects` (array of string, **required**): The side-effect categories this command may plausibly have. Must contain at least one entry drawn from the enum below. Use `["NONE"]` for commands with no meaningful side effects. `NONE` is exclusive and must not be combined with any other category. The server rejects the call with `failed_to_start` if any declared category is configured as blocked.
     * Allowed values: `CHANGES_NETWORK_CONFIGURATION`, `CHANGES_PACKAGES_OR_DEPENDENCIES`, `CONSUMES_SIGNIFICANT_RESOURCES`, `DELETES_FILES`, `EXPOSES_SECRETS`, `KILLS_AGENT_PROCESS`, `MAKES_NETWORK_REQUESTS`, `MODIFIES_OS_SETTINGS`, `MODIFIES_OS_USER_SETTINGS`, `MODIFIES_OUTSIDE_WORKSPACE`, `MODIFIES_PRODUCTION_SERVICES`, `MODIFIES_PROTECTED_FILES`, `MODIFIES_SECURITY_CONTROLS`, `MODIFIES_WORKSPACE_FILES`, `NONE`, `OTHER`, `RUNS_INLINE_CODE`, `RUNS_PRIVILEGED_COMMANDS`, `STOPS_OR_RESTARTS_SERVICES`, `UNKNOWN`, `USES_DESTRUCTIVE_GIT_OPERATION`.
     * `RUNS_INLINE_CODE` is in the default blocklist. It covers commands that execute code supplied inline to an interpreter or shell (e.g. `python -c`, `node -e`, `curl ... | sh`). It does not cover simply creating a script or executable file unless the same command also executes inline code. The safer next action is to write the content to a reviewable workspace file and execute it in a small, inspectable step. Operators can clear the blocklist via `MCP_YIELDSHELL_BLOCKED_SIDE_EFFECTS=,`.
